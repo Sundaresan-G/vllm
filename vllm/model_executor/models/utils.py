@@ -638,11 +638,118 @@ def make_layers(
     start_layer, end_layer = get_pp_indices(num_hidden_layers,
                                             get_pp_group().rank_in_group,
                                             get_pp_group().world_size)
+
+    # Read env var to decide whether to offload layers to CPU
+    double_buffer_pipeline = envs.VLLM_DOUBLE_BUFFER_PIPELINE
+
+    if double_buffer_pipeline:
+        logger.info("Using double buffer pipeline parallelism")
+        global _CPU_OFFLOAD_MAX_BYTES
+        # Ensure the below is larger than the total model size
+        _CPU_OFFLOAD_MAX_BYTES = 50 * 1024 * 1024 * 1024  # 50 GB
+
     modules = torch.nn.ModuleList(
         [PPMissingLayer() for _ in range(start_layer)] + [
             maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}"))
             for idx in range(start_layer, end_layer)
         ] + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)])
+
+    if not double_buffer_pipeline:
+        return start_layer, end_layer, modules    
+    
+    _GPU_CURRENT_BYTES = 0
+    _GPU_TENSOR = None
+
+    for module in modules[start_layer:end_layer]:
+        required_gpu_bytes = 0 
+        for p in module.parameters():
+            required_gpu_bytes += p.data.numel() * p.data.element_size()
+
+            # Assigning twice the max layer size for double buffering
+            if required_gpu_bytes * 2 > _GPU_CURRENT_BYTES:  
+                _GPU_TENSOR = torch.empty(2 * required_gpu_bytes // p.data.element_size(), 
+                                        dtype=p.data.dtype, device=p.device)
+                _GPU_CURRENT_BYTES = _GPU_TENSOR.numel() * _GPU_TENSOR.element_size()
+
+    dataCopyStream = torch.cuda.Stream()
+
+    # split gpu tensor into two without creating new
+    tensors = torch.split(_GPU_TENSOR, [_GPU_TENSOR.numel()//2, _GPU_TENSOR.numel()//2])
+
+    curr_tensor_idx = 0
+    next_tensor_idx = 1
+
+    curr_device_state = {}
+    next_device_state = {}
+
+    copy_event = torch.cuda.Event()
+    compute_event = torch.cuda.Event()
+
+    # Modify the forward function to use the pre-allocated tensor
+    for layer_idx, module in enumerate(modules[start_layer:end_layer]):
+        original_forward = module.forward 
+
+        def make_forward(module, original_forward, layer_idx):
+        
+            def forward(*args, **kwargs):
+
+                # logger.debug("Executing with modified forward for %s", module)
+
+                module.forward = original_forward
+
+                nonlocal curr_tensor_idx, next_tensor_idx, curr_device_state, next_device_state, copy_event, compute_event, dataCopyStream, tensors
+
+                if layer_idx == start_layer:
+                    # Split the tensors[tensor_idx] into module.state_dict() sizes
+                    curr_tensor_split_sizes = [v.numel() for _, v in module.state_dict().items()]
+                    curr_split_tensors = torch.split(tensors[curr_tensor_idx], curr_tensor_split_sizes)
+
+                    # logger.debug("Copying start layer")
+                    
+                    for split_idx, (k, v) in enumerate(module.state_dict().items()):
+                        chunk = curr_split_tensors[split_idx].reshape(v.size())
+                        chunk.copy_(v, non_blocking=True)
+                        curr_device_state[k] = chunk
+
+                if layer_idx < end_layer - 1:
+                    next_device_state.clear()
+
+                    next_module = modules[layer_idx + 1]
+                    next_tensor_split_sizes = [v.numel() for _, v in next_module.state_dict().items()]
+                    next_split_tensors = torch.split(tensors[next_tensor_idx], next_tensor_split_sizes)            
+
+                    for split_idx, (k, v) in enumerate(next_module.state_dict().items()):
+                        chunk = next_split_tensors[split_idx].reshape(v.size())
+                        dataCopyStream.wait_event(compute_event)
+                        with torch.cuda.stream(dataCopyStream):
+                            # logger.debug("Copying chunk %s weights to %s", k, v.device)
+                            chunk.copy_(v, non_blocking=True)
+                        next_device_state[k] = chunk
+
+                # Make the default stream wait for the current events to complete
+                torch.cuda.current_stream().wait_event(copy_event)
+
+                copy_event.record(dataCopyStream)            
+
+                # logger.debug("Executing modified forward for layer")
+
+                output = functional_call(module,
+                                        curr_device_state,
+                                        args=args,
+                                        kwargs=kwargs)
+                compute_event.record(torch.cuda.current_stream())
+                module.forward = forward
+
+                # Swap the tensor indices
+                curr_tensor_idx, next_tensor_idx = next_tensor_idx, curr_tensor_idx
+                curr_device_state, next_device_state = next_device_state, curr_device_state
+
+                return output
+            
+            return forward
+        
+        module.forward = make_forward(module, original_forward, layer_idx)
+
     return start_layer, end_layer, modules
 
 
