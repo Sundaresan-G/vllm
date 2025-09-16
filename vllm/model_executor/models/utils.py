@@ -562,8 +562,11 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
     if device == torch.device("cpu"):
         return module
 
+    # Read env var to decide whether to offload layers to CPU
+    double_buffer_pipeline = envs.VLLM_DOUBLE_BUFFER_PIPELINE
+
     global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES
-    if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
+    if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES and not double_buffer_pipeline:
         return module
 
     pin_memory = is_pin_memory_available()
@@ -580,7 +583,7 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
     # use pin_memory if possible, which helps cudagraph capture speed
     offloaded_parameters = False
     for p in module.parameters():
-        if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES:
+        if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES and not double_buffer_pipeline:
             # we use per-parameter offloading
             # one module might have some parameters offloaded and some not
             break
@@ -593,7 +596,9 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
                                        device='cpu',
                                        pin_memory=pin_memory)
         cpu_data.copy_(p.data)
-        if not uva_offloading:
+        if (not uva_offloading) or double_buffer_pipeline:
+            # Save the original device in case we need to move
+            p._vllm_original_device = p.device
             p.data = cpu_data
         else:
             # keep the cpu data alive
@@ -601,26 +606,27 @@ def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
             p.data = get_cuda_view_from_cpu_tensor(cpu_data)
         _CPU_OFFLOAD_BYTES += p.data.numel() * p.data.element_size()
         offloaded_parameters = True
+    
+    if not double_buffer_pipeline:
+        if offloaded_parameters and not uva_offloading:
+            original_forward = module.forward
 
-    if offloaded_parameters and not uva_offloading:
-        original_forward = module.forward
+            def forward(*args, **kwargs):
+                module.forward = original_forward
+                device_state = {
+                    # here we blindly call `to(device)`
+                    # if the parameter is already on the device, it will be a no-op
+                    k: v.to(device, non_blocking=True)
+                    for k, v in module.state_dict().items()
+                }
+                output = functional_call(module,
+                                        device_state,
+                                        args=args,
+                                        kwargs=kwargs)
+                module.forward = forward
+                return output
 
-        def forward(*args, **kwargs):
-            module.forward = original_forward
-            device_state = {
-                # here we blindly call `to(device)`
-                # if the parameter is already on the device, it will be a no-op
-                k: v.to(device, non_blocking=True)
-                for k, v in module.state_dict().items()
-            }
-            output = functional_call(module,
-                                     device_state,
-                                     args=args,
-                                     kwargs=kwargs)
             module.forward = forward
-            return output
-
-        module.forward = forward
 
     return module
 
@@ -644,9 +650,6 @@ def make_layers(
 
     if double_buffer_pipeline:
         logger.info("Using double buffer pipeline parallelism")
-        global _CPU_OFFLOAD_MAX_BYTES
-        # Ensure the below is larger than the total model size
-        _CPU_OFFLOAD_MAX_BYTES = 50 * 1024 * 1024 * 1024  # 50 GB
 
     modules = torch.nn.ModuleList(
         [PPMissingLayer() for _ in range(start_layer)] + [
@@ -654,7 +657,9 @@ def make_layers(
             for idx in range(start_layer, end_layer)
         ] + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)])
 
-    if not double_buffer_pipeline:
+    device = modules[0].parameters().__next__()._vllm_original_device
+
+    if (not double_buffer_pipeline) or device.type not in ("cuda", "xpu"):
         return start_layer, end_layer, modules    
     
     _GPU_CURRENT_BYTES = 0
@@ -668,10 +673,10 @@ def make_layers(
             # Assigning twice the max layer size for double buffering
             if required_gpu_bytes * 2 > _GPU_CURRENT_BYTES:  
                 _GPU_TENSOR = torch.empty(2 * required_gpu_bytes // p.data.element_size(), 
-                                        dtype=p.data.dtype, device=p.device)
+                                        dtype=p.data.dtype, device=p._vllm_original_device)
                 _GPU_CURRENT_BYTES = _GPU_TENSOR.numel() * _GPU_TENSOR.element_size()
 
-    dataCopyStream = torch.cuda.Stream()
+    dataCopyStream = torch.Stream()
 
     # split gpu tensor into two without creating new
     tensors = torch.split(_GPU_TENSOR, [_GPU_TENSOR.numel()//2, _GPU_TENSOR.numel()//2])
@@ -682,8 +687,13 @@ def make_layers(
     curr_device_state = {}
     next_device_state = {}
 
-    copy_event = torch.cuda.Event()
-    compute_event = torch.cuda.Event()
+    copy_event = torch.Event()
+    compute_event = torch.Event()
+
+    # Get the current stream
+    curr_stream = torch.cuda.current_stream() if device.type == "cuda" else torch.xpu.current_stream() if device.type == "xpu" else None
+    if curr_stream is None:
+        raise RuntimeError("No CUDA or XPU stream available for double buffer pipeline")
 
     # Modify the forward function to use the pre-allocated tensor
     for layer_idx, module in enumerate(modules[start_layer:end_layer]):
@@ -721,13 +731,13 @@ def make_layers(
                     for split_idx, (k, v) in enumerate(next_module.state_dict().items()):
                         chunk = next_split_tensors[split_idx].reshape(v.size())
                         dataCopyStream.wait_event(compute_event)
-                        with torch.cuda.stream(dataCopyStream):
+                        with dataCopyStream:
                             # logger.debug("Copying chunk %s weights to %s", k, v.device)
                             chunk.copy_(v, non_blocking=True)
                         next_device_state[k] = chunk
 
                 # Make the default stream wait for the current events to complete
-                torch.cuda.current_stream().wait_event(copy_event)
+                curr_stream.wait_event(copy_event)
 
                 copy_event.record(dataCopyStream)            
 
@@ -737,7 +747,7 @@ def make_layers(
                                         curr_device_state,
                                         args=args,
                                         kwargs=kwargs)
-                compute_event.record(torch.cuda.current_stream())
+                compute_event.record(curr_stream)
                 module.forward = forward
 
                 # Swap the tensor indices
