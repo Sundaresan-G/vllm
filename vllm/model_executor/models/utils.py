@@ -657,7 +657,7 @@ def make_layers(
             for idx in range(start_layer, end_layer)
         ] + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)])
 
-    device = modules[0].parameters().__next__()._vllm_original_device
+    device = modules[0].parameters().__next__()._vllm_original_device if double_buffer_pipeline else None
 
     if (not double_buffer_pipeline) or device.type not in ("cuda", "xpu"):
         return start_layer, end_layer, modules    
