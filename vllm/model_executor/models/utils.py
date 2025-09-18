@@ -670,11 +670,11 @@ def make_layers(
         for p in module.parameters():
             required_gpu_bytes += p.data.numel() * p.data.element_size()
 
-            # Assigning twice the max layer size for double buffering
-            if required_gpu_bytes * 2 > _GPU_CURRENT_BYTES:  
-                _GPU_TENSOR = torch.empty(2 * required_gpu_bytes // p.data.element_size(), 
-                                        dtype=p.data.dtype, device=p._vllm_original_device)
-                _GPU_CURRENT_BYTES = _GPU_TENSOR.numel() * _GPU_TENSOR.element_size()
+        # Assigning twice the max layer size for double buffering
+        if required_gpu_bytes * 2 > _GPU_CURRENT_BYTES:  
+            _GPU_TENSOR = torch.empty(2 * required_gpu_bytes // p.data.element_size(), 
+                                    dtype=p.data.dtype, device=p._vllm_original_device)
+            _GPU_CURRENT_BYTES = _GPU_TENSOR.numel() * _GPU_TENSOR.element_size()
 
     dataCopyStream = torch.Stream()
 
