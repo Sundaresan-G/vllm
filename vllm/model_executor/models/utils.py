@@ -679,7 +679,7 @@ def make_layers(
     dataCopyStream = torch.Stream()
 
     # split gpu tensor into two without creating new
-    tensors = torch.split(_GPU_TENSOR, [_GPU_TENSOR.numel()//2, _GPU_TENSOR.numel()//2])
+    tensors = torch.chunk(_GPU_TENSOR, 2)
 
     curr_tensor_idx = 0
     next_tensor_idx = 1
