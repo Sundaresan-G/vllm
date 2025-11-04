@@ -490,6 +490,7 @@ async def benchmark(
     ramp_up_start_rps: Optional[int] = None,
     ramp_up_end_rps: Optional[int] = None,
     ready_check_timeout_sec: int = 600,
+    warmup_requests: Optional[list[list[SampleRequest]]] = None,
 ):
     try:
         request_func = ASYNC_REQUEST_FUNCS[endpoint_type]
@@ -522,45 +523,58 @@ async def benchmark(
         input_requests[0].multi_modal_data,
     )
 
-    assert (
-        test_mm_content is None
-        or isinstance(test_mm_content, dict)
-        or (
-            isinstance(test_mm_content, list)
-            and all(isinstance(item, dict) for item in test_mm_content)
-        )
-    ), "multi_modal_data must be a dict or list[dict]"
-    test_input = RequestFuncInput(
-        model=model_id,
-        model_name=model_name,
-        prompt=test_prompt,
-        api_url=api_url,
-        prompt_len=test_prompt_len,
-        output_len=test_output_len,
-        logprobs=logprobs,
-        multi_modal_content=test_mm_content,
-        ignore_eos=ignore_eos,
-        extra_headers=extra_headers,
-        extra_body=extra_body,
-    )
+    if warmup_requests is not None:
+        print(f"Starting {len(warmup_requests)} warmup runs...")
+        for i, warmup in enumerate(warmup_requests):
+            print(f"Warmup run {i+1} with {len(warmup)} requests...")
+            test_prompt, test_prompt_len, test_output_len, test_mm_content = (
+                warmup[0].prompt,
+                warmup[0].prompt_len,
+                warmup[0].expected_output_len,
+                warmup[0].multi_modal_data,
+            )            
 
-    if ready_check_timeout_sec > 0:
-        test_output = await wait_for_endpoint(
-            request_func,
-            test_input,
-            session,
-            timeout_seconds=ready_check_timeout_sec,
-        )
-        if not test_output.success:
-            raise ValueError(
-                "Initial test run failed - Please make sure benchmark "
-                "arguments are correctly specified. "
-                f"Error: {test_output.error}"
+            assert (
+                test_mm_content is None
+                or isinstance(test_mm_content, dict)
+                or (
+                    isinstance(test_mm_content, list)
+                    and all(isinstance(item, dict) for item in test_mm_content)
+                )
+            ), "multi_modal_data must be a dict or list[dict]"
+            test_input = RequestFuncInput(
+                model=model_id,
+                model_name=model_name,
+                prompt=test_prompt,
+                api_url=api_url,
+                prompt_len=test_prompt_len,
+                output_len=test_output_len,
+                logprobs=logprobs,
+                multi_modal_content=test_mm_content,
+                ignore_eos=ignore_eos,
+                extra_headers=extra_headers,
+                extra_body=extra_body,
             )
-        else:
-            print("Initial test run completed. Starting main benchmark run...")
+
+            if ready_check_timeout_sec > 0:
+                test_output = await wait_for_endpoint(
+                    request_func,
+                    test_input,
+                    session,
+                    timeout_seconds=ready_check_timeout_sec,
+                )
+                if not test_output.success:
+                    raise ValueError(
+                        "Initial test run failed - Please make sure benchmark "
+                        "arguments are correctly specified. "
+                        f"Error: {test_output.error}"
+                    )
+                else:
+                    print("Initial test run completed. Starting main benchmark run...")
+            else:
+                print("Skipping endpoint ready check.")
     else:
-        print("Skipping endpoint ready check.")
+        print("Skipping warmup runs.")
 
     if lora_modules:
         # For each input request, choose a LoRA module at random.
@@ -1303,6 +1317,15 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
     input_requests = get_samples(args, tokenizer)
     goodput_config_dict = check_goodput_args(args)
 
+    warmup_runs = 5
+    warmup_requests = []
+    import copy
+    warmup_args = copy.deepcopy(args)
+    warmup_args.num_prompts = min(1, args.num_prompts)
+    for _ in range(warmup_runs):
+        warmup_args.seed += 1
+        warmup_requests.append(get_samples(warmup_args, tokenizer))
+
     backend = args.backend
     task_type = TaskType.EMBEDDING if "embeddings" in backend else TaskType.GENERATION
 
@@ -1363,6 +1386,7 @@ async def main_async(args: argparse.Namespace) -> dict[str, Any]:
         ramp_up_start_rps=args.ramp_up_start_rps,
         ramp_up_end_rps=args.ramp_up_end_rps,
         ready_check_timeout_sec=args.ready_check_timeout_sec,
+        warmup_requests=warmup_requests,
     )
 
     # Save config and results to json
