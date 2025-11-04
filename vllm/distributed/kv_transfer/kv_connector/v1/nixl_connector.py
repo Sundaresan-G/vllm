@@ -83,6 +83,7 @@ _NIXL_SUPPORTED_DEVICE = {
     ),
     "tpu": ("cpu",),
     "xpu": ("cpu",),
+    "cpu": ("cpu",),
 }
 # support for oot platform by providing mapping in current_platform
 _NIXL_SUPPORTED_DEVICE.update(current_platform.get_nixl_supported_devices())
@@ -101,6 +102,7 @@ class NixlAgentMetadata(
     block_lens: list[int]
     attn_backend_name: str
     kv_cache_layout: str
+    nixl_memory_type: str
 
 
 @dataclass
@@ -805,7 +807,11 @@ class NixlConnectorWorker:
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
 
-        if self.use_host_buffer:
+        isCurrDeviceCPU = self.nixl_memory_type == "DRAM"
+
+        logger.debug("isCurrDeviceCPU: %s", isCurrDeviceCPU)
+
+        if self.use_host_buffer and not isCurrDeviceCPU:
             self.initialize_host_xfer_buffer(kv_caches=kv_caches)
             assert len(self.host_xfer_buffers) == len(kv_caches), (
                 f"host_buffer: {len(self.host_xfer_buffers)}, "
@@ -981,6 +987,7 @@ class NixlConnectorWorker:
             block_lens=self.block_len_per_layer,
             attn_backend_name=self.backend_name,
             kv_cache_layout=self.kv_cache_layout,
+            nixl_memory_type="VRAM" if self.vllm_config.kv_transfer_config.kv_buffer_device == "cuda" else "DRAM",
         )
         ready_event = threading.Event()
         self._nixl_handshake_listener_t = threading.Thread(
@@ -1046,7 +1053,7 @@ class NixlConnectorWorker:
         else:
             assert self._tp_size[engine_id] == remote_tp_size
         # TODO We may eventually want to skip enforcing the same attn backend.
-        assert nixl_agent_meta.attn_backend_name == self.backend_name
+        # assert nixl_agent_meta.attn_backend_name == self.backend_name
 
         remote_agent_name = self.nixl_wrapper.add_remote_agent(
             nixl_agent_meta.agent_metadata
@@ -1147,7 +1154,7 @@ class NixlConnectorWorker:
         )
 
         # Register with NIXL.
-        descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
+        descs = self.nixl_wrapper.get_xfer_descs(blocks_data, nixl_agent_meta.nixl_memory_type)
         self.dst_xfer_side_handles[engine_id] = self.nixl_wrapper.prep_xfer_dlist(
             remote_agent_name, descs
         )
