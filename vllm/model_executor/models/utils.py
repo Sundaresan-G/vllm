@@ -650,7 +650,7 @@ def make_layers(
 
     device = modules[0].parameters().__next__()._vllm_original_device if double_buffer_pipeline else None
 
-    if (not double_buffer_pipeline) or device.type not in ("cuda", "xpu"):
+    if (not double_buffer_pipeline) or device.type is "cpu":
         return start_layer, end_layer, modules    
     
     _GPU_CURRENT_BYTES = 0
@@ -682,9 +682,14 @@ def make_layers(
     compute_event = torch.Event()
 
     # Get the current stream
-    curr_stream = torch.cuda.current_stream() if device.type == "cuda" else torch.xpu.current_stream() if device.type == "xpu" else None
-    if curr_stream is None:
-        raise RuntimeError("No CUDA or XPU stream available for double buffer pipeline")
+    device_type = getattr(torch, device.type, None)
+    if device_type is None:
+        raise ValueError(f"Invalid device type: {device.type}")
+
+    stream_type = getattr(device_type, "current_stream", lambda: None)
+    if not callable(stream_type):
+        raise RuntimeError(f"'current_stream' is not callable for device: {device.type}")
+    curr_stream = stream_type()
 
     # Modify the forward function to use the pre-allocated tensor
     for layer_idx, module in enumerate(modules[start_layer:end_layer]):
