@@ -116,7 +116,8 @@ main() {
     echo "Please check prefiller.log, decoder.log and proxy.log for logs."
     export NIXL_DEBUG_LOGGING=1
 
-    KV_BUFFER_DEVICE="cuda" bash prefiller_decoder_vllm_launcher.sh prefiller $MODEL \
+    # If VLLM_OFFLOAD_KV_CACHE_TO_CPU=1, then KV_BUFFER_DEVICE does not matter and it will be ignored.
+    KV_BUFFER_DEVICE="cpu" bash prefiller_decoder_vllm_launcher.sh prefiller $MODEL \
         > >(tee prefiller.log) 2>&1 &
     prefiller_pid=$!
     PIDS+=($prefiller_pid)

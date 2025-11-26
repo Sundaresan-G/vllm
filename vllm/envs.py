@@ -207,6 +207,7 @@ if TYPE_CHECKING:
     VLLM_USE_FBGEMM: bool = False
     VLLM_GC_DEBUG: str = ""
     VLLM_DOUBLE_BUFFER_PIPELINE: bool = False
+    VLLM_OFFLOAD_KV_CACHE_TO_CPU: bool = False
 
 
 def get_default_cache_root():
@@ -1367,6 +1368,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable double pipelining
     "VLLM_DOUBLE_BUFFER_PIPELINE":
     lambda: bool(int(os.getenv("VLLM_DOUBLE_BUFFER_PIPELINE", "0"))),
+
+    # Enable kv_cache_offload_to_cpu
+    "VLLM_OFFLOAD_KV_CACHE_TO_CPU":
+    lambda: bool(int(os.getenv("VLLM_OFFLOAD_KV_CACHE_TO_CPU", "0"))),
     
 }
 

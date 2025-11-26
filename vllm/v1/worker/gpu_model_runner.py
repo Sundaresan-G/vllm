@@ -4100,10 +4100,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             dict[str, torch.Tensor]: A map between layer names to their
             corresponding memory buffer for KV cache.
         """
+        offload_kv_cache_to_cpu : bool = envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU
+
+        if offload_kv_cache_to_cpu:
+            logger.info("Offloading KV cache to CPU is enabled. The entire KV cache will be allocated on CPU memory.")
+        else:
+            logger.debug("Offloading KV cache to CPU is NOT enabled. KV cache will be allocated on GPU memory.")
+
         kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
         for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
             tensor = torch.zeros(
-                kv_cache_tensor.size, dtype=torch.int8, device=self.device
+                kv_cache_tensor.size, dtype=torch.int8, device=self.device if not offload_kv_cache_to_cpu else "cpu", pin_memory=offload_kv_cache_to_cpu if offload_kv_cache_to_cpu else False,
             )
             for layer_name in kv_cache_tensor.shared_by:
                 kv_cache_raw_tensors[layer_name] = tensor

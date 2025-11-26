@@ -29,6 +29,7 @@ export VLLM_LOGGING_LEVEL=DEBUG
 export TORCH_CUDA_ARCH_LIST="12.0"
 export UCX_NET_DEVICES=all
 export UCX_TLS=all
+# export VLLM_KV_CACHE_LAYOUT="NHD" # Do not use this. VLLM accuracy goes for a toss when using this.
 export VLLM_TORCH_PROFILER_WITH_STACK=1 
 export VLLM_TORCH_PROFILER_WITH_FLOPS=1
 export VLLM_TORCH_PROFILER_RECORD_SHAPES=1
@@ -41,6 +42,7 @@ if [[ $1 == "prefiller" ]]; then
 
     # 1st GPU as prefiller
     # OMP_NUM_THREADS=16 \
+    VLLM_OFFLOAD_KV_CACHE_TO_CPU=1 \
     VLLM_CPU_OMP_THREADS_BIND="0-31" \
     VLLM_CPU_SGL_KERNEL="1" \
     VLLM_NIXL_SIDE_CHANNEL_PORT=5600 \
@@ -54,7 +56,8 @@ if [[ $1 == "prefiller" ]]; then
     --max-num-batched-tokens 4096 \
     --block-size $BLOCK_SIZE \
     --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_buffer_device":"'"$KV_BUFFER_DEVICE"'"}' \
-    --enforce-eager
+    --enforce-eager \
+    --no-enable-prefix-caching # Ensure prefiller does not use prefix caching when VLLM_OFFLOAD_KV_CACHE_TO_CPU=1
     
 elif [[ $1 == "decoder" ]]; then
     # Decoder listens on port 8200

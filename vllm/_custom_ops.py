@@ -2022,6 +2022,26 @@ def reshape_and_cache_flash(
         v_scale,
     )
 
+    if envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU:
+
+        from vllm.forward_context import ForwardContext, get_forward_context
+        forward_context : ForwardContext = get_forward_context()
+
+        if hasattr(forward_context, '_curr_layer_offloaded_kv_tensor'):
+            key_cache_cpu, value_cache_cpu = forward_context._curr_layer_offloaded_kv_tensor.unbind(0)
+
+            torch.ops._C_cache_ops.reshape_and_cache_flash(
+                key,
+                value,
+                key_cache_cpu,
+                value_cache_cpu,
+                slot_mapping,
+                kv_cache_dtype,
+                k_scale,
+                v_scale,
+            )
+
+
 
 def concat_and_cache_mla(
     kv_c: torch.Tensor,

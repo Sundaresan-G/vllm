@@ -13,7 +13,7 @@ from transformers import PretrainedConfig
 from typing_extensions import deprecated
 
 import vllm.envs as envs
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -648,113 +648,173 @@ def make_layers(
             for idx in range(start_layer, end_layer)
         ] + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)])
 
-    device = modules[0].parameters().__next__()._vllm_original_device if double_buffer_pipeline else None
+    vllm_config = get_current_vllm_config()
 
-    if (not double_buffer_pipeline) or device.type is "cpu":
-        return start_layer, end_layer, modules    
+    device = vllm_config.device_config.device
+
+    if double_buffer_pipeline and device.type != "cpu":    
     
-    _GPU_CURRENT_BYTES = 0
-    _GPU_TENSOR = None
+        _GPU_CURRENT_BYTES = 0
+        _GPU_TENSOR = None
 
-    for module in modules[start_layer:end_layer]:
-        required_gpu_bytes = 0 
-        for p in module.parameters():
-            required_gpu_bytes += p.data.numel() * p.data.element_size()
+        for module in modules[start_layer:end_layer]:
+            required_gpu_bytes = 0 
+            for p in module.parameters():
+                required_gpu_bytes += p.data.numel() * p.data.element_size()
 
-        # Assigning twice the max layer size for double buffering
-        if required_gpu_bytes * 2 > _GPU_CURRENT_BYTES:  
-            _GPU_TENSOR = torch.empty(2 * required_gpu_bytes // p.data.element_size(), 
-                                    dtype=p.data.dtype, device=p._vllm_original_device)
-            _GPU_CURRENT_BYTES = _GPU_TENSOR.numel() * _GPU_TENSOR.element_size()
+            # Assigning twice the max layer size for double buffering
+            if required_gpu_bytes * 2 > _GPU_CURRENT_BYTES:  
+                _GPU_TENSOR = torch.empty(2 * required_gpu_bytes // p.data.element_size(), 
+                                        dtype=p.data.dtype, device=device)
+                _GPU_CURRENT_BYTES = _GPU_TENSOR.numel() * _GPU_TENSOR.element_size()
 
-    dataCopyStream = torch.Stream()
+        dataCopyStream = torch.Stream()
 
-    # split gpu tensor into two without creating new
-    tensors = torch.chunk(_GPU_TENSOR, 2)
+        # split gpu tensor into two without creating new
+        tensors = torch.chunk(_GPU_TENSOR, 2)
 
-    curr_tensor_idx = 0
-    next_tensor_idx = 1
+        curr_tensor_idx = 0
+        next_tensor_idx = 1
 
-    curr_device_state = {}
-    next_device_state = {}
+        curr_device_state = {}
+        next_device_state = {}
 
-    copy_event = torch.Event()
-    compute_event = torch.Event()
+        copy_event = torch.Event()
+        compute_event = torch.Event()
 
-    # Get the current stream
-    device_type = getattr(torch, device.type, None)
-    if device_type is None:
-        raise ValueError(f"Invalid device type: {device.type}")
+        # Get the current stream
+        device_type = getattr(torch, device.type, None)
+        if device_type is None:
+            raise ValueError(f"Invalid device type: {device.type}")
 
-    stream_type = getattr(device_type, "current_stream", lambda: None)
-    if not callable(stream_type):
-        raise RuntimeError(f"'current_stream' is not callable for device: {device.type}")
-    curr_stream = stream_type()
+        stream_type = getattr(device_type, "current_stream", lambda: None)
+        if not callable(stream_type):
+            raise RuntimeError(f"'current_stream' is not callable for device: {device.type}")
+        curr_stream = stream_type()
 
-    # Modify the forward function to use the pre-allocated tensor
-    for layer_idx, module in enumerate(modules[start_layer:end_layer]):
-        original_forward = module.forward 
+        # Modify the forward function to use the pre-allocated tensor
+        for layer_idx, module in enumerate(modules[start_layer:end_layer]):
+            original_forward = module.forward 
 
-        def make_forward(module, original_forward, layer_idx):
-        
-            def forward(*args, **kwargs):
-
-                # logger.debug("Executing with modified forward for %s", module)
-
-                module.forward = original_forward
-
-                nonlocal curr_tensor_idx, next_tensor_idx, curr_device_state, next_device_state, copy_event, compute_event, dataCopyStream, tensors
-
-                if layer_idx == start_layer:
-                    # Split the tensors[tensor_idx] into module.state_dict() sizes
-                    curr_tensor_split_sizes = [v.numel() for _, v in module.state_dict().items()]
-                    curr_split_tensors = torch.split(tensors[curr_tensor_idx], curr_tensor_split_sizes)
-
-                    # logger.debug("Copying start layer")
-                    
-                    for split_idx, (k, v) in enumerate(module.state_dict().items()):
-                        chunk = curr_split_tensors[split_idx].reshape(v.size())
-                        chunk.copy_(v, non_blocking=True)
-                        curr_device_state[k] = chunk
-
-                if layer_idx < end_layer - 1:
-                    next_device_state.clear()
-
-                    next_module = modules[layer_idx + 1]
-                    next_tensor_split_sizes = [v.numel() for _, v in next_module.state_dict().items()]
-                    next_split_tensors = torch.split(tensors[next_tensor_idx], next_tensor_split_sizes)            
-
-                    for split_idx, (k, v) in enumerate(next_module.state_dict().items()):
-                        chunk = next_split_tensors[split_idx].reshape(v.size())
-                        dataCopyStream.wait_event(compute_event)
-                        with dataCopyStream:
-                            # logger.debug("Copying chunk %s weights to %s", k, v.device)
-                            chunk.copy_(v, non_blocking=True)
-                        next_device_state[k] = chunk
-
-                # Make the default stream wait for the current events to complete
-                curr_stream.wait_event(copy_event)
-
-                copy_event.record(dataCopyStream)            
-
-                # logger.debug("Executing modified forward for layer")
-
-                output = functional_call(module,
-                                        curr_device_state,
-                                        args=args,
-                                        kwargs=kwargs)
-                compute_event.record(curr_stream)
-                module.forward = forward
-
-                # Swap the tensor indices
-                curr_tensor_idx, next_tensor_idx = next_tensor_idx, curr_tensor_idx
-                curr_device_state, next_device_state = next_device_state, curr_device_state
-
-                return output
+            def make_forward(module, original_forward, layer_idx):
             
-            return forward
-        
-        module.forward = make_forward(module, original_forward, layer_idx)
+                def forward(*args, **kwargs):
+
+                    # logger.debug("Executing with modified forward for %s", module)
+
+                    module.forward = original_forward
+
+                    nonlocal curr_tensor_idx, next_tensor_idx, curr_device_state, next_device_state, copy_event, compute_event, dataCopyStream, tensors
+
+                    if layer_idx == start_layer:
+                        # Split the tensors[tensor_idx] into module.state_dict() sizes
+                        curr_tensor_split_sizes = [v.numel() for _, v in module.state_dict().items()]
+                        curr_split_tensors = torch.split(tensors[curr_tensor_idx], curr_tensor_split_sizes)
+
+                        # logger.debug("Copying start layer")
+                        
+                        for split_idx, (k, v) in enumerate(module.state_dict().items()):
+                            chunk = curr_split_tensors[split_idx].reshape(v.size())
+                            chunk.copy_(v, non_blocking=True)
+                            curr_device_state[k] = chunk
+
+                    if layer_idx < end_layer - 1:
+                        next_device_state.clear()
+
+                        next_module = modules[layer_idx + 1]
+                        next_tensor_split_sizes = [v.numel() for _, v in next_module.state_dict().items()]
+                        next_split_tensors = torch.split(tensors[next_tensor_idx], next_tensor_split_sizes)            
+
+                        for split_idx, (k, v) in enumerate(next_module.state_dict().items()):
+                            chunk = next_split_tensors[split_idx].reshape(v.size())
+                            dataCopyStream.wait_event(compute_event)
+                            with dataCopyStream:
+                                # logger.debug("Copying chunk %s weights to %s", k, v.device)
+                                chunk.copy_(v, non_blocking=True)
+                            next_device_state[k] = chunk
+
+                    # Make the default stream wait for the current events to complete
+                    curr_stream.wait_event(copy_event)
+
+                    copy_event.record(dataCopyStream)            
+
+                    # logger.debug("Executing modified forward for layer")
+
+                    output = functional_call(module,
+                                            curr_device_state,
+                                            args=args,
+                                            kwargs=kwargs)
+                    compute_event.record(curr_stream)
+                    module.forward = forward
+
+                    # Swap the tensor indices
+                    curr_tensor_idx, next_tensor_idx = next_tensor_idx, curr_tensor_idx
+                    curr_device_state, next_device_state = next_device_state, curr_device_state
+
+                    return output
+                
+                return forward
+            
+            module.forward = make_forward(module, original_forward, layer_idx)
+
+    
+    offload_kv_cache_to_cpu : bool = envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU
+
+    if offload_kv_cache_to_cpu:
+        logger.info("Offloading KV cache to CPU")
+
+    if offload_kv_cache_to_cpu and device.type != "cpu": 
+
+        kv_tensor = None
+
+        from vllm.forward_context import ForwardContext, get_forward_context
+
+        # Modify the forward function to use the pre-allocated tensor
+        for module in modules[start_layer:end_layer]:
+            attn_module = module.self_attn.attn
+            original_forward = attn_module.forward
+
+            def make_forward(module, original_forward):
+            
+                def forward(*args, **kwargs):
+
+                    # logger.debug("Executing with modified forward for %s", module)
+                    forward_context : ForwardContext = get_forward_context()
+
+                    module.forward = original_forward 
+
+                    nonlocal kv_tensor
+
+                    if forward_context.attn_metadata is not None:
+                        original_kv_cache = forward_context.no_compile_layers[module.layer_name].kv_cache[forward_context.virtual_engine]
+                        if kv_tensor is None:
+                            kv_tensor = torch.zeros_like(original_kv_cache, device=device)
+                        # assert kv_tensors[kv_tensor_idx].numel() >= original_kv_cache.numel(), \
+                        #     f"Preallocated kv tensor size {kv_tensors[kv_tensor_idx].numel()} is less than required size {original_kv_cache.numel()}"
+                        forward_context.no_compile_layers[module.layer_name].kv_cache[forward_context.virtual_engine] = kv_tensor
+
+                        # Add addl. attribute
+                        forward_context._curr_layer_offloaded_kv_tensor = original_kv_cache
+ 
+                    output = functional_call(module,
+                                            module.state_dict(),
+                                            args=args,
+                                            kwargs=kwargs)
+
+                    if hasattr(forward_context, "_curr_layer_offloaded_kv_tensor"):
+                        del forward_context._curr_layer_offloaded_kv_tensor
+                    
+                    module.forward = forward
+
+                    # Restore original kv_cache and metadata
+                    if forward_context.attn_metadata is not None:
+                        forward_context.no_compile_layers[module.layer_name].kv_cache[forward_context.virtual_engine] = original_kv_cache
+
+                    return output
+                
+                return forward
+            
+            attn_module.forward = make_forward(attn_module, original_forward)
 
     return start_layer, end_layer, modules
 

@@ -750,6 +750,7 @@ class NixlConnectorWorker:
         Initialize transfer buffer in CPU mem for accelerators
         NOT directly supported by NIXL (e.g., tpu)
         """
+        logger.info("Allocating memory for KV cache host xfer buffers")
         xfer_buffers: dict[str, torch.Tensor] = {}
         try:
             for layer_name, kv_cache in kv_caches.items():
@@ -767,8 +768,9 @@ class NixlConnectorWorker:
     def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
         """Assign copy (d2h, h2d) operations when host buffer is used."""
         # Set a no-op if the host buffer is not cpu.
-        if self.kv_buffer_device != "cpu":
+        if self.kv_buffer_device != "cpu" or envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU:
             return
+        logger.info("Setting host xfer buffer operations.")
         assert self.use_host_buffer
         self.copy_blocks = copy_operation
 
@@ -807,11 +809,7 @@ class NixlConnectorWorker:
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
 
-        isCurrDeviceCPU = self.nixl_memory_type == "DRAM"
-
-        logger.debug("isCurrDeviceCPU: %s", isCurrDeviceCPU)
-
-        if self.use_host_buffer and not isCurrDeviceCPU:
+        if self.use_host_buffer and not envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU and self.vllm_config.device_config.device_type != "cpu":
             self.initialize_host_xfer_buffer(kv_caches=kv_caches)
             assert len(self.host_xfer_buffers) == len(kv_caches), (
                 f"host_buffer: {len(self.host_xfer_buffers)}, "
