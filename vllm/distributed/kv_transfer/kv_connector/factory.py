@@ -119,3 +119,9 @@ KVConnectorFactory.register_connector(
     "vllm.distributed.kv_transfer.kv_connector.v1.offloading_connector",
     "OffloadingConnector",
 )
+
+KVConnectorFactory.register_connector(
+    "ShmConnector",
+    "vllm.distributed.kv_transfer.kv_connector.v1.shm_connector",
+    "ShmConnector",
+)

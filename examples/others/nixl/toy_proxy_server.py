@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
+import time
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -136,7 +137,16 @@ def get_next_client(app, service_type: str):
     else:
         raise ValueError(f"Unknown service type: {service_type}")
 
+def measure_time(func):
+    async def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = await func(*args, **kwargs)
+        end_time = time.time()
+        print(f"{func.__name__} took {end_time - start_time:.4f} seconds")
+        return result
+    return wrapper
 
+@measure_time
 async def send_request_to_service(
     client_info: dict, endpoint: str, req_data: dict, request_id: str
 ):
@@ -149,8 +159,7 @@ async def send_request_to_service(
         "do_remote_prefill": False,
         "remote_engine_id": None,
         "remote_block_ids": None,
-        "remote_host": None,
-        "remote_port": None,
+        "remote_filename": None,
     }
     req_data["stream"] = False
     req_data["max_tokens"] = 1
@@ -170,7 +179,17 @@ async def send_request_to_service(
 
     return response
 
+def measure_generator_time(func):
+    async def wrapper(*args, **kwargs):
+        start_time = time.time()  # Record the time before the item is generated
+        async for item in func(*args, **kwargs):
+            end_time = time.time()  # Record the time after the item is generated
+            print(f"{func.__name__} generated an item in {end_time - start_time:.4f} seconds")
+            yield item
+            start_time = time.time()  # Record the time before the item is generated again
+    return wrapper
 
+@measure_generator_time
 async def stream_service_response(
     client_info: dict, endpoint: str, req_data: dict, request_id: str
 ):
@@ -214,8 +233,16 @@ async def _handle_completions(api: str, request: Request):
 
         logger.debug("Using %s %s", prefill_client_info, decode_client_info)
 
+        req_data['prompt'] += response_json['choices'][0]['text']
+        # Since the prefill already generated one token, decrement max_tokens by 1
+        if "max_tokens" in req_data:
+            req_data["max_tokens"] -= 1
+
         # Stream response from decode service
         async def generate_stream():
+            prefill_output = b"data: " + response.content
+            yield prefill_output
+            print(f"Proxy server relaying chunk from prefill of size {len(prefill_output)}, chunk: {prefill_output}")
             async for chunk in stream_service_response(
                 decode_client_info, api, req_data, request_id=request_id
             ):

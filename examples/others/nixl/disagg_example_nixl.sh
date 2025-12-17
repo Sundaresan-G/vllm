@@ -117,14 +117,14 @@ main() {
     export NIXL_DEBUG_LOGGING=1
 
     # If VLLM_OFFLOAD_KV_CACHE_TO_CPU=1, then KV_BUFFER_DEVICE does not matter and it will be ignored.
-    KV_BUFFER_DEVICE="cpu" bash prefiller_decoder_vllm_launcher.sh prefiller $MODEL \
+    bash prefiller_decoder_vllm_launcher.sh prefiller $MODEL \
         > >(tee prefiller.log) 2>&1 &
     prefiller_pid=$!
     PIDS+=($prefiller_pid)
 
     conda activate vllm_cpu
 
-    KV_BUFFER_DEVICE="cpu" bash prefiller_decoder_vllm_launcher.sh decoder $MODEL \
+    bash prefiller_decoder_vllm_launcher.sh decoder $MODEL \
         > >(tee decoder.log)  2>&1 &
     decoder_pid=$!
     PIDS+=($decoder_pid)

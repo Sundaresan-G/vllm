@@ -45,7 +45,6 @@ if [[ $1 == "prefiller" ]]; then
     VLLM_OFFLOAD_KV_CACHE_TO_CPU=1 \
     VLLM_CPU_OMP_THREADS_BIND="0-31" \
     VLLM_CPU_SGL_KERNEL="1" \
-    VLLM_NIXL_SIDE_CHANNEL_PORT=5600 \
     VLLM_DOUBLE_BUFFER_PIPELINE=1 \
     CUDA_VISIBLE_DEVICES=0 \
     numactl -C 0-31 \
@@ -55,20 +54,17 @@ if [[ $1 == "prefiller" ]]; then
     --max-num-seqs 512 \
     --max-num-batched-tokens 4096 \
     --block-size $BLOCK_SIZE \
-    --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_buffer_device":"'"$KV_BUFFER_DEVICE"'"}' \
+    --kv-transfer-config '{"kv_connector":"ShmConnector","kv_role":"kv_both"}' \
     --enforce-eager \
     --no-enable-prefix-caching # Ensure prefiller does not use prefix caching when VLLM_OFFLOAD_KV_CACHE_TO_CPU=1
     
 elif [[ $1 == "decoder" ]]; then
     # Decoder listens on port 8200
 
-    source /swtools/cuda/12.9.0/cuda_vars.sh
-
     # 2nd GPU as decoder
     # OMP_NUM_THREADS=32 \
     VLLM_CPU_OMP_THREADS_BIND="32-63" \
     VLLM_CPU_SGL_KERNEL="1" \
-    VLLM_NIXL_SIDE_CHANNEL_PORT=5601 \
     VLLM_DOUBLE_BUFFER_PIPELINE=0 \
     CUDA_VISIBLE_DEVICES=1 \
     numactl -C 32-63 \
@@ -79,7 +75,7 @@ elif [[ $1 == "decoder" ]]; then
     --max-num-seqs 512 \
     --max-num-batched-tokens 4096 \
     --block-size $BLOCK_SIZE \
-    --kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both","kv_buffer_device":"'"$KV_BUFFER_DEVICE"'"}'
+    --kv-transfer-config '{"kv_connector":"ShmConnector","kv_role":"kv_both"}'
 
 else
     echo "Invalid role: $1"

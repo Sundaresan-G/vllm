@@ -25,7 +25,7 @@ VLLM_LOGGING_STREAM = envs.VLLM_LOGGING_STREAM
 
 _FORMAT = (
     f"{VLLM_LOGGING_PREFIX}%(levelname)s %(asctime)s "
-    "[%(fileinfo)s:%(lineno)d] %(message)s"
+    "[%(fileinfo)s:%(lineno)d] %(funcName)s -  %(message)s"
 )
 _DATE_FORMAT = "%m-%d %H:%M:%S"
 
