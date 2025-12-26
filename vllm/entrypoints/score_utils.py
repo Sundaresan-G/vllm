@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Any, Optional, Union, cast
+from typing import Any, TypeAlias, cast
 
 from torch.nn import CosineSimilarity
-from typing_extensions import Required, TypeAlias, TypedDict
+from typing_extensions import Required, TypedDict
 
 from vllm.config import ModelConfig
 from vllm.entrypoints.chat_utils import (
@@ -19,15 +19,11 @@ from vllm.inputs import TokensPrompt
 from vllm.model_executor.models.interfaces import supports_score_template
 from vllm.multimodal.inputs import MultiModalDataDict
 from vllm.outputs import PoolingRequestOutput
-from vllm.transformers_utils.tokenizer import (
-    AnyTokenizer,
-    PreTrainedTokenizer,
-    PreTrainedTokenizerFast,
-)
+from vllm.tokenizers import TokenizerLike
 
-ScoreContentPartParam: TypeAlias = Union[
-    ChatCompletionContentPartImageParam, ChatCompletionContentPartImageEmbedsParam
-]
+ScoreContentPartParam: TypeAlias = (
+    ChatCompletionContentPartImageParam | ChatCompletionContentPartImageEmbedsParam
+)
 
 
 class ScoreMultiModalParam(TypedDict, total=False):
@@ -45,18 +41,18 @@ class ScoreMultiModalParam(TypedDict, total=False):
 
 
 def _cosine_similarity(
-    tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
+    tokenizer: TokenizerLike,
     embed_1: list[PoolingRequestOutput],
     embed_2: list[PoolingRequestOutput],
 ) -> list[PoolingRequestOutput]:
     scorer = CosineSimilarity(0)
-    scores: Union[list[PoolingRequestOutput]] = []
+    scores: list[PoolingRequestOutput] = []
 
     for emb_1, emb_2 in zip(embed_1, embed_2):
         pair_score = scorer(emb_1.outputs.data, emb_2.outputs.data)
 
-        padding = []
-        if (pad_token_id := getattr(tokenizer, "pad_token_id", None)) is not None:
+        padding: list[int] = []
+        if (pad_token_id := tokenizer.pad_token_id) is not None:
             padding = [pad_token_id]
 
         tokens = emb_1.prompt_token_ids + padding + emb_2.prompt_token_ids
@@ -66,6 +62,7 @@ def _cosine_similarity(
                 request_id=f"{emb_1.request_id}_{emb_2.request_id}",
                 outputs=pair_score,
                 prompt_token_ids=tokens,
+                num_cached_tokens=emb_1.num_cached_tokens + emb_2.num_cached_tokens,
                 finished=True,
             )
         )
@@ -74,8 +71,8 @@ def _cosine_similarity(
 
 
 def _validate_score_input_lens(
-    data_1: Union[list[str], list[ScoreContentPartParam]],
-    data_2: Union[list[str], list[ScoreContentPartParam]],
+    data_1: list[str] | list[ScoreContentPartParam],
+    data_2: list[str] | list[ScoreContentPartParam],
 ):
     len_1 = len(data_1)
     len_2 = len(data_2)
@@ -89,18 +86,16 @@ def _validate_score_input_lens(
 
 
 def parse_score_data(
-    data_1: Union[str, ScoreContentPartParam],
-    data_2: Union[str, ScoreContentPartParam],
+    data_1: str | ScoreContentPartParam,
+    data_2: str | ScoreContentPartParam,
     model_config: ModelConfig,
-    tokenizer: AnyTokenizer,
-) -> tuple[str, str, Optional[MultiModalDataDict]]:
-    mm_tracker = MultiModalItemTracker(model_config, tokenizer)
+) -> tuple[str, str, MultiModalDataDict | None]:
+    mm_tracker = MultiModalItemTracker(model_config)
 
     content_1 = _parse_score_content(data_1, mm_tracker)
-
     content_2 = _parse_score_content(data_2, mm_tracker)
 
-    def ensure_str(content: Optional[_ContentPart]) -> str:
+    def ensure_str(content: _ContentPart | None) -> str:
         if content is not None and isinstance(content, str):
             return cast(str, content)
         else:
@@ -113,16 +108,18 @@ def parse_score_data(
 
 
 def _parse_score_content(
-    data: Union[str, ScoreContentPartParam],
+    data: str | ScoreContentPartParam,
     mm_tracker: BaseMultiModalItemTracker,
-) -> Optional[_ContentPart]:
+) -> _ContentPart | None:
     if isinstance(data, str):
-        data = ChatCompletionContentPartTextParam(type="text", text=data)
+        part = ChatCompletionContentPartTextParam(type="text", text=data)
+    else:
+        part = data
 
     mm_parser = mm_tracker.create_parser()
 
     parse_res = _parse_chat_message_content_part(
-        data,
+        part,
         mm_parser,
         wrap_dicts=False,
         interleave_strings=False,
@@ -180,16 +177,15 @@ def post_process_tokens(
 
 def get_score_prompt(
     model_config: ModelConfig,
-    tokenizer: AnyTokenizer,
+    tokenizer: TokenizerLike,
     tokenization_kwargs: dict[str, Any],
-    data_1: Union[str, ScoreContentPartParam],
-    data_2: Union[str, ScoreContentPartParam],
+    data_1: str | ScoreContentPartParam,
+    data_2: str | ScoreContentPartParam,
 ) -> tuple[str, TokensPrompt]:
     prompt_1, prompt_2, mm_data = parse_score_data(
         data_1,
         data_2,
         model_config,
-        tokenizer,
     )
     from vllm.model_executor.model_loader import get_model_cls
 

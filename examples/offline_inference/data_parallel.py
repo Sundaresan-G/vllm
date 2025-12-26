@@ -33,7 +33,8 @@ import os
 from time import sleep
 
 from vllm import LLM, SamplingParams
-from vllm.utils import get_open_port
+from vllm.platforms import current_platform
+from vllm.utils.network_utils import get_open_port
 
 
 def parse_args():
@@ -95,7 +96,7 @@ def parse_args():
     parser.add_argument(
         "--compilation-config",
         type=int,
-        help=("Compilation optimization (O) level 0-3."),
+        help=("Compilation optimization (O) mode 0-3."),
     )
     parser.add_argument(
         "--quantization",
@@ -221,6 +222,11 @@ if __name__ == "__main__":
     dp_per_node = dp_size // node_size
 
     from multiprocessing import Process
+
+    if current_platform.is_rocm():
+        from multiprocessing import set_start_method
+
+        set_start_method("spawn", force=True)
 
     procs = []
     for local_dp_rank, global_dp_rank in enumerate(

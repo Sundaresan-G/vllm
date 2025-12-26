@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from typing import Optional
 
 import pytest
 import torch
@@ -10,13 +9,6 @@ from vllm.platforms import current_platform
 from ....utils import large_gpu_mark
 from ...registry import HF_EXAMPLE_MODELS
 from ...utils import check_logprobs_close
-
-# These have unsupported head_dim for FA. We do not
-# have a clean way to fall back, so we fail with
-# a clear msg when it happens.
-# https://github.com/vllm-project/vllm/issues/14524
-# NOTE(woosuk): Skipping these tests until V1 supports them.
-# REQUIRES_V0 = ["microsoft/phi-2", "stabilityai/stablelm-3b-4e1t"]
 
 # This list contains the model that are using AITER kernel.
 # Skip model that are not using AITER tests.
@@ -39,7 +31,11 @@ AITER_MODEL_LIST = [
     [
         pytest.param(
             "bigscience/bloom-560m",  # bloom - testing alibi slopes
-            marks=[pytest.mark.core_model, pytest.mark.slow_test],
+            marks=[
+                pytest.mark.core_model,
+                pytest.mark.slow_test,
+                pytest.mark.cpu_model,
+            ],
         ),
         pytest.param(
             "openai-community/gpt2",  # gpt2
@@ -57,6 +53,10 @@ AITER_MODEL_LIST = [
             ],
         ),
         pytest.param(
+            "google/gemma-2-2b-it",  # test hybrid attention
+            marks=[pytest.mark.cpu_model],
+        ),
+        pytest.param(
             "zai-org/chatglm3-6b",  # chatglm (text-only)
         ),
         pytest.param(
@@ -65,7 +65,6 @@ AITER_MODEL_LIST = [
         ),
         pytest.param(
             "openbmb/MiniCPM3-4B",
-            # fused_moe not supported on CPU
             marks=[pytest.mark.core_model, large_gpu_mark(min_gb=32)],
         ),
         pytest.param(
@@ -94,13 +93,9 @@ AITER_MODEL_LIST = [
         pytest.param("bigcode/starcoder2-3b"),  # starcoder2
         pytest.param(
             "TitanML/tiny-mixtral",  # mixtral
-            marks=[pytest.mark.core_model],
+            marks=[pytest.mark.core_model, pytest.mark.cpu_model],
         ),
-        pytest.param(
-            "allenai/OLMoE-1B-7B-0924-Instruct",
-            marks=[pytest.mark.cpu_model],
-        ),
-        pytest.param("swiss-ai/Apertus-8B-2509"),  # apertus
+        pytest.param("swiss-ai/Apertus-8B-Instruct-2509"),  # apertus
     ],
 )
 @pytest.mark.parametrize("max_tokens", [32])
@@ -138,7 +133,7 @@ def test_models(
             example_prompts, max_tokens, num_logprobs
         )
 
-        prompt_embeds: Optional[list[torch.Tensor]] = [] if use_prompt_embeds else None
+        prompt_embeds: list[torch.Tensor] | None = [] if use_prompt_embeds else None
 
         prompt_token_ids = []
         for prompt in example_prompts:

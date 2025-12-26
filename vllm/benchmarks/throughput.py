@@ -9,18 +9,19 @@ import os
 import random
 import time
 import warnings
-from typing import Any, Optional, Union
+from typing import Any
 
 import torch
 import uvloop
 from tqdm import tqdm
-from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
+from transformers import AutoModelForCausalLM, PreTrainedTokenizerBase
 
 from vllm.benchmarks.datasets import (
     AIMODataset,
     BurstGPTDataset,
     ConversationDataset,
     InstructCoderDataset,
+    MultiModalConversationDataset,
     PrefixRepetitionRandomDataset,
     RandomDataset,
     SampleRequest,
@@ -34,7 +35,8 @@ from vllm.inputs import TextPrompt, TokensPrompt
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import BeamSearchParams
-from vllm.utils import merge_async_iterators
+from vllm.tokenizers import TokenizerLike, get_tokenizer
+from vllm.utils.async_utils import merge_async_iterators
 
 
 def run_vllm(
@@ -43,7 +45,7 @@ def run_vllm(
     engine_args: EngineArgs,
     do_profile: bool,
     disable_detokenize: bool = False,
-) -> tuple[float, Optional[list[RequestOutput]]]:
+) -> tuple[float, list[RequestOutput] | None]:
     from vllm import LLM, SamplingParams
 
     llm = LLM(**dataclasses.asdict(engine_args))
@@ -56,19 +58,19 @@ def run_vllm(
         " prompt_len and expected_output_len for all requests."
     )
     # Add the requests to the engine.
-    prompts: list[Union[TextPrompt, TokensPrompt]] = []
+    prompts: list[TextPrompt | TokensPrompt] = []
     sampling_params: list[SamplingParams] = []
     for request in requests:
-        prompts.append(
-            TokensPrompt(
-                prompt_token_ids=request.prompt["prompt_token_ids"],
-                multi_modal_data=request.multi_modal_data,
-            )
+        prompt = (
+            TokensPrompt(prompt_token_ids=request.prompt["prompt_token_ids"])
             if "prompt_token_ids" in request.prompt
-            else TextPrompt(
-                prompt=request.prompt, multi_modal_data=request.multi_modal_data
-            )
+            else TextPrompt(prompt=request.prompt)
         )
+        if request.multi_modal_data:
+            assert isinstance(request.multi_modal_data, dict)
+            prompt["multi_modal_data"] = request.multi_modal_data
+        prompts.append(prompt)
+
         sampling_params.append(
             SamplingParams(
                 n=n,
@@ -79,7 +81,7 @@ def run_vllm(
                 detokenize=not disable_detokenize,
             )
         )
-    lora_requests: Optional[list[LoRARequest]] = None
+    lora_requests: list[LoRARequest] | None = None
     if engine_args.enable_lora:
         lora_requests = [request.lora_request for request in requests]
 
@@ -186,7 +188,7 @@ async def run_vllm_async(
         engine_args,
         disable_frontend_multiprocessing=disable_frontend_multiprocessing,
     ) as llm:
-        model_config = await llm.get_model_config()
+        model_config = llm.model_config
         assert all(
             model_config.max_model_len
             >= (request.prompt_len + request.expected_output_len)
@@ -197,9 +199,9 @@ async def run_vllm_async(
         )
 
         # Add the requests to the engine.
-        prompts: list[Union[TextPrompt, TokensPrompt]] = []
+        prompts: list[TextPrompt | TokensPrompt] = []
         sampling_params: list[SamplingParams] = []
-        lora_requests: list[Optional[LoRARequest]] = []
+        lora_requests: list[LoRARequest | None] = []
         for request in requests:
             prompt = (
                 TokensPrompt(prompt_token_ids=request.prompt["prompt_token_ids"])
@@ -221,6 +223,7 @@ async def run_vllm_async(
                     detokenize=not disable_detokenize,
                 )
             )
+            prompts.append(prompt)
             lora_requests.append(request.lora_request)
 
         generators = []
@@ -244,14 +247,17 @@ async def run_vllm_async(
 def run_hf(
     requests: list[SampleRequest],
     model: str,
-    tokenizer: PreTrainedTokenizerBase,
+    tokenizer: TokenizerLike,
     n: int,
     max_batch_size: int,
     trust_remote_code: bool,
     disable_detokenize: bool = False,
 ) -> float:
+    assert isinstance(tokenizer, PreTrainedTokenizerBase), (
+        "the hf backend only supports HF tokenizers"
+    )
     llm = AutoModelForCausalLM.from_pretrained(
-        model, torch_dtype=torch.float16, trust_remote_code=trust_remote_code
+        model, dtype=torch.float16, trust_remote_code=trust_remote_code
     )
     if llm.config.model_type == "llama":
         # To enable padding in the HF backend.
@@ -366,6 +372,11 @@ def get_requests(args, tokenizer):
         elif args.dataset_path in InstructCoderDataset.SUPPORTED_DATASET_PATHS:
             dataset_cls = InstructCoderDataset
             common_kwargs["dataset_split"] = "train"
+        elif args.dataset_path in MultiModalConversationDataset.SUPPORTED_DATASET_PATHS:
+            dataset_cls = MultiModalConversationDataset
+            common_kwargs["dataset_subset"] = args.hf_subset
+            common_kwargs["dataset_split"] = args.hf_split
+            sample_kwargs["enable_multimodal_chat"] = True
         elif args.dataset_path in ConversationDataset.SUPPORTED_DATASET_PATHS:
             dataset_cls = ConversationDataset
             common_kwargs["dataset_subset"] = args.hf_subset
@@ -455,6 +466,7 @@ def validate_args(args):
     elif args.dataset_name == "hf":
         if args.dataset_path in (
             VisionArenaDataset.SUPPORTED_DATASET_PATHS.keys()
+            | MultiModalConversationDataset.SUPPORTED_DATASET_PATHS
             | ConversationDataset.SUPPORTED_DATASET_PATHS
         ):
             assert args.backend == "vllm-chat", (
@@ -643,8 +655,7 @@ def add_cli_args(parser: argparse.ArgumentParser):
         "--profile",
         action="store_true",
         default=False,
-        help="Use Torch Profiler. The env variable "
-        "VLLM_TORCH_PROFILER_DIR must be set to enable profiler.",
+        help="Use vLLM Profiling. --profiler-config must be provided on the server.",
     )
 
     # prefix repetition dataset
@@ -684,19 +695,25 @@ def add_cli_args(parser: argparse.ArgumentParser):
 
 
 def main(args: argparse.Namespace):
-    if args.tokenizer is None:
-        args.tokenizer = args.model
     validate_args(args)
     if args.seed is None:
         args.seed = 0
     random.seed(args.seed)
     # Sample the requests.
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.tokenizer, trust_remote_code=args.trust_remote_code
+    if (
+        args.backend == "hf" or args.backend == "mii"
+    ) and args.tokenizer_mode == "auto":
+        # mistral_common tokenizer is only supported on vllm and vllm-chat backends;
+        # for hf and mii backends, we use hf tokenizer
+        args.tokenizer_mode = "hf"
+    tokenizer = get_tokenizer(
+        args.tokenizer,
+        tokenizer_mode=args.tokenizer_mode,
+        trust_remote_code=args.trust_remote_code,
     )
     requests = get_requests(args, tokenizer)
     is_multi_modal = any(request.multi_modal_data is not None for request in requests)
-    request_outputs: Optional[list[RequestOutput]] = None
+    request_outputs: list[RequestOutput] | None = None
     if args.backend == "vllm":
         if args.async_engine:
             elapsed_time = uvloop.run(

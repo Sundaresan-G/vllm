@@ -5,17 +5,16 @@ import time
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Union
+from typing import Any, NamedTuple
 
 import torch
 
 import vllm.envs as envs
+from vllm.attention.backends.abstract import AttentionMetadata
 from vllm.config import CUDAGraphMode, ParallelConfig, VllmConfig
 from vllm.logger import init_logger
+from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ubatch_utils import UBatchSlices
-
-if TYPE_CHECKING:
-    from vllm.attention.backends.abstract import AttentionMetadata
 
 logger = init_logger(__name__)
 
@@ -34,18 +33,28 @@ class BatchDescriptor(NamedTuple):
     """
 
     num_tokens: int
-    uniform_decode: bool = False
+    num_reqs: int | None = None
     """
-    False can also be used for an uniform decode batch to dispatch to the 
-    cudagraph supporting non-uniform batches.
+    Number of requests in the batch. Can be None for PIECEWISE cudagraphs where
+    the cudagraphs can handle any number of requests.
+    """
+    uniform: bool = False
+    """
+    True if all the requests in the batch have the same number of tokens.
+    """
+    has_lora: bool = False
+    """
+    Whether this batch has active LoRA adapters.
     """
 
-    @property
-    def non_uniform(self) -> "BatchDescriptor":
+    def relax_for_mixed_batch_cudagraphs(self) -> "BatchDescriptor":
         """
-        Return a non-uniform version of current batch descriptor.
+        Return a relaxed version of current batch descriptor that is still compatible
+        with PIECEWISE cudagraphs (or mixed prefill-decode FA cudagraphs).
         """
-        return BatchDescriptor(self.num_tokens, uniform_decode=False)
+        return BatchDescriptor(
+            self.num_tokens, num_reqs=None, uniform=False, has_lora=self.has_lora
+        )
 
 
 def _compute_sp_num_tokens(
@@ -83,7 +92,7 @@ class DPMetadata:
     num_tokens_across_dp_cpu: torch.Tensor
 
     # NOTE: local_sizes should only be set by the chunked_sizes context manager
-    local_sizes: Optional[list[int]] = None
+    local_sizes: list[int] | None = None
 
     @staticmethod
     def make(
@@ -146,7 +155,7 @@ class DPMetadata:
     @contextmanager
     def sp_local_sizes(self, sequence_parallel_size: int):
         """
-        Context mamager for setting self.local_sizes. Same as self.chunked_sizes
+        Context manager for setting self.local_sizes. Same as self.chunked_sizes
         but without any chunking.
         """
         self.local_sizes = _compute_sp_num_tokens(
@@ -157,9 +166,20 @@ class DPMetadata:
         finally:
             self.local_sizes = None
 
-    def get_chunk_sizes_across_dp_rank(self) -> Optional[list[int]]:
+    def get_chunk_sizes_across_dp_rank(self) -> list[int] | None:
         assert self.local_sizes is not None
         return self.local_sizes
+
+    # Get the cumulative tokens across sequence parallel ranks.
+    # In this case the input to the MoEs will be distributed w.r.t both
+    # DP and TP rank.
+    # When sp_size==1, this is just the cummulative num tokens across DP.
+    def cu_tokens_across_sp(self, sp_size: int) -> torch.Tensor:
+        num_tokens_across_sp_cpu = (
+            self.num_tokens_across_dp_cpu - 1 + sp_size
+        ) // sp_size
+        num_tokens_across_sp_cpu = num_tokens_across_sp_cpu.repeat_interleave(sp_size)
+        return torch.cumsum(num_tokens_across_sp_cpu, dim=0)
 
 
 @dataclass
@@ -167,28 +187,23 @@ class ForwardContext:
     # copy from vllm_config.compilation_config.static_forward_context
     no_compile_layers: dict[str, Any]
     """
-    Type AttentionMetadata for v0, 
     Type Dict[str, AttentionMetadata] for v1, map from layer_name of each 
     attention layer to its attention metadata
     Type List[Dict[str, AttentionMetadata]] for DBO. List of size two, one
     for each microbatch.
     Set dynamically for each forward pass
     """
-    attn_metadata: Union[
-        "AttentionMetadata",
-        dict[str, "AttentionMetadata"],
-        list[dict[str, "AttentionMetadata"]],
-    ]
+    attn_metadata: dict[str, AttentionMetadata] | list[dict[str, AttentionMetadata]]
     # TODO: remove after making all virtual_engines share the same kv cache
     virtual_engine: int  # set dynamically for each forward pass
     # set dynamically for each forward pass
-    dp_metadata: Optional[DPMetadata] = None
+    dp_metadata: DPMetadata | None = None
     # determine the cudagraph style at runtime to be FULL, PIECEWISE, or NONE.
     # by default NONE, no cudagraph is used.
     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE
-    batch_descriptor: Optional[BatchDescriptor] = None
+    batch_descriptor: BatchDescriptor | None = None
 
-    ubatch_slices: Optional[UBatchSlices] = None
+    ubatch_slices: UBatchSlices | None = None
 
     def __post_init__(self):
         assert self.cudagraph_runtime_mode.valid_runtime_modes(), (
@@ -196,7 +211,7 @@ class ForwardContext:
         )
 
 
-_forward_context: Optional[ForwardContext] = None
+_forward_context: ForwardContext | None = None
 
 
 def get_forward_context() -> ForwardContext:
@@ -208,14 +223,18 @@ def get_forward_context() -> ForwardContext:
     return _forward_context
 
 
+def is_forward_context_available() -> bool:
+    return _forward_context is not None
+
+
 def create_forward_context(
     attn_metadata: Any,
     vllm_config: VllmConfig,
     virtual_engine: int = 0,
-    dp_metadata: Optional[DPMetadata] = None,
+    dp_metadata: DPMetadata | None = None,
     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
-    batch_descriptor: Optional[BatchDescriptor] = None,
-    ubatch_slices: Optional[UBatchSlices] = None,
+    batch_descriptor: BatchDescriptor | None = None,
+    ubatch_slices: UBatchSlices | None = None,
 ):
     return ForwardContext(
         no_compile_layers=vllm_config.compilation_config.static_forward_context,
@@ -229,7 +248,7 @@ def create_forward_context(
 
 
 @contextmanager
-def override_forward_context(forward_context: Optional[ForwardContext]):
+def override_forward_context(forward_context: ForwardContext | None):
     """A context manager that overrides the current forward context.
     This is used to override the forward context for a specific
     forward pass.
@@ -248,11 +267,11 @@ def set_forward_context(
     attn_metadata: Any,
     vllm_config: VllmConfig,
     virtual_engine: int = 0,
-    num_tokens: Optional[int] = None,
-    num_tokens_across_dp: Optional[torch.Tensor] = None,
+    num_tokens: int | None = None,
+    num_tokens_across_dp: torch.Tensor | None = None,
     cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
-    batch_descriptor: Optional[BatchDescriptor] = None,
-    ubatch_slices: Optional[UBatchSlices] = None,
+    batch_descriptor: BatchDescriptor | None = None,
+    ubatch_slices: UBatchSlices | None = None,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -263,14 +282,32 @@ def set_forward_context(
     if need_to_track_batchsize:
         forward_start_time = time.perf_counter()
 
-    dp_metadata: Optional[DPMetadata] = None
+    dp_metadata: DPMetadata | None = None
     if vllm_config.parallel_config.data_parallel_size > 1 and (
         attn_metadata is not None or num_tokens is not None
     ):
-        assert num_tokens_across_dp is not None
+        # If num_tokens_across_dp hasn't already been initialized, then
+        # initialize it here. Both DP padding and Microbatching will be
+        # disabled.
+        if num_tokens_across_dp is None:
+            assert ubatch_slices is None
+            assert num_tokens is not None
+            _, num_tokens_across_dp, _ = coordinate_batch_across_dp(
+                num_tokens_unpadded=num_tokens,
+                parallel_config=vllm_config.parallel_config,
+                allow_microbatching=False,
+                allow_dp_padding=False,
+            )
+            assert num_tokens_across_dp is not None
         dp_metadata = DPMetadata.make(
             vllm_config.parallel_config, num_tokens or 0, num_tokens_across_dp
         )
+
+    # Convenience: if cudagraph is used and num_tokens is given, we can just
+    # create a batch descriptor here if not given (there's no harm since if it
+    # doesn't match in the wrapper it'll fall through).
+    if cudagraph_runtime_mode != CUDAGraphMode.NONE and num_tokens is not None:
+        batch_descriptor = batch_descriptor or BatchDescriptor(num_tokens=num_tokens)
 
     forward_context = create_forward_context(
         attn_metadata,
@@ -288,14 +325,7 @@ def set_forward_context(
     finally:
         global last_logging_time, batchsize_logging_interval
         if need_to_track_batchsize:
-            if hasattr(attn_metadata, "num_prefill_tokens"):
-                # for v0 attention backends
-                batchsize = (
-                    attn_metadata.num_prefill_tokens + attn_metadata.num_decode_tokens
-                )
-            else:
-                # for v1 attention backends
-                batchsize = num_tokens
+            batchsize = num_tokens
             # we use synchronous scheduling right now,
             # adding a sync point here should not affect
             # scheduling of the next batch

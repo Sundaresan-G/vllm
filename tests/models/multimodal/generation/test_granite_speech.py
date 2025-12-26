@@ -2,13 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from collections.abc import Sequence
-from typing import Optional
 
 import pytest
 from transformers import AutoModelForSpeechSeq2Seq
 
 from vllm.logprobs import SampleLogprobs
 from vllm.lora.request import LoRARequest
+from vllm.platforms import current_platform
 
 from ....conftest import AudioTestAssets, HfRunner, PromptAudioInput, VllmRunner
 from ...registry import HF_EXAMPLE_MODELS
@@ -18,8 +18,8 @@ HF_AUDIO_PROMPT = "<|start_of_role|>system<|end_of_role|>Knowledge Cutoff Date: 
 
 
 def vllm_to_hf_output(
-    vllm_output: tuple[list[int], str, Optional[SampleLogprobs]],
-) -> tuple[list[int], str, Optional[SampleLogprobs]]:
+    vllm_output: tuple[list[int], str, SampleLogprobs | None],
+) -> tuple[list[int], str, SampleLogprobs | None]:
     """Sanitize hf output to be comparable with vllm output."""
     output_ids, output_str, out_logprobs = vllm_output
 
@@ -35,6 +35,12 @@ audio_lora_path = MODEL_NAME
 models = [MODEL_NAME]
 
 
+@pytest.fixture(autouse=True)
+def set_attention_backend_for_rocm(monkeypatch):
+    if current_platform.is_rocm():
+        monkeypatch.setenv("VLLM_ATTENTION_BACKEND", "TRITON_ATTN")
+
+
 def run_test(
     hf_runner: type[HfRunner],
     vllm_runner: type[VllmRunner],
@@ -46,7 +52,7 @@ def run_test(
     max_tokens: int,
     num_logprobs: int,
     tensor_parallel_size: int,
-    distributed_executor_backend: Optional[str] = None,
+    distributed_executor_backend: str | None = None,
 ):
     """Inference result should be the same between hf and vllm.
 
@@ -112,8 +118,12 @@ def run_test(
 
 
 @pytest.mark.parametrize("model", models)
-@pytest.mark.parametrize("dtype", ["bfloat16"])
-@pytest.mark.parametrize("max_model_len", [2048])
+@pytest.mark.parametrize(
+    "dtype", ["float16"] if current_platform.is_rocm() else ["bfloat16"]
+)
+@pytest.mark.parametrize(
+    "max_model_len", [512] if current_platform.is_rocm() else [2048]
+)
 @pytest.mark.parametrize("max_tokens", [128])
 @pytest.mark.parametrize("num_logprobs", [10])
 def test_models(

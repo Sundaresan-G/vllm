@@ -5,8 +5,6 @@
 Run `pytest tests/kernels/test_moe_permute_unpermute.py`.
 """
 
-from typing import Optional
-
 import numpy as np
 import pytest
 import torch
@@ -25,6 +23,12 @@ TOP_KS = [2, 6, 8]
 EP_SIZE = [1, 4, 16]
 current_platform.seed_everything(0)
 
+if current_platform.is_rocm():
+    pytest.skip(
+        "moe_permute_unpermute_supported is not defined for ROCm",
+        allow_module_level=True,
+    )
+
 
 def torch_permute(
     hidden_states: torch.Tensor,
@@ -34,8 +38,8 @@ def torch_permute(
     n_expert: int,
     n_local_expert: int,
     start_expert: int,
-    expert_map: Optional[torch.Tensor] = None,
-    align_block_size: Optional[int] = None,
+    expert_map: torch.Tensor | None = None,
+    align_block_size: int | None = None,
     fill_invalid_expert: int = -1,
 ) -> list[torch.Tensor]:
     n_token, n_hidden = hidden_states.shape[0], hidden_states.shape[1]
@@ -210,7 +214,7 @@ def test_moe_permute_unpermute(
     n_expert: int,
     ep_size: int,
     dtype: torch.dtype,
-    align_block_size: Optional[int],
+    align_block_size: int | None,
 ):
     if not moe_permute_unpermute_supported():
         pytest.skip("moe_permute_unpermute is not supported on this platform.")
@@ -219,7 +223,7 @@ def test_moe_permute_unpermute(
     expert_map = None
     n_local_expert = n_expert
     if ep_size != 1:
-        n_local_expert, expert_map = determine_expert_map(ep_size, ep_rank, n_expert)
+        n_local_expert, expert_map, _ = determine_expert_map(ep_size, ep_rank, n_expert)
         expert_map = expert_map.cuda()
     start_expert = n_local_expert * ep_rank
     current_platform.seed_everything(0)

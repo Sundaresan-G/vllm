@@ -3,11 +3,11 @@
 
 import asyncio
 import atexit
-from collections.abc import Iterable
+from collections.abc import Generator, Set
 from concurrent.futures import ThreadPoolExecutor
 from itertools import groupby
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, TypeVar, Union
+from typing import TYPE_CHECKING, Any, TypeVar
 from urllib.parse import ParseResult, urlparse
 from urllib.request import url2pathname
 
@@ -18,42 +18,46 @@ from PIL import Image, UnidentifiedImageError
 
 import vllm.envs as envs
 from vllm.connections import HTTPConnection, global_http_connection
-from vllm.utils.jsontree import json_map_leaves
+from vllm.logger import init_logger
+from vllm.utils.registry import ExtensionManager
 
-from .audio import AudioMediaIO
+from .audio import AudioEmbeddingMediaIO, AudioMediaIO
 from .base import MediaIO
 from .image import ImageEmbeddingMediaIO, ImageMediaIO
 from .video import VideoMediaIO
-
-_M = TypeVar("_M")
 
 if TYPE_CHECKING:
     from .inputs import (
         BatchedTensorInputs,
         MultiModalKwargsItem,
-        MultiModalKwargsItems,
         MultiModalPlaceholderDict,
     )
 else:
     BatchedTensorInputs = Any
     MultiModalKwargsItem = Any
-    MultiModalKwargsItems = Any
     MultiModalPlaceholderDict = Any
+
+logger = init_logger(__name__)
 
 global_thread_pool = ThreadPoolExecutor(
     max_workers=envs.VLLM_MEDIA_LOADING_THREAD_COUNT
 )
 atexit.register(global_thread_pool.shutdown)
 
+_M = TypeVar("_M")
 
+MEDIA_CONNECTOR_REGISTRY = ExtensionManager()
+
+
+@MEDIA_CONNECTOR_REGISTRY.register("http")
 class MediaConnector:
     def __init__(
         self,
-        media_io_kwargs: Optional[dict[str, dict[str, Any]]] = None,
+        media_io_kwargs: dict[str, dict[str, Any]] | None = None,
         connection: HTTPConnection = global_http_connection,
         *,
         allowed_local_media_path: str = "",
-        allowed_media_domains: Optional[list[str]] = None,
+        allowed_media_domains: list[str] | None = None,
     ) -> None:
         """
         Args:
@@ -62,8 +66,9 @@ class MediaConnector:
                              to set num_frames for video, set
                              `--media-io-kwargs '{"video":{"num_frames":40}}'`
             connection: HTTP connection client to download media contents.
-            allowed_local_media_path: A local directory to load media files
-                                      from.
+            allowed_local_media_path: A local directory to load media files from.
+            allowed_media_domains: If set, only media URLs that belong to this
+                                   domain can be used for multi-modal inputs.
         """
         super().__init__()
 
@@ -118,16 +123,16 @@ class MediaConnector:
                 "Cannot load local files without `--allowed-local-media-path`."
             )
 
-        filepath = Path(url2pathname(url_spec.path))
+        filepath = Path(url2pathname(url_spec.netloc + url_spec.path))
         if allowed_local_media_path not in filepath.resolve().parents:
             raise ValueError(
                 f"The file path {filepath} must be a subpath "
-                f"of `--allowed-local-media-path` {allowed_local_media_path}."
+                f"of `--allowed-local-media-path {allowed_local_media_path}`."
             )
 
         return media_io.load_file(filepath)
 
-    def _assert_url_in_allowed_media_domains(self, url_spec) -> None:
+    def _assert_url_in_allowed_media_domains(self, url_spec: ParseResult) -> None:
         if (
             self.allowed_media_domains
             and url_spec.hostname not in self.allowed_media_domains
@@ -143,7 +148,7 @@ class MediaConnector:
         url: str,
         media_io: MediaIO[_M],
         *,
-        fetch_timeout: Optional[int] = None,
+        fetch_timeout: int | None = None,
     ) -> _M:  # type: ignore[type-var]
         url_spec = urlparse(url)
 
@@ -173,7 +178,7 @@ class MediaConnector:
         url: str,
         media_io: MediaIO[_M],
         *,
-        fetch_timeout: Optional[int] = None,
+        fetch_timeout: int | None = None,
     ) -> _M:
         url_spec = urlparse(url)
         loop = asyncio.get_running_loop()
@@ -207,7 +212,7 @@ class MediaConnector:
     def fetch_audio(
         self,
         audio_url: str,
-    ) -> tuple[np.ndarray, Union[int, float]]:
+    ) -> tuple[np.ndarray, int | float]:
         """
         Load audio from a URL.
         """
@@ -222,7 +227,7 @@ class MediaConnector:
     async def fetch_audio_async(
         self,
         audio_url: str,
-    ) -> tuple[np.ndarray, Union[int, float]]:
+    ) -> tuple[np.ndarray, int | float]:
         """
         Asynchronously fetch audio from a URL.
         """
@@ -337,6 +342,17 @@ class MediaConnector:
 
         return image_embedding_io.load_base64("", data)
 
+    def fetch_audio_embedding(
+        self,
+        data: str,
+    ) -> torch.Tensor:
+        """
+        Load audio embedding from a URL.
+        """
+        audio_embedding_io = AudioEmbeddingMediaIO()
+
+        return audio_embedding_io.load_base64("", data)
+
 
 def encode_audio_base64(
     audio: np.ndarray,
@@ -396,8 +412,9 @@ def group_mm_kwargs_by_modality(
     *,
     device: torch.types.Device = None,
     pin_memory: bool = False,
-    merge_by_field_config: Optional[bool] = None,
-) -> Iterable[tuple[str, int, BatchedTensorInputs]]:
+    merge_by_field_config: bool | None = None,
+    multimodal_cpu_fields: Set[str] | None = None,
+) -> Generator[tuple[str, int, BatchedTensorInputs], None, None]:
     """Group consecutive `MultiModalKwargsItem`s from `mm_kwargs` with the same
     modality together into the same `MultiModalKwargs` instance.
 
@@ -409,84 +426,88 @@ def group_mm_kwargs_by_modality(
     Yields:
         A tuple `(modality, num_items, grouped_kwargs)`.
     """
-    if merge_by_field_config is None:
-        raise RuntimeError(
-            "`group_mm_kwargs_by_modality` now requires "
-            "`merge_by_field_config` arg, please update your model runner "
-            "according to https://github.com/vllm-project/vllm/pull/25676."
+    if merge_by_field_config is not None:
+        logger.warning_once(
+            "The `merge_by_field_config` argument of `group_mm_kwargs_by_modality` "
+            "is deprecated and will be removed in v0.14."
+        )
+    if multimodal_cpu_fields is not None:
+        logger.warning_once(
+            "The `multimodal_cpu_fields` argument of `group_mm_kwargs_by_modality` "
+            "is deprecated and will be removed in v0.14."
         )
 
-    from vllm.multimodal.inputs import MultiModalKwargs, MultiModalKwargsItems
+    from vllm.multimodal.inputs import MultiModalKwargsItems
 
     for modality, items in groupby(mm_kwargs, key=lambda item: item.modality):
         items_lst = list(items)
+        mm_kwargs_items = MultiModalKwargsItems.from_seq(items_lst)
+        mm_kwargs_data = mm_kwargs_items.get_data(
+            device=device,
+            pin_memory=pin_memory,
+        )
 
-        # TODO: Deprecate `merge_by_field_config` once
-        # we have migrated all in-tree models
-        if merge_by_field_config:
-            mm_kwargs_group: BatchedTensorInputs = dict(
-                MultiModalKwargsItems.from_seq(items_lst).get_data(
-                    pin_memory=pin_memory
-                )
-            )
-
-            if device is not None:
-                mm_kwargs_group = json_map_leaves(
-                    lambda x: x.to(device=device),
-                    mm_kwargs_group,
-                )
-        else:
-            mm_kwargs_group = MultiModalKwargs.as_kwargs(
-                MultiModalKwargs.batch(
-                    [
-                        MultiModalKwargsItems.from_seq([item]).get_data()
-                        for item in items_lst
-                    ],
-                    pin_memory=pin_memory,
-                ),
-                device=device,
-            )
-
-        yield modality, len(items_lst), mm_kwargs_group
+        yield modality, len(items_lst), mm_kwargs_data
 
 
 def fetch_audio(
     audio_url: str,
-    audio_io_kwargs: Optional[dict[str, Any]] = None,
-) -> tuple[np.ndarray, Union[int, float]]:
+    audio_io_kwargs: dict[str, Any] | None = None,
+) -> tuple[np.ndarray, int | float]:
     """
     Args:
         audio_url: URL of the audio file to fetch.
         audio_io_kwargs: Additional kwargs passed to handle audio IO.
+
+    Warning:
+        This method has direct access to local files and is only intended
+        to be called by user code. Never call this from the online server!
     """
     media_io_kwargs = None if not audio_io_kwargs else {"audio": audio_io_kwargs}
-    media_connector = MediaConnector(media_io_kwargs=media_io_kwargs)
+    media_connector = MediaConnector(
+        media_io_kwargs=media_io_kwargs,
+        allowed_local_media_path="/",
+    )
     return media_connector.fetch_audio(audio_url)
 
 
 def fetch_image(
     image_url: str,
-    image_io_kwargs: Optional[dict[str, Any]] = None,
+    image_io_kwargs: dict[str, Any] | None = None,
 ) -> Image.Image:
     """
     Args:
         image_url: URL of the image file to fetch.
         image_io_kwargs: Additional kwargs passed to handle image IO.
+
+    Warning:
+        This method has direct access to local files and is only intended
+        to be called by user code. Never call this from the online server!
     """
     media_io_kwargs = None if not image_io_kwargs else {"image": image_io_kwargs}
-    media_connector = MediaConnector(media_io_kwargs=media_io_kwargs)
+    media_connector = MediaConnector(
+        media_io_kwargs=media_io_kwargs,
+        allowed_local_media_path="/",
+    )
     return media_connector.fetch_image(image_url)
 
 
 def fetch_video(
     video_url: str,
-    video_io_kwargs: Optional[dict[str, Any]] = None,
+    video_io_kwargs: dict[str, Any] | None = None,
 ) -> tuple[npt.NDArray, dict[str, Any]]:
     """
     Args:
         video_url: URL of the video file to fetch.
         video_io_kwargs: Additional kwargs passed to handle video IO.
+
+    Warning:
+        This method has direct access to local files and is only intended
+        to be called by user code. Never call this from the online server!
     """
     media_io_kwargs = None if not video_io_kwargs else {"video": video_io_kwargs}
-    media_connector = MediaConnector(media_io_kwargs=media_io_kwargs)
+    media_connector = MediaConnector(
+        media_io_kwargs=media_io_kwargs,
+        allowed_local_media_path="/",
+    )
     return media_connector.fetch_video(video_url)

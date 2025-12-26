@@ -3,13 +3,12 @@
 """Utility functions for attention-related v1 tests."""
 
 from dataclasses import dataclass
-from typing import Optional, Union
 
 import pytest
 import torch
 
 from vllm.attention.backends.abstract import AttentionImpl
-from vllm.attention.backends.registry import _Backend, backend_to_class_str
+from vllm.attention.backends.registry import AttentionBackendEnum
 from vllm.config import (
     CacheConfig,
     CompilationConfig,
@@ -21,7 +20,6 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.config.model import ModelDType
-from vllm.utils import resolve_obj_by_qualname
 from vllm.v1.attention.backends.utils import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
@@ -108,8 +106,8 @@ def create_common_attn_metadata(
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc_cpu,
         seq_lens=seq_lens,
-        seq_lens_cpu=seq_lens_cpu,
-        num_computed_tokens_cpu=num_computed_tokens_cpu,
+        _seq_lens_cpu=seq_lens_cpu,
+        _num_computed_tokens_cpu=num_computed_tokens_cpu,
         num_reqs=batch_spec.batch_size,
         num_actual_tokens=num_tokens,
         max_query_len=max_query_len,
@@ -121,15 +119,14 @@ def create_common_attn_metadata(
 
 
 def try_get_attention_backend(
-    backend: _Backend,
+    backend: AttentionBackendEnum,
 ) -> tuple[type[AttentionMetadataBuilder], type[AttentionImpl]]:
     """Try to get the attention backend class, skipping test if not found."""
-    backend_class_str = backend_to_class_str(backend)
     try:
-        backend_class = resolve_obj_by_qualname(backend_class_str)
+        backend_class = backend.get_class()
         return backend_class.get_builder_cls(), backend_class.get_impl_cls()
     except ImportError as e:
-        pytest.skip(f"{backend_class_str} not available: {e}")
+        pytest.skip(f"{backend.name} not available: {e}")
         raise AssertionError("unreachable") from None
 
 
@@ -150,14 +147,14 @@ def create_vllm_config(
     model_name: str = "meta-llama/Meta-Llama-3-8B",
     tensor_parallel_size: int = 1,
     max_model_len: int = 1024,
-    dtype: Union[ModelDType, torch.dtype] = "auto",
+    dtype: ModelDType | torch.dtype = "auto",
     num_gpu_blocks: int = 1000,
     block_size: int = 16,
     max_num_seqs: int = 256,
     max_num_batched_tokens: int = 8192,
     enable_chunked_prefill: bool = True,
     add_mock_model_methods: bool = True,
-    hf_config_override: Optional[dict] = None,
+    hf_config_override: dict | None = None,
 ) -> VllmConfig:
     """Create a VllmConfig for testing with reasonable defaults."""
 
@@ -188,6 +185,8 @@ def create_vllm_config(
         max_num_seqs=max_num_seqs,
         max_num_batched_tokens=max_num_batched_tokens,
         enable_chunked_prefill=enable_chunked_prefill,
+        max_model_len=model_config.max_model_len,
+        is_encoder_decoder=model_config.is_encoder_decoder,
     )
 
     device_config = DeviceConfig()
@@ -252,7 +251,7 @@ class BackendConfig:
     name: str
     env_vars: dict
     comp_config: dict  # compilation config
-    specific_gpu_arch: Optional[tuple] = None
+    specific_gpu_arch: tuple | None = None
 
 
 # Define all backend configurations of full cudagraph to be tested
@@ -286,7 +285,17 @@ full_cg_backend_configs = {
         name="CutlassMLA",
         env_vars={
             "VLLM_ATTENTION_BACKEND": "CUTLASS_MLA",
-            "FORCE_NUM_KV_SPLITS": "1",  # TODO: remove this when hang issue is fixed
+        },
+        comp_config={
+            "cudagraph_mode": "FULL_AND_PIECEWISE",
+        },
+        specific_gpu_arch=(10, 0),
+    ),
+    # FlashInfer MLA on Blackwell
+    "FlashInferMLA": BackendConfig(
+        name="FlashInferMLA",
+        env_vars={
+            "VLLM_ATTENTION_BACKEND": "FLASHINFER_MLA",
         },
         comp_config={
             "cudagraph_mode": "FULL_AND_PIECEWISE",
@@ -331,6 +340,13 @@ full_cg_backend_configs = {
         env_vars={"VLLM_ATTENTION_BACKEND": "FLASHINFER"},
         comp_config={
             "cudagraph_mode": "FULL_AND_PIECEWISE",
+        },
+    ),
+    "RocmAttn": BackendConfig(
+        name="RocmAttn",
+        env_vars={"VLLM_V1_USE_PREFILL_DECODE_ATTENTION": "1"},
+        comp_config={
+            "cudagraph_mode": "FULL",
         },
     ),
 }

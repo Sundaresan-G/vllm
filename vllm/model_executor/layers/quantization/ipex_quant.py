@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 import torch
 from packaging import version
@@ -23,12 +23,14 @@ from vllm.model_executor.layers.quantization import (
     QuantizationConfig,
     QuantizationMethods,
 )
-from vllm.model_executor.layers.quantization.awq import (
-    AWQLinearMethod,
-    is_layer_skipped_awq,
-)
+from vllm.model_executor.layers.quantization.awq import AWQLinearMethod
 from vllm.model_executor.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from vllm.model_executor.layers.quantization.gptq import GPTQLinearMethod
+from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
+    maybe_create_device_identity,
+)
+from vllm.model_executor.parameter import ModelWeightParameter
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 
@@ -50,9 +52,10 @@ class IPEXConfig(QuantizationConfig):
         method: str,
         weight_bits: int,
         group_size: int,
-        modules_to_not_convert: Optional[list[str]] = None,
-        desc_act: Optional[bool] = None,
-        lm_head_quantized: Optional[bool] = None,
+        modules_to_not_convert: list[str] | None = None,
+        desc_act: bool | None = None,
+        lm_head_quantized: bool | None = None,
+        is_sym: bool | None = None,
     ) -> None:
         super().__init__()
         self.method = method
@@ -61,6 +64,7 @@ class IPEXConfig(QuantizationConfig):
         self.modules_to_not_convert = modules_to_not_convert or []
         self.desc_act = desc_act
         self.lm_head_quantized = lm_head_quantized
+        self.is_sym = is_sym
         self.pack_factor = 32 // self.weight_bits
 
         if self.weight_bits not in [4]:
@@ -109,21 +113,31 @@ class IPEXConfig(QuantizationConfig):
             modules_to_not_convert = cls.get_from_keys_or(
                 config, ["modules_to_not_convert"], None
             )
+            is_sym = not cls.get_from_keys_or(config, ["zero_point"], default=False)
             return cls(
-                method, weight_bits, group_size, modules_to_not_convert, False, False
+                method,
+                weight_bits,
+                group_size,
+                modules_to_not_convert,
+                False,
+                False,
+                is_sym,
             )
         # otherwise for gptq
         weight_bits = cls.get_from_keys(config, ["bits"])
         group_size = cls.get_from_keys(config, ["group_size"])
         lm_head_quantized = cls.get_from_keys_or(config, ["lm_head"], default=False)
         desc_act = cls.get_from_keys_or(config, ["desc_act"], default=False)
-        return cls(method, weight_bits, group_size, [], desc_act, lm_head_quantized)
+        is_sym = cls.get_from_keys_or(config, ["sym"], default=True)
+        return cls(
+            method, weight_bits, group_size, [], desc_act, lm_head_quantized, is_sym
+        )
 
     @classmethod
     def override_quantization_method(
         cls, hf_quant_cfg, user_quant
-    ) -> Optional[QuantizationMethods]:
-        if not current_platform.is_cpu() and not current_platform.is_xpu():
+    ) -> QuantizationMethods | None:
+        if not current_platform.is_xpu():
             return None
 
         quant_method = hf_quant_cfg.get("quant_method", "").lower()
@@ -138,7 +152,12 @@ class IPEXConfig(QuantizationConfig):
     ) -> Optional["LinearMethodBase"]:
         if isinstance(layer, LinearBase):
             if self.method == "awq":
-                if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+                if is_layer_skipped(
+                    prefix,
+                    self.modules_to_not_convert,
+                    self.packed_modules_mapping,
+                    skip_with_substr=True,
+                ):
                     return UnquantizedLinearMethod()
                 return IPEXAWQLinearMethod(self)
             if self.method == "gptq":
@@ -179,6 +198,7 @@ class IPEXGPTQLinearMethod(GPTQLinearMethod):
         # The float activation will be quantized (dynamic, per-token) to INT8.
         act_quant_mode = ipex.quantization.WoqActQuantMode.PER_BATCH_IC_BLOCK
 
+        assert isinstance(self.quant_config, IPEXConfig)
         qconfig = ipex.quantization.get_weight_only_quant_qconfig_mapping(
             weight_dtype=weight_dtype,
             lowp_mode=lowp_mode,
@@ -199,6 +219,7 @@ class IPEXGPTQLinearMethod(GPTQLinearMethod):
                 bias=bias,
                 group_size=self.quant_config.group_size,
                 quant_method=IPEXConfig.IPEX_QUANT_METHOD_MAP["gptq"],
+                weight_qscheme="sym" if self.quant_config.is_sym else "asym",
             )
         )
 
@@ -206,7 +227,7 @@ class IPEXGPTQLinearMethod(GPTQLinearMethod):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         reshaped_x = x.reshape(-1, x.shape[-1])
         out = layer.ipex_qlinear(reshaped_x)
@@ -249,6 +270,7 @@ class IPEXAWQLinearMethod(AWQLinearMethod):
         # The float activation will be quantized (dynamic, per-token) to INT8.
         act_quant_mode = ipex.quantization.WoqActQuantMode.PER_BATCH
 
+        assert isinstance(self.quant_config, IPEXConfig)
         qconfig = ipex.quantization.get_weight_only_quant_qconfig_mapping(
             weight_dtype=weight_dtype,
             lowp_mode=lowp_mode,
@@ -268,6 +290,7 @@ class IPEXAWQLinearMethod(AWQLinearMethod):
                 bias=bias,
                 group_size=self.quant_config.group_size,
                 quant_method=IPEXConfig.IPEX_QUANT_METHOD_MAP["awq"],  # type: ignore
+                weight_qscheme="sym" if self.quant_config.is_sym else "asym",
             )
         )
 
@@ -275,7 +298,7 @@ class IPEXAWQLinearMethod(AWQLinearMethod):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         reshaped_x = x.reshape(-1, x.shape[-1])
         out = layer.ipex_qlinear(reshaped_x)
@@ -285,6 +308,37 @@ class IPEXAWQLinearMethod(AWQLinearMethod):
 class XPUFp8LinearMethod(Fp8LinearMethod):
     def __init__(self, quant_config: Fp8Config):
         super().__init__(quant_config)
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        input_size_per_partition: int,
+        output_partition_sizes: list[int],
+        input_size: int,
+        output_size: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        maybe_create_device_identity()
+
+        output_size_per_partition = sum(output_partition_sizes)
+        weight_loader = extra_weight_attrs.get("weight_loader")
+        layer.logical_widths = output_partition_sizes
+        layer.input_size_per_partition = input_size_per_partition
+        layer.output_size_per_partition = output_size_per_partition
+        layer.orig_dtype = params_dtype
+        layer.weight_block_size = None
+        weight = ModelWeightParameter(
+            data=torch.empty(
+                output_size_per_partition,
+                input_size_per_partition,
+                dtype=params_dtype,
+            ),
+            input_dim=1,
+            output_dim=0,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter("weight", weight)
 
     def process_weights_after_loading(self, layer: Module) -> None:
         # If checkpoint not serialized fp8, quantize the weights.
@@ -299,7 +353,7 @@ class XPUFp8LinearMethod(Fp8LinearMethod):
         self,
         layer: torch.nn.Module,
         x: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         weight = layer.weight.data
         weight_scale = layer.weight_scale.data
@@ -398,6 +452,7 @@ class XPUFp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
         import intel_extension_for_pytorch as ipex
 
+        ep_rank_start = self.moe.ep_rank * self.moe.num_local_experts
         layer.ipex_fusion = ipex.llm.modules.GatedMLPMOE(
             layer.w13_weight,
             layer.w2_weight,
@@ -406,11 +461,12 @@ class XPUFp8MoEMethod(FusedMoEMethodBase):
             a1_scale_inv=layer.w13_input_scale,
             a2_scale_inv=layer.w2_input_scale,
             use_prepack=True,
+            experts_start_id=ep_rank_start,
         )
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
-    ) -> Optional[FusedMoEQuantConfig]:
+    ) -> FusedMoEQuantConfig | None:
         return None
 
     def apply(
@@ -418,31 +474,14 @@ class XPUFp8MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         x: torch.Tensor,
         router_logits: torch.Tensor,
-        top_k: int,
-        renormalize: bool,
-        use_grouped_topk: bool = False,
-        topk_group: Optional[int] = None,
-        num_expert_group: Optional[int] = None,
-        global_num_experts: int = -1,
-        expert_map: Optional[torch.Tensor] = None,
-        custom_routing_function: Optional[Callable] = None,
-        scoring_func: str = "softmax",
-        routed_scaling_factor: float = 1.0,
-        e_score_correction_bias: Optional[torch.Tensor] = None,
-        apply_router_weight_on_input: bool = False,
-        activation: str = "silu",
-        enable_eplb: bool = False,
-        expert_load_view: Optional[torch.Tensor] = None,
-        logical_to_physical_map: Optional[torch.Tensor] = None,
-        logical_replica_count: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         return layer.ipex_fusion(
             x,
-            use_grouped_topk,
-            top_k,
+            layer.use_grouped_topk,
+            layer.top_k,
             router_logits,
-            renormalize,
-            topk_group,
-            num_expert_group,
-            custom_routing_function=custom_routing_function,
+            layer.renormalize,
+            layer.topk_group,
+            layer.num_expert_group,
+            custom_routing_function=layer.custom_routing_function,
         )

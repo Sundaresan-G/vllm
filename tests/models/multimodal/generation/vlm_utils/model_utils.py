@@ -7,7 +7,6 @@ typically specific to a small subset of models.
 
 import types
 from pathlib import PosixPath
-from typing import Optional, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -26,7 +25,8 @@ from transformers import (
 from transformers.video_utils import VideoMetadata
 
 from vllm.logprobs import SampleLogprobs
-from vllm.utils import is_list_of
+from vllm.platforms import current_platform
+from vllm.utils.collection_utils import is_list_of
 
 from .....conftest import HfRunner, ImageAsset, ImageTestAssets
 from .types import RunnerOutput
@@ -58,7 +58,7 @@ def fuyu_vllm_to_hf_output(vllm_output: RunnerOutput, model: str) -> RunnerOutpu
 
 def qwen_vllm_to_hf_output(
     vllm_output: RunnerOutput, model: str
-) -> tuple[list[int], str, Optional[SampleLogprobs]]:
+) -> tuple[list[int], str, SampleLogprobs | None]:
     """Sanitize vllm output [qwen models] to be comparable with hf output."""
     output_ids, output_str, out_logprobs = vllm_output
 
@@ -69,7 +69,7 @@ def qwen_vllm_to_hf_output(
 
 def qwen2_vllm_to_hf_output(
     vllm_output: RunnerOutput, model: str
-) -> tuple[list[int], str, Optional[SampleLogprobs]]:
+) -> tuple[list[int], str, SampleLogprobs | None]:
     """Sanitize vllm output [qwen2 models] to be comparable with hf output."""
     output_ids, output_str, out_logprobs = vllm_output
 
@@ -80,7 +80,7 @@ def qwen2_vllm_to_hf_output(
 
 def kimiv_vl_vllm_to_hf_output(
     vllm_output: RunnerOutput, model: str
-) -> tuple[list[int], str, Optional[SampleLogprobs]]:
+) -> tuple[list[int], str, SampleLogprobs | None]:
     """Sanitize vllm output [kimi_vl models] to be comparable with hf output."""
     output_ids, output_str, out_logprobs = vllm_output
 
@@ -99,7 +99,7 @@ def llava_image_vllm_to_hf_output(
 
 def llava_video_vllm_to_hf_output(
     vllm_output: RunnerOutput, model: str
-) -> tuple[list[int], str, Optional[SampleLogprobs]]:
+) -> tuple[list[int], str, SampleLogprobs | None]:
     config = AutoConfig.from_pretrained(model)
     mm_token_id = config.video_token_index
     return _llava_vllm_to_hf_output(vllm_output, model, mm_token_id)
@@ -263,7 +263,7 @@ def get_llava_embeddings(image_assets: ImageTestAssets):
 
 ####### Prompt path encoders for models that need models on disk
 def qwen_prompt_path_encoder(
-    tmp_path: PosixPath, prompt: str, assets: Union[list[ImageAsset], ImageTestAssets]
+    tmp_path: PosixPath, prompt: str, assets: list[ImageAsset] | ImageTestAssets
 ) -> str:
     """Given a temporary dir path, export one or more image assets into the
     tempdir & replace its contents with the local path to the string so that
@@ -367,6 +367,40 @@ def gemma3_vllm_to_hf_output(vllm_output: RunnerOutput, model: str) -> RunnerOut
 
 def glm4v_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
     """Patches and returns an instance of the HfRunner to use for GLM4V."""
+    if current_platform.is_rocm():
+        import types
+
+        config = hf_model.model.config
+        if hasattr(config, "num_layers") and not hasattr(config, "num_hidden_layers"):
+            config.num_hidden_layers = config.num_layers
+        config.output_hidden_states = True
+
+        def patched_prepare_cache(
+            self, generation_config, model_kwargs, *args, **kwargs
+        ):
+            model_kwargs["past_key_values"] = None
+            model_kwargs["use_cache"] = False
+            return model_kwargs
+
+        hf_model.model._prepare_cache_for_generation = types.MethodType(
+            patched_prepare_cache, hf_model.model
+        )
+        original_generate = hf_model.model.generate
+
+        def patched_generate(*args, **kwargs):
+            kwargs["output_hidden_states"] = True
+            kwargs["return_dict_in_generate"] = True
+            return original_generate(*args, **kwargs)
+
+        hf_model.model.generate = patched_generate
+        original_forward = hf_model.model.forward
+
+        def patched_forward(*args, **kwargs):
+            kwargs["output_hidden_states"] = True
+            return original_forward(*args, **kwargs)
+
+        hf_model.model.forward = patched_forward
+
     hf_processor = hf_model.processor
 
     def processor(*args, text="", images=None, **kwargs):
@@ -407,7 +441,15 @@ def glm4_1v_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
         if videos is not None and is_list_of(videos, tuple):
             # If videos is a list of tuples, we assume each tuple contains
             # (video_array, metadata) as in the case of GLM4.1V.
-            video_metadata = [[VideoMetadata(**video[1])] for video in videos]
+            # Filter out 'do_sample_frames' as it's not a valid VideoMetadata arg
+            video_metadata = [
+                [
+                    VideoMetadata(
+                        **{k: v for k, v in video[1].items() if k != "do_sample_frames"}
+                    )
+                ]
+                for video in videos
+            ]
             videos = [[video[0]] for video in videos]
         else:
             video_metadata = None
@@ -440,7 +482,7 @@ def h2ovl_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
             self.max_num = self.config.max_dynamic_patch
             self.image_size = self.vision_config.image_size
 
-        def __call__(self, text: str, images: Union[Image, list[Image]], **kwargs):
+        def __call__(self, text: str, images: Image | list[Image], **kwargs):
             from vllm.model_executor.models.h2ovl import (
                 IMG_CONTEXT,
                 IMG_END,
@@ -499,7 +541,7 @@ def skyworkr1v_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
             self.max_num = self.config.max_dynamic_patch
             self.image_size = self.vision_config.image_size
 
-        def __call__(self, text: str, images: Union[Image, list[Image]], **kwargs):
+        def __call__(self, text: str, images: Image | list[Image], **kwargs):
             from vllm.model_executor.models.skyworkr1v import (
                 IMG_CONTEXT,
                 IMG_END,
@@ -560,8 +602,8 @@ def internvl_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
         def __call__(
             self,
             text: str,
-            images: Union[Image, list[Image]] = None,
-            videos: Union[npt.NDArray, list[npt.NDArray]] = None,
+            images: Image | list[Image] = None,
+            videos: npt.NDArray | list[npt.NDArray] = None,
             **kwargs,
         ):
             from vllm.model_executor.models.internvl import (
@@ -650,7 +692,7 @@ def _internvl_generate(
     self,
     pixel_values: torch.FloatTensor,
     input_ids: torch.FloatTensor,
-    attention_mask: Optional[torch.LongTensor] = None,
+    attention_mask: torch.LongTensor | None = None,
     **generate_kwargs,
 ) -> torch.LongTensor:
     """Generate method for InternVL2 model without fixed use_cache."""
@@ -903,6 +945,54 @@ def qwen2_5_omni_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
     thinker = hf_model.model.thinker
     thinker.get_output_embeddings = lambda: thinker.lm_head
     hf_model.model = thinker
+    return hf_model
+
+
+def qwen3_vl_patch_hf_runner(hf_model: HfRunner) -> HfRunner:
+    """Patches and returns an instance of the HfRunner to use for GLM4.1V."""
+    hf_processor = hf_model.processor
+
+    def processor(*args, videos=None, **kwargs):
+        if videos is not None and is_list_of(videos, tuple):
+            # batched multi videos
+            do_sample_frames = {video[1]["do_sample_frames"] for video in videos}
+            assert len(do_sample_frames) == 1
+            if kwargs.get("do_sample_frames") is None:
+                kwargs["do_sample_frames"] = do_sample_frames
+            video_metadata = [
+                [
+                    VideoMetadata(
+                        **{k: v for k, v in video[1].items() if k != "do_sample_frames"}
+                    )
+                ]
+                for video in videos
+            ]
+            videos = [[video[0]] for video in videos]
+        elif videos is not None and isinstance(videos, tuple):
+            # single video
+            do_sample_frames = videos[1]["do_sample_frames"]
+            if kwargs.get("do_sample_frames") is None:
+                kwargs["do_sample_frames"] = do_sample_frames
+            video_metadata = [
+                [
+                    VideoMetadata(
+                        **{
+                            k: v
+                            for k, v in videos[1].items()
+                            if k != "do_sample_frames"
+                        }
+                    )
+                ]
+            ]
+            videos = [[videos[0]]]
+        else:
+            video_metadata = None
+
+        return hf_processor(
+            *args, videos=videos, video_metadata=video_metadata, **kwargs
+        )
+
+    hf_model.processor = processor
     return hf_model
 
 
