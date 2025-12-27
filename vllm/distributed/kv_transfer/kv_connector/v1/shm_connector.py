@@ -1091,7 +1091,8 @@ class ShmConnectorWorker:
             #      f"meta.remote_block_ids = {meta.remote_block_ids}, meta.local_block_ids = {meta.local_block_ids}")
 
             curr_local_block_ids = meta.local_block_ids[:len(meta.remote_block_ids)] if len(meta.remote_block_ids) <= len(meta.local_block_ids) else meta.local_block_ids
-            curr_remote_block_ids = meta.remote_block_ids if len(meta.remote_block_ids) <= len(meta.local_block_ids) else meta.remote_block_ids[-len(meta.local_block_ids):]
+            # If there are more remote blocks than local blocks, we skip the remote blocks since likely they are from prefix caching
+            curr_remote_block_ids = meta.remote_block_ids if len(meta.remote_block_ids) <= len(meta.local_block_ids) else []
             
             isa = _get_attn_isa(next(iter(self.device_kv_caches.values())).dtype, self.block_size)
             slot_mapping = torch.tensor([curr_local_block_ids[i] * self.block_size + offset for i in range(len(curr_remote_block_ids)) for offset in range(self.block_size)])
@@ -1108,31 +1109,33 @@ class ShmConnectorWorker:
                 # logger.debug(f"self.device_kv_caches[{layer_name}] shape = {self.device_kv_caches[layer_name].shape} and stride = {self.device_kv_caches[layer_name].stride()}")
                 # logger.debug(f"remote_kv_cache[{layer_name}] shape = {remote_kv_cache.shape} and stride = {remote_kv_cache.stride()}")
 
-                # keys, values = remote_kv_cache.unbind(0)
-                # key = keys[meta.remote_block_ids].transpose(1, 2).reshape(-1, keys.shape[-2], keys.shape[-1])
-                # value = values[meta.remote_block_ids].transpose(1, 2).reshape(-1, values.shape[-2], values.shape[-1])
-                # cpu_attn_reshape_and_cache(
-                #     key,
-                #     value,
-                #     self.device_kv_caches[layer_name][0],
-                #     self.device_kv_caches[layer_name][1],
-                #     slot_mapping,
-                #     isa
-                # )
-
                 keys, values = remote_kv_cache.unbind(0)
-                for i in range(len(curr_remote_block_ids)):
-                    remote_block_id = curr_remote_block_ids[i]
-                    key = keys[remote_block_id].transpose(0, 1)
-                    value = values[remote_block_id].transpose(0, 1)
-                    cpu_attn_reshape_and_cache(
-                        key,
-                        value,
-                        self.device_kv_caches[layer_name][0],
-                        self.device_kv_caches[layer_name][1],
-                        slot_mapping[i * self.block_size : (i + 1) * self.block_size],
-                        isa
-                    )
+                key = keys[meta.remote_block_ids].transpose(1, 2)
+                key = key.reshape(-1, key.shape[-2], key.shape[-1])
+                value = values[meta.remote_block_ids].transpose(1, 2)
+                value = value.reshape(-1, value.shape[-2], value.shape[-1])
+                cpu_attn_reshape_and_cache(
+                    key,
+                    value,
+                    self.device_kv_caches[layer_name][0],
+                    self.device_kv_caches[layer_name][1],
+                    slot_mapping,
+                    isa
+                )
+
+                # keys, values = remote_kv_cache.unbind(0)
+                # for i in range(len(curr_remote_block_ids)):
+                #     remote_block_id = curr_remote_block_ids[i]
+                #     key = keys[remote_block_id].transpose(0, 1)
+                #     value = values[remote_block_id].transpose(0, 1)
+                #     cpu_attn_reshape_and_cache(
+                #         key,
+                #         value,
+                #         self.device_kv_caches[layer_name][0],
+                #         self.device_kv_caches[layer_name][1],
+                #         slot_mapping[i * self.block_size : (i + 1) * self.block_size],
+                #         isa
+                #     )
 
                 
                 # for i in range(len(meta.remote_block_ids)):
