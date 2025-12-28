@@ -99,7 +99,8 @@ wait_for_server() {
 main() {
 
     source /data/nfs_home/sundares/miniforge3/etc/profile.d/conda.sh
-    # conda activate vllm_0.13.0_cpu
+    # conda activate vllm_0.13.0_cpu_nonAvx
+    # conda activate vllm_0.13.0_shm_xpu
     conda activate vllm_0.13.0_shm_cuda
 
     # check_hf_token
@@ -124,6 +125,7 @@ main() {
     prefiller_pid=$!
     PIDS+=($prefiller_pid)
 
+    # conda activate vllm_0.13.0_cpu_nonAvx
     conda activate vllm_0.13.0_cpu
 
     VLLM_LOGGING_PREFIX="DECODER " \
@@ -132,6 +134,7 @@ main() {
     decoder_pid=$!
     PIDS+=($decoder_pid)
 
+    # conda activate vllm_0.13.0_shm_xpu
     conda activate vllm_0.13.0_shm_cuda
 
     # Use proxy_server.py or toy_proxy_server.py
@@ -200,9 +203,9 @@ main() {
     #     --num-prompts $NUM_PROMPTS \
     #     2>&1 | tee benchmark.log
 
-    # while true; do
-    #     sleep 1
-    # done
+    while true; do
+        sleep 1
+    done
 
     cleanup
 

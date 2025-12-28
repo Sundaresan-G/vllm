@@ -34,7 +34,7 @@ export VLLM_TORCH_PROFILER_WITH_STACK=1
 export VLLM_TORCH_PROFILER_WITH_FLOPS=1
 export VLLM_TORCH_PROFILER_RECORD_SHAPES=1
 export VLLM_TORCH_PROFILER_DIR="."
-export BLOCK_SIZE=32
+export BLOCK_SIZE=64
 
 if [[ $1 == "prefiller" ]]; then
 
@@ -42,12 +42,11 @@ if [[ $1 == "prefiller" ]]; then
 
     # 1st GPU as prefiller
     # OMP_NUM_THREADS=16 \
+    VLLM_KV_CACHE_LAYOUT="NHD" \
     VLLM_OFFLOAD_KV_CACHE_TO_CPU=1 \
-    VLLM_CPU_OMP_THREADS_BIND="0-31" \
     VLLM_CPU_SGL_KERNEL="1" \
     VLLM_DOUBLE_BUFFER_PIPELINE=1 \
     CUDA_VISIBLE_DEVICES=0 \
-    numactl -C 0-31 \
     $(which vllm) serve $MODEL \
     --port 8100 \
     --max-model-len 2600 \
@@ -65,11 +64,9 @@ elif [[ $1 == "decoder" ]]; then
     # OMP_NUM_THREADS=32 \
     TORCH_COMPILE_DISABLE=1 \
     VLLM_CPU_KVCACHE_SPACE=1 \
-    VLLM_CPU_OMP_THREADS_BIND="32-63" \
     VLLM_CPU_SGL_KERNEL="1" \
     VLLM_DOUBLE_BUFFER_PIPELINE=0 \
     CUDA_VISIBLE_DEVICES=1 \
-    numactl -C 32-63 \
     $(which vllm) serve $MODEL \
     --port 8200 \
     --enforce-eager \

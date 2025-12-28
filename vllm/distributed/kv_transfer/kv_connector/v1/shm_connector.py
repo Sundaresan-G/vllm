@@ -55,6 +55,10 @@ class ReqMeta:
     remote_filename: str
     remote_engine_id: str
     tp_size: int
+    remote_kv_cache_shape: list[int]
+    remote_kv_cache_stride: list[int]
+    remote_kv_cache_layout: str
+    remote_block_size: int
 
 
 class ShmConnectorMetadata(KVConnectorMetadata):
@@ -82,11 +86,18 @@ class ShmConnectorMetadata(KVConnectorMetadata):
             remote_filename=kv_transfer_params["remote_filename"],
             # P workers don't need to receive tp_size from proxy here.
             tp_size=kv_transfer_params.get("tp_size", 1),
+            remote_kv_cache_shape=kv_transfer_params.get("remote_kv_cache_shape"),
+            remote_kv_cache_stride=kv_transfer_params.get("remote_kv_cache_stride"),
+            remote_kv_cache_layout=kv_transfer_params.get("remote_kv_cache_layout"),
+            remote_block_size=kv_transfer_params.get("remote_block_size"),
         )
         if load_remote_cache:
             self.reqs_to_recv[request_id] = _req
 
+# TODO: make it per-instance
 _send_ReqId2BlockIds: dict[ReqId, list[int]] = {}
+global_kv_cache_shape: list[int] = []
+global_kv_cache_stride: list[int] = []
 
 class ShmConnector(KVConnectorBase_V1):
     def __init__(
@@ -410,6 +421,7 @@ class ShmConnectorScheduler:
 
         # self._send_ReqId2BlockIds[request.request_id] = block_ids
         # logger.debug(f"self._send_ReqId2BlockIds = {self._send_ReqId2BlockIds}")
+        global global_kv_cache_shape, global_kv_cache_stride
 
         return delay_free_blocks, dict(
             do_remote_prefill=True,
@@ -418,6 +430,10 @@ class ShmConnectorScheduler:
             remote_engine_id=self.engine_id,
             remote_filename=self.side_channel_filename,
             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
+            remote_kv_cache_shape=global_kv_cache_shape,
+            remote_kv_cache_stride=global_kv_cache_stride,
+            remote_kv_cache_layout=get_kv_cache_layout(),
+            remote_block_size=self.block_size,
         )
 
 
@@ -575,6 +591,11 @@ class ShmConnectorWorker:
             original_cache_stride = cache_or_caches.stride()
             original_cache_requires_grad = cache_or_caches.requires_grad
             original_cache_is_contiguous = cache_or_caches.is_contiguous()
+
+            # TODO: improve it
+            global global_kv_cache_shape, global_kv_cache_stride
+            global_kv_cache_shape = list(original_cache_shape)
+            global_kv_cache_stride = list(original_cache_stride)
 
             cache_or_caches.data = torch.empty(0)  # release tensor from PyTorch management
 
@@ -944,6 +965,7 @@ class ShmConnectorWorker:
             )
             self._reqs_to_process.remove(req_id)
             del self._reqs_to_send[req_id]
+            del self._send_ReqId2BlockIds[req_id]
             done_sending.add(req_id)
 
         return done_sending, done_recving
@@ -1073,9 +1095,15 @@ class ShmConnectorWorker:
                     )
                     self.remote_cached_kv_caches[remote_engine_id][layer_name] = torch.from_numpy(np_array).view(
                         dtype=kv_cache.dtype
-                    ).view([kv_cache.shape[0], -1, *kv_cache.shape[2:]])
+                        ).as_strided_(
+                            size=meta.remote_kv_cache_shape,
+                            stride=meta.remote_kv_cache_stride,
+                        )
 
-                    # logger.debug(f"Recreated remote KV cache tensor for engine {remote_engine_id} and layer {layer_name} with shape {self.remote_cached_kv_caches[remote_engine_id][layer_name].shape} and stride {self.remote_cached_kv_caches[remote_engine_id][layer_name].stride()}")
+                    # For difference in the block size position between GPU and CPU layouts
+                    self.remote_cached_kv_caches[remote_engine_id][layer_name].transpose_(-2, -3)
+
+                    logger.debug(f"Recreated remote KV cache tensor for engine {remote_engine_id} and layer {layer_name} with shape {self.remote_cached_kv_caches[remote_engine_id][layer_name].shape} and stride {self.remote_cached_kv_caches[remote_engine_id][layer_name].stride()}")
 
                     # logger.debug(f"Remote cached KV cache[{layer_name}][0, 0, 0, 0, :4] = {self.remote_cached_kv_caches[remote_engine_id][layer_name][0, 0, 0, 0, :4]}")
 
@@ -1096,6 +1124,11 @@ class ShmConnectorWorker:
             
             isa = _get_attn_isa(next(iter(self.device_kv_caches.values())).dtype, self.block_size)
             slot_mapping = torch.tensor([curr_local_block_ids[i] * self.block_size + offset for i in range(len(curr_remote_block_ids)) for offset in range(self.block_size)])
+
+            # TODO: make it general for different block sizes
+            assert self.block_size == meta.remote_block_size, (
+                f"Block size mismatch: local block size {self.block_size} vs remote block size {meta.remote_block_size}"
+            )
             
             copy_start_time = time.perf_counter()
 
@@ -1110,9 +1143,9 @@ class ShmConnectorWorker:
                 # logger.debug(f"remote_kv_cache[{layer_name}] shape = {remote_kv_cache.shape} and stride = {remote_kv_cache.stride()}")
 
                 keys, values = remote_kv_cache.unbind(0)
-                key = keys[meta.remote_block_ids].transpose(1, 2)
+                key = keys[meta.remote_block_ids].transpose(-2, -3)
                 key = key.reshape(-1, key.shape[-2], key.shape[-1])
-                value = values[meta.remote_block_ids].transpose(1, 2)
+                value = values[meta.remote_block_ids].transpose(-2, -3)
                 value = value.reshape(-1, value.shape[-2], value.shape[-1])
                 cpu_attn_reshape_and_cache(
                     key,
