@@ -2,11 +2,11 @@
 
 # echo "Warning: LMCache disaggregated prefill support for vLLM v1 is experimental and subject to change."
 
-set -xe
+set -x
 
 PIDS=()
 MODEL="Qwen/Qwen2.5-1.5B-Instruct"
-INPUT_LEN=1024
+INPUT_LEN=8192
 OUTPUT_LEN=8
 NUM_PROMPTS=5
 
@@ -95,13 +95,16 @@ wait_for_server() {
   done
 }
 
+# GPU_ENV="vllm_0.13.0_shm_cuda"
+GPU_ENV="vllm_0.13.0_shm_xpu"
+
 
 main() {
 
     source /data/nfs_home/sundares/miniforge3/etc/profile.d/conda.sh
     # conda activate vllm_0.13.0_cpu_nonAvx
     # conda activate vllm_0.13.0_shm_xpu
-    conda activate vllm_0.13.0_shm_cuda
+    conda activate $GPU_ENV
 
     # check_hf_token
     # check_num_gpus
@@ -135,7 +138,7 @@ main() {
     PIDS+=($decoder_pid)
 
     # conda activate vllm_0.13.0_shm_xpu
-    conda activate vllm_0.13.0_shm_cuda
+    conda activate $GPU_ENV
 
     # Use proxy_server.py or toy_proxy_server.py
     # python -m debugpy --listen 0.0.0.0:5678 --wait-for-client \
@@ -166,7 +169,15 @@ main() {
         --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN \
         --num-prompts $NUM_PROMPTS --max-concurrency 1 \
         2>&1 | tee benchmark.log
-    # curl -X POST http://localhost:9000/v1/completions -H "Content-Type: application/json" -d '{    "model": "Qwen/Qwen2.5-1.5B-Instruct",    "prompt": "Write a detailed, vivid, and slightly humorous free-verse poem about the craft of software engineering and coding. Touch on long nights spent debugging, collaborating with teammates, wrestling with legacy code, and the relief when all the tests finally pass. Use clear imagery, a hopeful tone.", "max_tokens": 10,    "temperature": 0.7  }' |& tee benchmark.log
+
+    # curl -X POST http://localhost:9000/v1/completions -H "Content-Type: application/json" -d '{    "model": "'"$MODEL"'",    "prompt": "Write a detailed, vivid, and slightly humorous free-verse poem about the craft of software engineering and coding. Touch on long nights spent debugging, collaborating with teammates, wrestling with legacy code, and the relief when all the tests finally pass. Use clear imagery, a hopeful tone.", "max_tokens": 10,    "temperature": 0.7  }' |& tee -a benchmark.log
+
+    # curl -X POST http://localhost:9000/v1/completions -H "Content-Type: application/json" -d '{    "model": "'"$MODEL"'",    "prompt": "Write a rich, vivid, slightly humorous free-verse poem about the craft of software engineering and coding. Describe in detail long nights spent debugging elusive bugs, the glow of multiple monitors, half-finished mugs of cold coffee, and the quiet hum of machines in an almost empty office or home workspace. Show the emotional roller coaster of reading confusing legacy code, adding one more log line, watching stack traces scroll by, and wondering what the previous developer was thinking when they designed this system. Include scenes of collaboration: pair programming sessions, code review comments that are both kind and blunt, whiteboard diagrams that start neat and end as chaotic scribbles, and chat messages full of links to docs, tickets, and pull requests. Mention modern tools and rituals of the craft: version control, feature branches, continuous integration pipelines, flaky tests, deployment scripts, and dashboards that flip from red to green. Contrast the stress of production incidents, paging alerts, and frantic hotfixes with the quiet, satisfying moment when all tests finally pass, the pipeline is green, and the release is tagged.", "max_tokens": 100,    "temperature": 0.7  }' |& tee -a benchmark.log
+
+    # curl -X POST http://localhost:9000/v1/completions -H "Content-Type: application/json" -d '{    "model": "'"$MODEL"'",    "prompt": "Write a rich, vivid, slightly humorous free-verse poem about the craft of software engineering and coding. Describe in detail long nights spent debugging elusive bugs, the glow of multiple monitors, half-finished mugs of cold coffee, and the quiet hum of machines in an almost empty office or home workspace. Show the emotional roller coaster of reading confusing legacy code, adding one more log line, watching stack traces scroll by, and wondering what the previous developer was thinking when they designed this system. Include scenes of collaboration: pair programming sessions, code review comments that are both kind and blunt, whiteboard diagrams that start neat and end as chaotic scribbles, and chat messages full of links to docs, tickets, and pull requests. Mention modern tools and rituals of the craft: version control, feature branches, continuous integration pipelines, flaky tests, deployment scripts, and dashboards that flip from red to green. Contrast the stress of production incidents, paging alerts, and frantic hotfixes with the quiet, satisfying moment when all tests finally pass, the pipeline is green, and the release is tagged. Use concrete imagery that developers recognize, add gentle inside jokes about off by one errors and mysterious race conditions, and keep the overall tone hopeful and affirming. Celebrate the creativity, persistence, and teamwork that make software possible, and end on a note of cautious but genuine optimism about the next refactor, the next big feature, and the next late night that somehow feels worth it.", "max_tokens": 100,    "temperature": 0.7  }' |& tee -a benchmark.log
+
+    # To check the prefix caching effect
+    curl -X POST http://localhost:9000/v1/completions -H "Content-Type: application/json" -d '{    "model": "'"$MODEL"'",    "prompt": "Write a rich, vivid, slightly humorous free-verse poem about the craft of software engineering and coding. Describe in detail long nights spent debugging elusive bugs, the glow of multiple monitors, half-finished mugs of cold coffee, and the quiet hum of machines in an almost empty office or home workspace. Show the emotional roller coaster of reading confusing legacy code, adding one more log line, watching stack traces scroll by, and wondering what the previous developer was thinking when they designed this system. Include scenes of collaboration: pair programming sessions, code review comments that are both kind and blunt, whiteboard diagrams that start neat and end as chaotic scribbles, and chat messages full of links to docs, tickets, and pull requests. Mention modern tools and rituals of the craft: version control, feature branches, continuous integration pipelines, flaky tests, deployment scripts, and dashboards that flip from red to green. Contrast the stress of production incidents, paging alerts, and frantic hotfixes with the quiet, satisfying moment when all tests finally pass, the pipeline is green, and the release is tagged. Use concrete imagery that developers recognize, add gentle inside jokes about off by one errors and mysterious race conditions, and keep the overall tone hopeful and affirming. Celebrate the creativity, persistence, and teamwork that make software possible, and end on a note of cautious but genuine optimism about the next refactor, the next big feature, and the next late night that somehow feels worth it.", "max_tokens": 100,    "temperature": 0.7  }' |& tee -a benchmark.log
 
     # while true; do
     #     # python -m debugpy --listen 0.0.0.0:5678 --wait-for-client \
@@ -203,9 +214,9 @@ main() {
     #     --num-prompts $NUM_PROMPTS \
     #     2>&1 | tee benchmark.log
 
-    while true; do
-        sleep 1
-    done
+    # while true; do
+    #     sleep 1
+    # done
 
     cleanup
 

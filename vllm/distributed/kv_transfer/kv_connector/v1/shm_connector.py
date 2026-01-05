@@ -1118,9 +1118,15 @@ class ShmConnectorWorker:
             #     (f"Number of remote block ids {len(meta.remote_block_ids)} should be less than or equal to number of local block ids {len(meta.local_block_ids)}"
             #      f"meta.remote_block_ids = {meta.remote_block_ids}, meta.local_block_ids = {meta.local_block_ids}")
 
+            logger.debug(f"meta.local_block_ids = {meta.local_block_ids}")
+            logger.debug(f"meta.remote_block_ids = {meta.remote_block_ids}")
+
             curr_local_block_ids = meta.local_block_ids[:len(meta.remote_block_ids)] if len(meta.remote_block_ids) <= len(meta.local_block_ids) else meta.local_block_ids
-            # If there are more remote blocks than local blocks, we skip the remote blocks since likely they are from prefix caching
-            curr_remote_block_ids = meta.remote_block_ids if len(meta.remote_block_ids) <= len(meta.local_block_ids) else []
+            # If there are more remote blocks than local blocks, we skip the initial remote blocks since likely they are from prefix caching
+            curr_remote_block_ids = meta.remote_block_ids if len(meta.remote_block_ids) <= len(curr_local_block_ids) else meta.remote_block_ids[-len(curr_local_block_ids):]
+
+            logger.debug(f"curr_local_block_ids = {curr_local_block_ids}")
+            logger.debug(f"curr_remote_block_ids = {curr_remote_block_ids}")
             
             isa = _get_attn_isa(next(iter(self.device_kv_caches.values())).dtype, self.block_size)
             slot_mapping = torch.tensor([curr_local_block_ids[i] * self.block_size + offset for i in range(len(curr_remote_block_ids)) for offset in range(self.block_size)])
@@ -1142,19 +1148,20 @@ class ShmConnectorWorker:
                 # logger.debug(f"self.device_kv_caches[{layer_name}] shape = {self.device_kv_caches[layer_name].shape} and stride = {self.device_kv_caches[layer_name].stride()}")
                 # logger.debug(f"remote_kv_cache[{layer_name}] shape = {remote_kv_cache.shape} and stride = {remote_kv_cache.stride()}")
 
-                keys, values = remote_kv_cache.unbind(0)
-                key = keys[meta.remote_block_ids].transpose(-2, -3)
-                key = key.reshape(-1, key.shape[-2], key.shape[-1])
-                value = values[meta.remote_block_ids].transpose(-2, -3)
-                value = value.reshape(-1, value.shape[-2], value.shape[-1])
-                cpu_attn_reshape_and_cache(
-                    key,
-                    value,
-                    self.device_kv_caches[layer_name][0],
-                    self.device_kv_caches[layer_name][1],
-                    slot_mapping,
-                    isa
-                )
+                if slot_mapping.numel() > 0:
+                    keys, values = remote_kv_cache.unbind(0)
+                    key = keys[meta.remote_block_ids].transpose(-2, -3)
+                    key = key.reshape(-1, key.shape[-2], key.shape[-1])
+                    value = values[meta.remote_block_ids].transpose(-2, -3)
+                    value = value.reshape(-1, value.shape[-2], value.shape[-1])
+                    cpu_attn_reshape_and_cache(
+                        key,
+                        value,
+                        self.device_kv_caches[layer_name][0],
+                        self.device_kv_caches[layer_name][1],
+                        slot_mapping,
+                        isa
+                    )
 
                 # keys, values = remote_kv_cache.unbind(0)
                 # for i in range(len(curr_remote_block_ids)):
@@ -1187,7 +1194,7 @@ class ShmConnectorWorker:
                 # remote_k_cache = remote_kv_cache[0]
                 # # for remote_block_id in meta.remote_block_ids[:1]:
                 # #     logger.debug(f"{req_id}, {remote_block_id}, {remote_k_cache[remote_block_id][0][1][:20]}")
-                # for slot in [0, self.block_size, 87, 88, 89]:
+                # for slot in [0, self.block_size, 55, 56, 57, 58]:
                 #     block_id = slot // self.block_size
                 #     offset = slot % self.block_size
                 #     logger.debug(f"Remote cache slot key_cache[{block_id} , 1, {offset}, :20] {slot}: {remote_k_cache[block_id, 1, offset, :20]}")
@@ -1197,7 +1204,7 @@ class ShmConnectorWorker:
                 # local_k_cache = self.device_kv_caches[layer_name][0]
                 # # for local_block_id in meta.local_block_ids[:1]:
                 # #     logger.debug(f"{req_id}, {local_block_id}, {local_k_cache[local_block_id][0][1][:20]}")
-                # for slot in [self.block_size, 87, 88, 89]:
+                # for slot in [self.block_size, 55, 56, 57, 58]:
                 #     block_id = slot // self.block_size
                 #     offset = slot % self.block_size
                 #     logger.debug(f"Local cache slot key_cache[{block_id} , 1, {offset}, :20] {slot}: {local_k_cache[block_id, 1, offset, :20]}") 

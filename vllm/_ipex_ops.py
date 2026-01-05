@@ -268,6 +268,33 @@ class ipex_ops:
             v_scale_float,
         )
 
+        import vllm.envs as envs
+        if envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU:
+
+            from vllm.forward_context import ForwardContext, get_forward_context
+            forward_context : ForwardContext = get_forward_context()
+
+            if hasattr(forward_context, '_curr_layer_offloaded_kv_tensor'):
+                key_cache_cpu, value_cache_cpu = forward_context._curr_layer_offloaded_kv_tensor.unbind(0)
+
+                ipex.llm.modules.PagedAttention.reshape_and_cache_flash(
+                    key,
+                    value,
+                    key_cache_cpu,
+                    value_cache_cpu,
+                    slot_mapping,
+                    kv_cache_dtype,
+                    k_scale_float,
+                    v_scale_float,
+                )
+
+                # curr_event = torch.Event()
+                # curr_event.record()
+                # curr_event.synchronize()
+
+                # key_cache_cpu.copy_(key_cache, non_blocking=True)
+                # value_cache_cpu.copy_(value_cache, non_blocking=True)
+
     @staticmethod
     def flash_attn_varlen_func(
         q: torch.Tensor,

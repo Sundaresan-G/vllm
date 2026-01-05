@@ -42,6 +42,8 @@ if [[ $1 == "prefiller" ]]; then
 
     # 1st GPU as prefiller
     # OMP_NUM_THREADS=16 \
+    NEOReadDebugKeys=1 \
+    EnableSharedSystemUsmSupport=1 \
     VLLM_KV_CACHE_LAYOUT="NHD" \
     VLLM_OFFLOAD_KV_CACHE_TO_CPU=1 \
     VLLM_CPU_SGL_KERNEL="1" \
@@ -49,9 +51,9 @@ if [[ $1 == "prefiller" ]]; then
     CUDA_VISIBLE_DEVICES=0 \
     $(which vllm) serve $MODEL \
     --port 8100 \
-    --max-model-len 2600 \
-    --max-num-seqs 512 \
-    --max-num-batched-tokens 4096 \
+    --max-model-len 9000 \
+    --max-num-seqs 5 \
+    --max-num-batched-tokens 9000 \
     --block-size $BLOCK_SIZE \
     --kv-transfer-config '{"kv_connector":"ShmConnector","kv_role":"kv_both"}' \
     --enforce-eager \
@@ -63,17 +65,18 @@ elif [[ $1 == "decoder" ]]; then
     # 2nd GPU as decoder
     # OMP_NUM_THREADS=32 \
     TORCH_COMPILE_DISABLE=1 \
-    VLLM_CPU_KVCACHE_SPACE=1 \
+    VLLM_CPU_KVCACHE_SPACE=4 \
     VLLM_CPU_SGL_KERNEL="1" \
     VLLM_DOUBLE_BUFFER_PIPELINE=0 \
     CUDA_VISIBLE_DEVICES=1 \
     $(which vllm) serve $MODEL \
     --port 8200 \
     --enforce-eager \
-    --max-model-len 2600 \
-    --max-num-seqs 512 \
-    --max-num-batched-tokens 4096 \
+    --max-model-len 9000 \
+    --max-num-seqs 5 \
+    --max-num-batched-tokens 9000 \
     --block-size $BLOCK_SIZE \
+    --no-enable-prefix-caching \
     --kv-transfer-config '{"kv_connector":"ShmConnector","kv_role":"kv_both"}'
 
 else
