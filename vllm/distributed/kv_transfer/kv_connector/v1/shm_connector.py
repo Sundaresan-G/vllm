@@ -449,6 +449,7 @@ class ShmConnectorWorker:
         self.block_size = vllm_config.cache_config.block_size
         
         self._send_ReqId2BlockIds = reqId2BlockIds
+        self._pending_send_reqs: set[ReqId] = set()
 
         self.side_channel_filename = engine_id
         # Metadata.
@@ -966,6 +967,7 @@ class ShmConnectorWorker:
             self._reqs_to_process.remove(req_id)
             del self._reqs_to_send[req_id]
             del self._send_ReqId2BlockIds[req_id]
+            self._pending_send_reqs.discard(req_id)
             done_sending.add(req_id)
 
         return done_sending, done_recving
@@ -978,12 +980,14 @@ class ShmConnectorWorker:
         """
         notified_req_ids: set[str] = set()
         logger.debug(f"self._send_ReqId2BlockIds = {self._send_ReqId2BlockIds}")
+        logger.debug(f"self._pending_send_reqs = {self._pending_send_reqs}")
         for req_id in list(self._reqs_to_send.keys()):
             assert req_id in self._send_ReqId2BlockIds
             block_id = self._send_ReqId2BlockIds[req_id][-1]  # Check the last block's flag
             logger.debug(f"self.shm_kv_caches_completion_flags.buf[{block_id}] = {self.shm_kv_caches_completion_flags.buf[block_id]}")
             if self.shm_kv_caches_completion_flags.buf[block_id] == False:  # False means free
                 self._send_ReqId2BlockIds.pop(req_id, None)
+                self._pending_send_reqs.discard(req_id)
                 # TODO: support heterogeneous TP
                 tp_ratio = 1
                 self.consumer_notification_counts_by_req[req_id] += 1
@@ -1271,10 +1275,12 @@ class ShmConnectorWorker:
     def wait_for_save(self, metadata: ShmConnectorMetadata):
         # Get the most recently added item (dictionaries maintain insertion order)
         if self._send_ReqId2BlockIds:
-            last_req_id = next(reversed(self._send_ReqId2BlockIds))
-            i = self._send_ReqId2BlockIds[last_req_id][-1]
-            self.shm_kv_caches_completion_flags.buf[i] = True  # Mark as busy
-            logger.debug(f"self.shm_kv_caches_completion_flags.buf[{i}] = {self.shm_kv_caches_completion_flags.buf[i]}")
+            for req_id in self._send_ReqId2BlockIds.keys():
+                if req_id not in self._pending_send_reqs:
+                    self._pending_send_reqs.add(req_id)
+                    i = self._send_ReqId2BlockIds[req_id][-1]
+                    self.shm_kv_caches_completion_flags.buf[i] = True  # Mark as busy
+                    logger.debug(f"self.shm_kv_caches_completion_flags.buf[{i}] = {self.shm_kv_caches_completion_flags.buf[i]}")
         logger.debug(f"self._send_ReqId2BlockIds = {self._send_ReqId2BlockIds}")
         # for reqId, blockIdList in self._send_ReqId2BlockIds.items():
         #     k_cache = list(self.device_kv_caches.values())[0][0]
