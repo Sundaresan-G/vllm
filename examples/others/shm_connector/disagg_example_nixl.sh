@@ -59,11 +59,13 @@ ensure_python_library_installed() {
 
 cleanup() {
     echo "Stopping everything…"
+    set -x
     trap - INT TERM        # prevent re-entrancy
-    kill -- $PIDS          
-    wait                   # reap children so we don't leave zombies
+    pkill -f "vllm serve" -u $USER
+    kill -2 -- ${PIDS[@]}
+    wait -- ${PIDS[@]} 2>/dev/null
+    echo "Cleaning up shared memory..."
     rm -f /dev/shm/*
-    # kill -9 -- -$$         # in case any processes are still lingering
     exit 0
 }
 

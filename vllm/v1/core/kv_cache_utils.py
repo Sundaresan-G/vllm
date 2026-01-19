@@ -612,7 +612,10 @@ def max_memory_usage_bytes(
     """
     Get the maximum memory usage in bytes for the given KV cache specs.
     """
-    return sum(spec.max_memory_usage_bytes(vllm_config) for spec in kv_cache_specs)
+    result = [spec.max_memory_usage_bytes(vllm_config) for spec in kv_cache_specs]
+    if envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU and vllm_config.device_config.device_type != "cpu":
+        return max(result) * 1 # Multiply it by 2 in case of double buffering of KV cache
+    return sum(result)
 
 
 def estimate_max_model_len(

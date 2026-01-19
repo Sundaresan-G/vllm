@@ -531,7 +531,10 @@ class Scheduler(SchedulerInterface):
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
                     if (
-                        not self.scheduler_config.enable_chunked_prefill
+                        (
+                            (envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU and self.vllm_config.device_config.device.type != "cpu") 
+                            or not self.scheduler_config.enable_chunked_prefill
+                        )
                         and num_new_tokens > token_budget
                     ):
                         # If chunked_prefill is disabled,
