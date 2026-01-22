@@ -6,9 +6,9 @@ set -x
 
 PIDS=()
 MODEL="Qwen/Qwen2.5-1.5B-Instruct"
-INPUT_LEN=8192
+INPUT_LEN=1024
 OUTPUT_LEN=8
-NUM_PROMPTS=5
+NUM_PROMPTS=20
 
 # Switch to the directory of the current script
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -97,8 +97,8 @@ wait_for_server() {
   done
 }
 
-# GPU_ENV="vllm_0.13.0_shm_cuda"
-GPU_ENV="vllm_0.13.0_shm_xpu"
+GPU_ENV="vllm_0.13.0_shm_cuda"
+# GPU_ENV="vllm_0.13.0_shm_xpu"
 
 
 main() {
@@ -169,7 +169,7 @@ main() {
     $(which vllm) bench serve --port 9000 --seed $(date +%s) \
         --model $MODEL \
         --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN \
-        --num-prompts $NUM_PROMPTS --max-concurrency 1 \
+        --num-prompts $NUM_PROMPTS --max-concurrency 5 \
         2>&1 | tee benchmark.log
 
     # curl -X POST http://localhost:9000/v1/completions -H "Content-Type: application/json" -d '{    "model": "'"$MODEL"'",    "prompt": "Write a detailed, vivid, and slightly humorous free-verse poem about the craft of software engineering and coding. Touch on long nights spent debugging, collaborating with teammates, wrestling with legacy code, and the relief when all the tests finally pass. Use clear imagery, a hopeful tone.", "max_tokens": 10,    "temperature": 0.7  }' |& tee -a benchmark.log

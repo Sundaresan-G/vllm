@@ -67,6 +67,7 @@ class ShmConnectorMetadata(KVConnectorMetadata):
         self.reqs_to_send: dict[ReqId, float] = {}
         self.reqs_in_batch: set[ReqId] = set()
         self.reqs_not_processed: set[ReqId] = set()
+        self.send_ReqId2BlockIds: dict[ReqId, list[int]] = {}
 
     def add_new_req(
         self,
@@ -95,7 +96,6 @@ class ShmConnectorMetadata(KVConnectorMetadata):
             self.reqs_to_recv[request_id] = _req
 
 # TODO: make it per-instance
-_send_ReqId2BlockIds: dict[ReqId, list[int]] = {}
 global_kv_cache_shape: list[int] = []
 global_kv_cache_stride: list[int] = []
 
@@ -112,16 +112,14 @@ class ShmConnector(KVConnectorBase_V1):
         assert vllm_config.kv_transfer_config.engine_id is not None
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
 
-        self._send_ReqId2BlockIds: dict[ReqId, list[int]] = _send_ReqId2BlockIds
-
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler: Optional[ShmConnectorScheduler] = (
-                ShmConnectorScheduler(vllm_config, self.engine_id, self._send_ReqId2BlockIds)
+                ShmConnectorScheduler(vllm_config, self.engine_id)
             )
             self.connector_worker: Optional[ShmConnectorWorker] = None
         elif role == KVConnectorRole.WORKER:
             self.connector_scheduler = None
-            self.connector_worker = ShmConnectorWorker(vllm_config, self.engine_id, self._send_ReqId2BlockIds)
+            self.connector_worker = ShmConnectorWorker(vllm_config, self.engine_id)
 
     ############################################################
     # Class Methods
@@ -229,12 +227,12 @@ class ShmConnector(KVConnectorBase_V1):
 class ShmConnectorScheduler:
     """Implementation of Scheduler side methods"""
 
-    def __init__(self, vllm_config: VllmConfig, engine_id: str, reqId2BlockIds: dict[ReqId, list[int]]):
+    def __init__(self, vllm_config: VllmConfig, engine_id: str):
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
         self.engine_id: EngineId = engine_id
         self.side_channel_filename = engine_id
-        self._send_ReqId2BlockIds = reqId2BlockIds
+        self._send_ReqId2BlockIds: dict[ReqId, list[int]] = {}
         logger.info("Initializing SHM Scheduler %s", engine_id)
 
         # Requests that need to start recv/send.
@@ -301,6 +299,9 @@ class ShmConnectorScheduler:
         if params.get("do_remote_decode"):
             self._reqs_in_batch.add(request.request_id)
             local_block_ids = blocks.get_unhashed_block_ids()
+            assert request.request_id not in self._send_ReqId2BlockIds, (
+                f"Request {request.request_id} already in send_ReqId2BlockIds"
+            )
             self._send_ReqId2BlockIds[request.request_id] = local_block_ids
         if params.get("do_remote_prefill"):
             if params.get("remote_block_ids"):
@@ -350,6 +351,10 @@ class ShmConnectorScheduler:
                 save_to_host=False,
             )
 
+        # Make it a deepcopy to avoid mutation during transfer
+        for req_id, block_ids in self._send_ReqId2BlockIds.items():
+            meta.send_ReqId2BlockIds[req_id] = list(block_ids)
+
         meta.reqs_to_send = self._reqs_need_send
         meta.reqs_in_batch = self._reqs_in_batch
         meta.reqs_not_processed = self._reqs_not_processed
@@ -359,6 +364,7 @@ class ShmConnectorScheduler:
         self._reqs_in_batch = set()
         self._reqs_not_processed = set()
         self._reqs_need_send = {}
+        self._send_ReqId2BlockIds = {}
 
         return meta
 
@@ -440,7 +446,7 @@ class ShmConnectorScheduler:
 class ShmConnectorWorker:
     """Implementation of Worker side methods"""
 
-    def __init__(self, vllm_config: VllmConfig, engine_id: str, reqId2BlockIds: dict[ReqId, list[int]]):
+    def __init__(self, vllm_config: VllmConfig, engine_id: str):
         logger.info("Initializing SHM wrapper")
         logger.info("Initializing SHM worker %s", engine_id)
 
@@ -448,7 +454,7 @@ class ShmConnectorWorker:
         self.vllm_config = vllm_config
         self.block_size = vllm_config.cache_config.block_size
         
-        self._send_ReqId2BlockIds = reqId2BlockIds
+        self._send_ReqId2BlockIds: dict[ReqId, list[int]] = {}
         self._pending_send_reqs: set[ReqId] = set()
 
         self.side_channel_filename = engine_id
@@ -577,7 +583,6 @@ class ShmConnectorWorker:
         # Enable different block lengths for different layers when MLA is used.
         self.block_len_per_layer = list[int]()
         self.slot_size_per_layer = list[int]()  # HD bytes in kv terms
-        self.device_id = self.tp_rank
         for layer_name, cache_or_caches in kv_caches.items():
             logger.debug("Registering layer %s with cache shape %s and stride %s", layer_name, cache_or_caches.shape, cache_or_caches.stride())
             assert cache_or_caches.device.type == "cpu", (
@@ -1252,6 +1257,14 @@ class ShmConnectorWorker:
         for req_id, expiration_time in metadata.reqs_to_send.items():
             if req_id in self._reqs_to_process:
                 self._reqs_to_send[req_id] = expiration_time
+
+        for req_id, block_ids in metadata.send_ReqId2BlockIds.items():
+            assert req_id not in self._send_ReqId2BlockIds, (
+                f"Request {req_id} already in send_ReqId2BlockIds"
+            )
+            self._send_ReqId2BlockIds[req_id] = block_ids
+
+        logger.debug(f"self._send_ReqId2BlockIds after start_load_kv: {self._send_ReqId2BlockIds}")
 
     def get_mapped_blocks(self, block_ids, block_size_ratio):
         """
