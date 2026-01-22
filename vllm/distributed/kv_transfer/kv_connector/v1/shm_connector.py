@@ -55,9 +55,6 @@ class ReqMeta:
     remote_filename: str
     remote_engine_id: str
     tp_size: int
-    remote_kv_cache_shape: list[int]
-    remote_kv_cache_stride: list[int]
-    remote_kv_cache_layout: str
     remote_block_size: int
 
 
@@ -87,17 +84,10 @@ class ShmConnectorMetadata(KVConnectorMetadata):
             remote_filename=kv_transfer_params["remote_filename"],
             # P workers don't need to receive tp_size from proxy here.
             tp_size=kv_transfer_params.get("tp_size", 1),
-            remote_kv_cache_shape=kv_transfer_params.get("remote_kv_cache_shape"),
-            remote_kv_cache_stride=kv_transfer_params.get("remote_kv_cache_stride"),
-            remote_kv_cache_layout=kv_transfer_params.get("remote_kv_cache_layout"),
             remote_block_size=kv_transfer_params.get("remote_block_size"),
         )
         if load_remote_cache:
             self.reqs_to_recv[request_id] = _req
-
-# TODO: make it per-instance
-global_kv_cache_shape: list[int] = []
-global_kv_cache_stride: list[int] = []
 
 class ShmConnector(KVConnectorBase_V1):
     def __init__(
@@ -222,7 +212,7 @@ class ShmConnector(KVConnectorBase_V1):
     def shutdown(self):
         if self.connector_worker is not None:
             self.connector_worker.shutdown()
-
+            self.connector_worker = None
 
 class ShmConnectorScheduler:
     """Implementation of Scheduler side methods"""
@@ -427,7 +417,6 @@ class ShmConnectorScheduler:
 
         # self._send_ReqId2BlockIds[request.request_id] = block_ids
         # logger.debug(f"self._send_ReqId2BlockIds = {self._send_ReqId2BlockIds}")
-        global global_kv_cache_shape, global_kv_cache_stride
 
         return delay_free_blocks, dict(
             do_remote_prefill=True,
@@ -436,9 +425,6 @@ class ShmConnectorScheduler:
             remote_engine_id=self.engine_id,
             remote_filename=self.side_channel_filename,
             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
-            remote_kv_cache_shape=global_kv_cache_shape,
-            remote_kv_cache_stride=global_kv_cache_stride,
-            remote_kv_cache_layout=get_kv_cache_layout(),
             remote_block_size=self.block_size,
         )
 
@@ -544,6 +530,8 @@ class ShmConnectorWorker:
         # Flags to indicate whether a layer's shared memory is free to use.
         # True means busy, False means free to use
         self.shm_kv_caches_completion_flags: Optional[shared_memory.SharedMemory] = None
+        # Contains kv cache shape and stride (list of 10 integers total)
+        self.shm_kv_caches_metadata: dict[str, shared_memory.SharedMemory] = {}
         self.remote_shm_objects: dict[EngineId, dict[str, shared_memory.SharedMemory]] = {}
         self.remote_cached_kv_caches: dict[EngineId, dict[str, torch.Tensor]] = {}
         self.remote_cached_shm_kv_caches_completion_flags: dict[EngineId, shared_memory.SharedMemory] = {}
@@ -597,11 +585,6 @@ class ShmConnectorWorker:
             original_cache_stride = cache_or_caches.stride()
             original_cache_requires_grad = cache_or_caches.requires_grad
             original_cache_is_contiguous = cache_or_caches.is_contiguous()
-
-            # TODO: improve it
-            global global_kv_cache_shape, global_kv_cache_stride
-            global_kv_cache_shape = list(original_cache_shape)
-            global_kv_cache_stride = list(original_cache_stride)
 
             cache_or_caches.data = torch.empty(0)  # release tensor from PyTorch management
 
@@ -715,6 +698,42 @@ class ShmConnectorWorker:
                 caches_data.append(
                     (base_addr, curr_tensor_size_bytes, self.device_id, "")
                 )
+
+            # Now create new shared memory for metadata (10 int64 elements)
+            shm_name = f"{self.side_channel_filename}_{layer_name}_metadata"
+            try:
+                existing_shm = shared_memory.SharedMemory(name=shm_name)
+                existing_shm.close()
+                existing_shm.unlink()
+                logger.debug(f"Deleted existing shared memory for metadata of {layer_name}")
+            except FileNotFoundError:
+                # No existing shared memory, which is fine
+                logger.debug(f"No existing shared memory found for metadata of {layer_name}")
+            except Exception as e:
+                logger.warning(f"Failed to cleanup existing shared memory {shm_name}: {e}")
+
+            self.shm_kv_caches_metadata[layer_name] = shared_memory.SharedMemory(
+                name=shm_name,
+                create=True,
+                size=10 * 8,  # 10 elements x 8 bytes (int64)
+            )
+
+            # Create a numpy int64 view over the shared buffer and store shape/stride
+            meta_array = np.frombuffer(self.shm_kv_caches_metadata[layer_name].buf, dtype=np.int64, count=10)
+            for i in range(10):
+                if i < len(original_cache_shape):
+                    meta_array[i] = int(original_cache_shape[i])
+                else:
+                    meta_array[i] = int(original_cache_stride[i - len(original_cache_shape)])
+
+            logger.debug(
+                "Created new shared memory for metadata with name %s (10 int64s) for layer %s and stored shape %s and stride %s",
+                shm_name,
+                layer_name,
+                original_cache_shape,
+                original_cache_stride,
+            )
+            logger.debug("Metadata int64 array: %s", meta_array.tolist())
 
         shm_name = f"{self.side_channel_filename}_flags"
         try:
@@ -1102,11 +1121,50 @@ class ShmConnectorWorker:
                         buffer=remote_shm_buffer.buf,
                         dtype=np.uint8,  # 1 byte per element
                     )
+
+                    try:
+                        remote_meta_shm_name = f"{meta.remote_filename}_{layer_name}_metadata"
+                        logger.debug(
+                            "Accessing metadata shared memory for remote engine %s and layer %s with name %s",
+                            remote_engine_id,
+                            layer_name,
+                            remote_meta_shm_name,
+                        )
+                        remote_meta_shm_buffer = shared_memory.SharedMemory(
+                            name=remote_meta_shm_name,
+                            create=False,
+                        )
+                    except FileNotFoundError:
+                        logger.error(
+                            "Metadata shared memory for remote engine %s and layer %s "
+                            "not found. Make sure the remote process has created "
+                            "the shared memory segment.",
+                            remote_engine_id,
+                            layer_name,
+                        )
+                        raise RuntimeError(
+                            f"Failed to access metadata shared memory for remote engine {remote_engine_id} "
+                            f"and layer {layer_name}. Ensure the remote process has created the "
+                            f"shared memory segment and it is accessible."
+                        )
+                    # Read shape and stride from metadata shared memory
+                    meta_array = np.frombuffer(
+                        buffer=remote_meta_shm_buffer.buf,
+                        dtype=np.int64,
+                        count=10,
+                    )
+                    remote_shape = tuple(int(meta_array[i]) for i in range(5))
+                    remote_stride = tuple(int(meta_array[i]) for i in range(5, 10))   
+
+                    # Now release the meta_array and remote_meta_shm_buffer references
+                    del meta_array
+                    remote_meta_shm_buffer.close()
+                    
                     self.remote_cached_kv_caches[remote_engine_id][layer_name] = torch.from_numpy(np_array).view(
                         dtype=kv_cache.dtype
                         ).as_strided_(
-                            size=meta.remote_kv_cache_shape,
-                            stride=meta.remote_kv_cache_stride,
+                            size=remote_shape,
+                            stride=remote_stride,
                         )
 
                     # For difference in the block size position between GPU and CPU layouts
@@ -1396,13 +1454,14 @@ class ShmConnectorWorker:
                 try:
                     shm_obj.close()
                     shm_obj.unlink()
-                    logger.debug(f"Cleaned up shared memory for {layer_name}")
+                    logger.debug(f"Cleaned up shared memory kv_caches for {layer_name}")
                 except FileNotFoundError:
                     # Already cleaned up
-                    logger.debug(f"Shared memory for {layer_name} already cleaned up")
+                    logger.debug(f"Shared memory kv_caches for {layer_name} already cleaned up")
                 except Exception as e:
-                    logger.warning(f"Failed to cleanup shared memory for {layer_name}: {e}")
+                    logger.warning(f"Failed to cleanup shared memory kv_caches for {layer_name}: {e}")
             self.shm_kv_caches.clear()
+
         if hasattr(self, 'shm_kv_caches_completion_flags'):
             try:
                 self.shm_kv_caches_completion_flags.close()
@@ -1413,3 +1472,16 @@ class ShmConnectorWorker:
                 logger.debug("Shared memory for completion flags already cleaned up")
             except Exception as e:
                 logger.warning(f"Failed to cleanup shared memory for completion flags: {e}")
+
+        if hasattr(self, 'shm_kv_caches_metadata'):
+            for layer_name, shm_obj in self.shm_kv_caches_metadata.items():
+                try:
+                    shm_obj.close()
+                    shm_obj.unlink()
+                    logger.debug(f"Cleaned up shared memory metadata for {layer_name}")
+                except FileNotFoundError:
+                    # Already cleaned up
+                    logger.debug(f"Shared memory metadata for {layer_name} already cleaned up")
+                except Exception as e:
+                    logger.warning(f"Failed to cleanup shared memory metadata for {layer_name}: {e}")
+            self.shm_kv_caches_metadata.clear()
