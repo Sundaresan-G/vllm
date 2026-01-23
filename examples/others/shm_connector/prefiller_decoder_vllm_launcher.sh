@@ -48,7 +48,7 @@ if [[ $1 == "prefiller" ]]; then
     VLLM_OFFLOAD_KV_CACHE_TO_CPU=1 \
     VLLM_CPU_SGL_KERNEL="1" \
     VLLM_DOUBLE_BUFFER_PIPELINE=1 \
-    CUDA_VISIBLE_DEVICES=0 \
+    CUDA_VISIBLE_DEVICES=0,1 \
     $(which vllm) serve $MODEL \
     --port 8100 \
     --max-model-len 9000 \
@@ -57,6 +57,7 @@ if [[ $1 == "prefiller" ]]; then
     --block-size $BLOCK_SIZE \
     --kv-transfer-config '{"kv_connector":"ShmConnector","kv_role":"kv_both"}' \
     --enforce-eager \
+    -tp 2 \
     --no-enable-prefix-caching # Ensure prefiller does not use prefix caching when VLLM_OFFLOAD_KV_CACHE_TO_CPU=1
     
 elif [[ $1 == "decoder" ]]; then
@@ -64,6 +65,7 @@ elif [[ $1 == "decoder" ]]; then
 
     # 2nd GPU as decoder
     # OMP_NUM_THREADS=32 \
+    VLLM_CPU_OMP_THREADS_BIND="0-31|32-63" \
     TORCH_COMPILE_DISABLE=1 \
     VLLM_CPU_KVCACHE_SPACE=4 \
     VLLM_CPU_SGL_KERNEL="1" \
@@ -77,6 +79,7 @@ elif [[ $1 == "decoder" ]]; then
     --max-num-batched-tokens 9000 \
     --block-size $BLOCK_SIZE \
     --no-enable-prefix-caching \
+    -tp 2 \
     --kv-transfer-config '{"kv_connector":"ShmConnector","kv_role":"kv_both"}'
 
 else

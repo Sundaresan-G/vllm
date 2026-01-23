@@ -532,9 +532,9 @@ class ShmConnectorWorker:
         self.shm_kv_caches_completion_flags: Optional[shared_memory.SharedMemory] = None
         # Contains kv cache shape and stride (list of 10 integers total)
         self.shm_kv_caches_metadata: dict[str, shared_memory.SharedMemory] = {}
-        self.remote_shm_objects: dict[EngineId, dict[str, shared_memory.SharedMemory]] = {}
-        self.remote_cached_kv_caches: dict[EngineId, dict[str, torch.Tensor]] = {}
-        self.remote_cached_shm_kv_caches_completion_flags: dict[EngineId, shared_memory.SharedMemory] = {}
+        self.remote_shm_objects: dict[EngineId, dict[str, list[shared_memory.SharedMemory]]] = {}
+        self.remote_cached_kv_caches: dict[EngineId, dict[str, list[torch.Tensor]]] = {}
+        self.remote_cached_shm_kv_caches_completion_flags: dict[EngineId, list[shared_memory.SharedMemory]] = {}
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
@@ -589,7 +589,7 @@ class ShmConnectorWorker:
             cache_or_caches.data = torch.empty(0)  # release tensor from PyTorch management
 
             # First try to clean up any existing shared memory with the same name
-            shm_name = f"{self.side_channel_filename}_{layer_name}"
+            shm_name = f"{self.side_channel_filename}_{layer_name}_tp{self.tp_rank}"
             try:
                 existing_shm = shared_memory.SharedMemory(name=shm_name)
                 existing_shm.close()
@@ -700,7 +700,7 @@ class ShmConnectorWorker:
                 )
 
             # Now create new shared memory for metadata (10 int64 elements)
-            shm_name = f"{self.side_channel_filename}_{layer_name}_metadata"
+            shm_name = f"{self.side_channel_filename}_{layer_name}_tp{self.tp_rank}_metadata"
             try:
                 existing_shm = shared_memory.SharedMemory(name=shm_name)
                 existing_shm.close()
@@ -735,7 +735,7 @@ class ShmConnectorWorker:
             )
             logger.debug("Metadata int64 array: %s", meta_array.tolist())
 
-        shm_name = f"{self.side_channel_filename}_flags"
+        shm_name = f"{self.side_channel_filename}_tp{self.tp_rank}_flags"
         try:
             existing_shm = shared_memory.SharedMemory(name=shm_name)
             existing_shm.close()
@@ -1071,114 +1071,127 @@ class ShmConnectorWorker:
                 self.remote_shm_objects[remote_engine_id] = {} 
                 self.remote_cached_kv_caches[remote_engine_id] = {}
                 assert remote_engine_id not in self.remote_cached_shm_kv_caches_completion_flags   
-                try: 
-                    self.remote_cached_shm_kv_caches_completion_flags[remote_engine_id] = shared_memory.SharedMemory(
-                        name=f"{meta.remote_filename}_flags",
-                        create=False,
-                    )
-                except FileNotFoundError:
-                    logger.error(
-                        "Shared memory for remote engine %s completion flags "
-                        "not found. Make sure the remote process has created "
-                        "the shared memory segment.",
-                        remote_engine_id,
-                    )
-                    raise RuntimeError(
-                        f"Failed to access shared memory for remote engine {remote_engine_id} "
-                        f"completion flags. Ensure the remote process has created the "
-                        f"shared memory segment and it is accessible."
-                    ) 
-                for layer_name, kv_cache in self.device_kv_caches.items():
-                    try:
-                        remote_shm_name = f"{meta.remote_filename}_{layer_name}"
-                        logger.debug(
-                            "Accessing shared memory for remote engine %s and layer %s with name %s",
-                            remote_engine_id,
-                            layer_name,
-                            remote_shm_name,
-                        )
-                        remote_shm_buffer = shared_memory.SharedMemory(
-                            name=remote_shm_name,
+                for remote_tp_rank in range(meta.tp_size): 
+                    self.remote_cached_shm_kv_caches_completion_flags[remote_engine_id] = [] if remote_engine_id not in self.remote_cached_shm_kv_caches_completion_flags else self.remote_cached_shm_kv_caches_completion_flags[remote_engine_id]
+                    try: 
+                        self.remote_cached_shm_kv_caches_completion_flags[remote_engine_id].append(
+                            shared_memory.SharedMemory(
+                            name=f"{meta.remote_filename}_tp{remote_tp_rank}_flags",
                             create=False,
                         )
-                        # Store it to prevent cleanup
-                        self.remote_shm_objects[remote_engine_id][layer_name] = remote_shm_buffer
+                        )
                     except FileNotFoundError:
                         logger.error(
-                            "Shared memory for remote engine %s and layer %s "
+                            "Shared memory for remote engine %s completion flags "
                             "not found. Make sure the remote process has created "
                             "the shared memory segment.",
                             remote_engine_id,
-                            layer_name,
                         )
                         raise RuntimeError(
                             f"Failed to access shared memory for remote engine {remote_engine_id} "
-                            f"and layer {layer_name}. Ensure the remote process has created the "
+                            f"completion flags. Ensure the remote process has created the "
                             f"shared memory segment and it is accessible."
-                        )
-                    # Recreate the tensor from shared memory
-                    np_array = np.frombuffer(
-                        buffer=remote_shm_buffer.buf,
-                        dtype=np.uint8,  # 1 byte per element
-                    )
-
-                    try:
-                        remote_meta_shm_name = f"{meta.remote_filename}_{layer_name}_metadata"
-                        logger.debug(
-                            "Accessing metadata shared memory for remote engine %s and layer %s with name %s",
-                            remote_engine_id,
-                            layer_name,
-                            remote_meta_shm_name,
-                        )
-                        remote_meta_shm_buffer = shared_memory.SharedMemory(
-                            name=remote_meta_shm_name,
-                            create=False,
-                        )
-                    except FileNotFoundError:
-                        logger.error(
-                            "Metadata shared memory for remote engine %s and layer %s "
-                            "not found. Make sure the remote process has created "
-                            "the shared memory segment.",
-                            remote_engine_id,
-                            layer_name,
-                        )
-                        raise RuntimeError(
-                            f"Failed to access metadata shared memory for remote engine {remote_engine_id} "
-                            f"and layer {layer_name}. Ensure the remote process has created the "
-                            f"shared memory segment and it is accessible."
-                        )
-                    # Read shape and stride from metadata shared memory
-                    meta_array = np.frombuffer(
-                        buffer=remote_meta_shm_buffer.buf,
-                        dtype=np.int64,
-                        count=10,
-                    )
-                    remote_shape = tuple(int(meta_array[i]) for i in range(5))
-                    remote_stride = tuple(int(meta_array[i]) for i in range(5, 10))   
-
-                    # Now release the meta_array and remote_meta_shm_buffer references
-                    del meta_array
-                    remote_meta_shm_buffer.close()
-                    
-                    self.remote_cached_kv_caches[remote_engine_id][layer_name] = torch.from_numpy(np_array).view(
-                        dtype=kv_cache.dtype
-                        ).as_strided_(
-                            size=remote_shape,
-                            stride=remote_stride,
+                        ) 
+                    for layer_name, kv_cache in self.device_kv_caches.items():  
+                        self.remote_shm_objects[remote_engine_id][layer_name] = [] if layer_name not in self.remote_shm_objects[remote_engine_id] else self.remote_shm_objects[remote_engine_id][layer_name]                     
+                        try:
+                            remote_shm_name = f"{meta.remote_filename}_{layer_name}_tp{remote_tp_rank}"
+                            logger.debug(
+                                "Accessing shared memory for remote engine %s and layer %s with name %s",
+                                remote_engine_id,
+                                layer_name,
+                                remote_shm_name,
+                            )
+                            remote_shm_buffer = shared_memory.SharedMemory(
+                                name=remote_shm_name,
+                                create=False,
+                            )
+                            # Store it to prevent cleanup
+                            self.remote_shm_objects[remote_engine_id][layer_name].append(remote_shm_buffer)
+                        except FileNotFoundError:
+                            logger.error(
+                                "Shared memory for remote engine %s and layer %s "
+                                "not found. Make sure the remote process has created "
+                                "the shared memory segment.",
+                                remote_engine_id,
+                                layer_name,
+                            )
+                            raise RuntimeError(
+                                f"Failed to access shared memory for remote engine {remote_engine_id} "
+                                f"and layer {layer_name}. Ensure the remote process has created the "
+                                f"shared memory segment and it is accessible."
+                            )
+                        # Recreate the tensor from shared memory
+                        np_array = np.frombuffer(
+                            buffer=remote_shm_buffer.buf,
+                            dtype=np.uint8,  # 1 byte per element
                         )
 
-                    # For difference in the block size position between GPU and CPU layouts
-                    self.remote_cached_kv_caches[remote_engine_id][layer_name].transpose_(-2, -3)
+                        try:
+                            remote_meta_shm_name = f"{meta.remote_filename}_{layer_name}_tp{remote_tp_rank}_metadata"
+                            logger.debug(
+                                "Accessing metadata shared memory for remote engine %s and layer %s with name %s",
+                                remote_engine_id,
+                                layer_name,
+                                remote_meta_shm_name,
+                            )
+                            remote_meta_shm_buffer = shared_memory.SharedMemory(
+                                name=remote_meta_shm_name,
+                                create=False,
+                            )
+                        except FileNotFoundError:
+                            logger.error(
+                                "Metadata shared memory for remote engine %s and layer %s "
+                                "not found. Make sure the remote process has created "
+                                "the shared memory segment.",
+                                remote_engine_id,
+                                layer_name,
+                            )
+                            raise RuntimeError(
+                                f"Failed to access metadata shared memory for remote engine {remote_engine_id} "
+                                f"and layer {layer_name}. Ensure the remote process has created the "
+                                f"shared memory segment and it is accessible."
+                            )
+                        # Read shape and stride from metadata shared memory
+                        meta_array = np.frombuffer(
+                            buffer=remote_meta_shm_buffer.buf,
+                            dtype=np.int64,
+                            count=10,
+                        )
+                        remote_shape = tuple(int(meta_array[i]) for i in range(5))
+                        remote_stride = tuple(int(meta_array[i]) for i in range(5, 10))   
 
-                    logger.debug(f"Recreated remote KV cache tensor for engine {remote_engine_id} and layer {layer_name} with shape {self.remote_cached_kv_caches[remote_engine_id][layer_name].shape} and stride {self.remote_cached_kv_caches[remote_engine_id][layer_name].stride()}")
+                        # Now release the meta_array and remote_meta_shm_buffer references
+                        del meta_array
+                        remote_meta_shm_buffer.close()
 
-                    # logger.debug(f"Remote cached KV cache[{layer_name}][0, 0, 0, 0, :4] = {self.remote_cached_kv_caches[remote_engine_id][layer_name][0, 0, 0, 0, :4]}")
+                        self.remote_cached_kv_caches[remote_engine_id][layer_name] = [] if layer_name not in self.remote_cached_kv_caches[remote_engine_id] else self.remote_cached_kv_caches[remote_engine_id][layer_name]
+                        
+                        self.remote_cached_kv_caches[remote_engine_id][layer_name].append(
+                            torch.from_numpy(np_array).view(
+                            dtype=kv_cache.dtype
+                            ).as_strided_(
+                                size=remote_shape,
+                                stride=remote_stride,
+                            )
+                        )
+
+                        # For difference in the block size position between GPU and CPU layouts
+                        self.remote_cached_kv_caches[remote_engine_id][layer_name][-1].transpose_(-2, -3)
+
+                        logger.debug(f"Recreated remote KV cache tensor for engine {remote_engine_id} and layer {layer_name} and remote_tp_rank {remote_tp_rank} with shape {self.remote_cached_kv_caches[remote_engine_id][layer_name][-1].shape} and stride {self.remote_cached_kv_caches[remote_engine_id][layer_name][-1].stride()}")
+
+                        # logger.debug(f"Remote cached KV cache[{layer_name}][0, 0, 0, 0, :4] = {self.remote_cached_kv_caches[remote_engine_id][layer_name][0, 0, 0, 0, :4]}")
 
             from vllm._custom_ops import cpu_attn_reshape_and_cache
             from vllm.v1.attention.backends.cpu_attn import _get_attn_isa
 
-            assert self.remote_cached_shm_kv_caches_completion_flags[remote_engine_id].buf[meta.remote_block_ids[-1]] == True, (
-                f"Remote block id {meta.remote_block_ids[-1]} for engine {remote_engine_id} is not marked busy as expected.")
+            if self.tp_rank == 0:
+                for remote_tp_rank, elem in enumerate(self.remote_cached_shm_kv_caches_completion_flags[remote_engine_id]):
+                    assert elem.buf[meta.remote_block_ids[-1]] == True, (
+                        f"Remote block id {meta.remote_block_ids[-1]} for remote_tp_rank {remote_tp_rank} of engine {remote_engine_id} is not marked busy as expected.")
+                    
+            self.tp_group.barrier()
             
             # Do not use the assert below. In the case of prefix caching, len(meta.remote_block_ids) can be greater than len(meta.local_block_ids)
             # assert len(meta.remote_block_ids) <= len(meta.local_block_ids), \
@@ -1202,24 +1215,61 @@ class ShmConnectorWorker:
             assert self.block_size == meta.remote_block_size, (
                 f"Block size mismatch: local block size {self.block_size} vs remote block size {meta.remote_block_size}"
             )
+
+            # TODO: handle self.use_mla case
+            if self.device_type == "cpu":
+                kv_head_position = -3
+            else:
+                kv_head_position = -2
             
             copy_start_time = time.perf_counter()
 
-            for layer_name, remote_kv_cache in self.remote_cached_kv_caches[remote_engine_id].items():
-                # logger.debug(
-                #     "Accessed remote KV cache for engine %s, layer %s with shape %s",
-                #     remote_engine_id,
-                #     layer_name,
-                #     remote_kv_cache.shape,
-                # )
-                # logger.debug(f"self.device_kv_caches[{layer_name}] shape = {self.device_kv_caches[layer_name].shape} and stride = {self.device_kv_caches[layer_name].stride()}")
-                # logger.debug(f"remote_kv_cache[{layer_name}] shape = {remote_kv_cache.shape} and stride = {remote_kv_cache.stride()}")
+            remote_tp_size = meta.tp_size
+            start_remote_rank = int((remote_tp_size * self.tp_rank) // self.world_size)
+            end_remote_rank = int((remote_tp_size * (self.tp_rank + 1) + self.world_size - 1) // self.world_size)
+
+            for layer_name, remote_kv_caches in self.remote_cached_kv_caches[remote_engine_id].items():
+
+                # TODO: assuming all the tp ranks have the same number of kv heads. Need to generalize for heterogeneous TP.
+                remote_num_kv_heads = remote_kv_caches[0].shape[kv_head_position]
+                local_num_kv_heads = self.device_kv_caches[layer_name][0].shape[kv_head_position] 
+
+                assert remote_num_kv_heads * remote_tp_size == local_num_kv_heads * self.world_size, (
+                    f"Total number of kv heads mismatch between remote and local: "
+                    f"remote num kv heads {remote_num_kv_heads} * remote tp size {remote_tp_size} != "
+                    f"local num kv heads {local_num_kv_heads} * local world size {self.world_size}"
+                )
+
+                # Distribute these heads across local ranks that share this subset
+                # Number of local ranks per remote subset
+                local_ranks_per_subset = (self.world_size + remote_tp_size - 1) // remote_tp_size  # 4 // 2 = 2
+
+                # Which subset group does this rank belong to?
+                subset_group = self.tp_rank // local_ranks_per_subset  
+
+                # Rank within the subset group
+                rank_in_group = self.tp_rank % local_ranks_per_subset  
+
+                # Distribute heads within the concatenated subset
+                start_kv_head = 0 if local_num_kv_heads >= remote_num_kv_heads else (remote_num_kv_heads * rank_in_group) // local_ranks_per_subset
+                end_kv_head = local_num_kv_heads if local_num_kv_heads >= remote_num_kv_heads else (remote_num_kv_heads * (rank_in_group + 1) + local_ranks_per_subset - 1) // local_ranks_per_subset
+
+                remote_kv_cache = remote_kv_caches[0]
+                if remote_tp_size > 1:                
+                    remote_kv_cache = torch.cat(
+                        [x[:, meta.remote_block_ids] for x in remote_kv_caches[start_remote_rank:end_remote_rank]], 
+                        dim=kv_head_position
+                    )
+                else:
+                    remote_kv_cache = remote_kv_cache[:, meta.remote_block_ids]
+
+                remote_kv_cache = remote_kv_cache[:, :, start_kv_head:end_kv_head]
 
                 if slot_mapping.numel() > 0:
                     keys, values = remote_kv_cache.unbind(0)
-                    key = keys[meta.remote_block_ids].transpose(-2, -3)
+                    key = keys.transpose(-2, -3)
                     key = key.reshape(-1, key.shape[-2], key.shape[-1])
-                    value = values[meta.remote_block_ids].transpose(-2, -3)
+                    value = values.transpose(-2, -3)
                     value = value.reshape(-1, value.shape[-2], value.shape[-1])
                     cpu_attn_reshape_and_cache(
                         key,
@@ -1276,11 +1326,15 @@ class ShmConnectorWorker:
                 #     offset = slot % self.block_size
                 #     logger.debug(f"Local cache slot key_cache[{block_id} , 1, {offset}, :20] {slot}: {local_k_cache[block_id, 1, offset, :20]}") 
 
+            self.tp_group.barrier()
             copy_end_time = time.perf_counter()
             
             logger.debug(f"meta.remote_block_ids = {meta.remote_block_ids}")
+
             # Mark the last remote block as free
-            self.remote_cached_shm_kv_caches_completion_flags[remote_engine_id].buf[meta.remote_block_ids[-1]] = False  # False means free
+            if self.tp_rank == 0:
+                for remote_tp_rank, elem in enumerate(self.remote_cached_shm_kv_caches_completion_flags[remote_engine_id]):
+                    elem.buf[meta.remote_block_ids[-1]] = False  # False means free
 
 
             logger.debug(
@@ -1420,31 +1474,34 @@ class ShmConnectorWorker:
         # Clear remote cached tensors
         if hasattr(self, 'remote_cached_kv_caches'):
             for remote_engine_id, cache_dict in self.remote_cached_kv_caches.items():
-                for layer_name, tensor in cache_dict.items():
-                    try:
-                        # Release tensor reference to remote shared memory
-                        tensor.data = torch.empty(0)
-                    except Exception as e:
-                        logger.warning(f"Error releasing remote tensor reference for {layer_name}: {e}")
+                for layer_name, tensors in cache_dict.items():
+                    for tensor in tensors:
+                        try:
+                            # Release tensor reference to remote shared memory
+                            tensor.data = torch.empty(0)
+                        except Exception as e:
+                            logger.warning(f"Error releasing remote tensor reference for {layer_name}: {e}")
             self.remote_cached_kv_caches.clear()
 
         # Clean up remote shared memory references
         if hasattr(self, 'remote_shm_objects'):
             for remote_engine_id, shm_dict in self.remote_shm_objects.items():
-                for layer_name, shm_obj in shm_dict.items():
-                    try:
-                        shm_obj.close()
-                    except Exception as e:
-                        logger.warning(f"Error closing remote shared memory: {e}")
+                for layer_name, shm_objs in shm_dict.items():
+                    for shm_obj in shm_objs:
+                        try:
+                            shm_obj.close()
+                        except Exception as e:
+                            logger.warning(f"Error closing remote shared memory: {e}")
                 logger.debug(f"Cleaned up remote shared memory references for engine {remote_engine_id}")
             self.remote_shm_objects.clear()
 
         if hasattr(self, 'remote_cached_shm_kv_caches_completion_flags'):
-            for remote_engine_id, shm_obj in self.remote_cached_shm_kv_caches_completion_flags.items():
-                try:
-                    shm_obj.close()
-                except Exception as e:
-                    logger.warning(f"Error closing remote completion flags shared memory: {e}")
+            for remote_engine_id, shm_objs in self.remote_cached_shm_kv_caches_completion_flags.items():
+                for shm_obj in shm_objs:
+                    try:
+                        shm_obj.close()
+                    except Exception as e:
+                        logger.warning(f"Error closing remote completion flags shared memory: {e}")
                 logger.debug(f"Cleaned up remote completion flags shared memory for engine {remote_engine_id}")
             self.remote_cached_shm_kv_caches_completion_flags.clear()
 
