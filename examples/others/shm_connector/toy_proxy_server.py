@@ -56,7 +56,8 @@ async def lifespan(app: FastAPI):
 
     print(
         f"Initialized {len(app.state.prefill_clients)} prefill clients "
-        f"and {len(app.state.decode_clients)} decode clients."
+        f"and {len(app.state.decode_clients)} decode clients.",
+        flush=True,
     )
 
     yield
@@ -142,7 +143,7 @@ def measure_time(func):
         start_time = time.time()
         result = await func(*args, **kwargs)
         end_time = time.time()
-        print(f"{func.__name__} took {end_time - start_time:.4f} seconds")
+        print(f"{func.__name__} took {end_time - start_time:.4f} seconds", flush=True)
         return result
     return wrapper
 
@@ -184,7 +185,10 @@ def measure_generator_time(func):
         start_time = time.time()  # Record the time before the item is generated
         async for item in func(*args, **kwargs):
             end_time = time.time()  # Record the time after the item is generated
-            print(f"{func.__name__} generated an item in {end_time - start_time:.4f} seconds")
+            print(
+                f"{func.__name__} generated an item in {end_time - start_time:.4f} seconds",
+                flush=True,
+            )
             yield item
             start_time = time.time()  # Record the time before the item is generated again
     return wrapper
@@ -242,11 +246,17 @@ async def _handle_completions(api: str, request: Request):
         async def generate_stream():
             prefill_output = b"data: " + response.content
             yield prefill_output
-            print(f"Proxy server relaying chunk from prefill of size {len(prefill_output)}, chunk: {prefill_output}")
+            print(
+                f"Proxy server relaying chunk from prefill of size {len(prefill_output)}, chunk: {prefill_output}",
+                flush=True,
+            )
             async for chunk in stream_service_response(
                 decode_client_info, api, req_data, request_id=request_id
             ):
-                print(f"Proxy server relaying chunk of size {len(chunk)}, chunk: {chunk}")
+                print(
+                    f"Proxy server relaying chunk of size {len(chunk)}, chunk: {chunk}",
+                    flush=True,
+                )
                 yield chunk
 
         output = StreamingResponse(generate_stream(), media_type="application/json")
@@ -257,9 +267,9 @@ async def _handle_completions(api: str, request: Request):
         import traceback
 
         exc_info = sys.exc_info()
-        print(f"Error occurred in disagg prefill proxy server - {api} endpoint")
-        print(e)
-        print("".join(traceback.format_exception(*exc_info)))
+        print(f"Error occurred in disagg prefill proxy server - {api} endpoint", flush=True)
+        print(e, flush=True)
+        print("".join(traceback.format_exception(*exc_info)), flush=True)
         raise
 
 
