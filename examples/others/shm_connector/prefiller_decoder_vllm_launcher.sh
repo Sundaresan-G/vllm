@@ -35,6 +35,7 @@ export VLLM_TORCH_PROFILER_WITH_FLOPS=1
 export VLLM_TORCH_PROFILER_RECORD_SHAPES=1
 export VLLM_TORCH_PROFILER_DIR="."
 export BLOCK_SIZE=64
+export VLLM_TP=${VLLM_TP:-1}
 
 if [[ $1 == "prefiller" ]]; then
 
@@ -52,12 +53,13 @@ if [[ $1 == "prefiller" ]]; then
     $(which vllm) serve $MODEL \
     --port 8100 \
     --max-model-len 9000 \
-    --max-num-seqs 5 \
-    --max-num-batched-tokens 9000 \
+    --max-num-seqs 10 \
+    --max-num-batched-tokens 70000 \
     --block-size $BLOCK_SIZE \
     --kv-transfer-config '{"kv_connector":"ShmConnector","kv_role":"kv_both"}' \
     --enforce-eager \
-    -tp 2 \
+    -tp $VLLM_TP \
+    --num-gpu-blocks-override $((2 * 70000 / BLOCK_SIZE)) \
     --no-enable-prefix-caching # Ensure prefiller does not use prefix caching when VLLM_OFFLOAD_KV_CACHE_TO_CPU=1
     
 elif [[ $1 == "decoder" ]]; then
@@ -65,9 +67,9 @@ elif [[ $1 == "decoder" ]]; then
 
     # 2nd GPU as decoder
     # OMP_NUM_THREADS=32 \
-    VLLM_CPU_OMP_THREADS_BIND="0-31|32-63" \
+    VLLM_CPU_OMP_THREADS_BIND="0-59|60-119" \
     TORCH_COMPILE_DISABLE=1 \
-    VLLM_CPU_KVCACHE_SPACE=4 \
+    VLLM_CPU_KVCACHE_SPACE=40 \
     VLLM_CPU_SGL_KERNEL="1" \
     VLLM_DOUBLE_BUFFER_PIPELINE=0 \
     CUDA_VISIBLE_DEVICES=1 \
@@ -75,11 +77,11 @@ elif [[ $1 == "decoder" ]]; then
     --port 8200 \
     --enforce-eager \
     --max-model-len 9000 \
-    --max-num-seqs 5 \
-    --max-num-batched-tokens 9000 \
+    --max-num-seqs 10 \
+    --max-num-batched-tokens 70000 \
     --block-size $BLOCK_SIZE \
     --no-enable-prefix-caching \
-    -tp 2 \
+    -tp $VLLM_TP \
     --kv-transfer-config '{"kv_connector":"ShmConnector","kv_role":"kv_both"}'
 
 else

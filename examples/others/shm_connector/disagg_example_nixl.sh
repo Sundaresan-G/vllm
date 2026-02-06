@@ -1,4 +1,10 @@
 #!/bin/bash
+#SBATCH --partition=bmtxg31
+#SBATCH --job-name=vllm_g31
+#SBATCH --output=slurm-g31-runs-%j.out
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --time=08:00:00
 
 # echo "Warning: LMCache disaggregated prefill support for vLLM v1 is experimental and subject to change."
 
@@ -6,9 +12,9 @@ set -x
 
 PIDS=()
 MODEL="Qwen/Qwen2.5-1.5B-Instruct"
-INPUT_LEN=1024
+INPUT_LEN=8192
 OUTPUT_LEN=8
-NUM_PROMPTS=20
+NUM_PROMPTS=1
 
 # Switch to the directory of the current script
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -61,16 +67,20 @@ cleanup() {
     echo "Stopping everything…"
     set -x
     trap - INT TERM        # prevent re-entrancy
+    pgrep -af "vllm serve" -u $USER
     pkill -f "vllm serve" -u $USER
-    kill -2 -- ${PIDS[@]}
-    wait -- ${PIDS[@]} 2>/dev/null
+    sleep 10
+    pkill -9 -f "vllm serve" -u $USER
+    kill -9 -- ${PIDS[@]}
+    wait -- ${PIDS[@]}
     echo "Cleaning up shared memory..."
-    rm -f /dev/shm/*
+    find /dev/shm -maxdepth 1 -user $USER -type f -exec rm -f {} +
     exit 0
 }
 
 wait_for_server() {
   local port=$1
+  local pid=$2
   local timeout_seconds=1200
   local start_time=$(date +%s)
 
@@ -89,16 +99,22 @@ wait_for_server() {
     local now=$(date +%s)
     echo "Waiting for server on port $port..."
     if (( now - start_time >= timeout_seconds )); then
-      echo "Timeout waiting for server"
+      echo "Timeout waiting for server on port $port"
       return 1
     fi
 
     sleep 1
+
+    # Check if the process is still running
+    if ! kill -0 $pid 2>/dev/null; then
+        echo "Process with PID $pid and port $port has terminated unexpectedly."
+        cleanup
+    fi
   done
 }
 
-GPU_ENV="vllm_0.13.0_shm_cuda"
-# GPU_ENV="vllm_0.13.0_shm_xpu"
+# GPU_ENV="vllm_0.13.0_shm_cuda"
+GPU_ENV="vllm_0.13.0_shm_xpu"
 
 
 main() {
@@ -124,6 +140,8 @@ main() {
     echo "Please check prefiller.log, decoder.log and proxy.log for logs."
 
     # If VLLM_OFFLOAD_KV_CACHE_TO_CPU=1, then KV_BUFFER_DEVICE does not matter and it will be ignored.
+    ONEAPI_DEVICE_SELECTOR="level_zero:0,4;opencl:0,4" \
+    VLLM_TP=2 \
     VLLM_LOGGING_PREFIX="PREFILLER " \
     bash prefiller_decoder_vllm_launcher.sh prefiller $MODEL \
         > >(tee prefiller.log) 2>&1 &
@@ -133,6 +151,7 @@ main() {
     # conda activate vllm_0.13.0_cpu_nonAvx
     conda activate vllm_0.13.0_cpu
 
+    VLLM_TP=2 \
     VLLM_LOGGING_PREFIX="DECODER " \
     bash prefiller_decoder_vllm_launcher.sh decoder $MODEL \
         > >(tee decoder.log)  2>&1 &
@@ -156,9 +175,9 @@ main() {
     proxy_pid=$!
     PIDS+=($proxy_pid)
 
-    wait_for_server 8100
-    wait_for_server 8200
-    wait_for_server 9000
+    wait_for_server 8100 $prefiller_pid
+    wait_for_server 8200 $decoder_pid
+    wait_for_server 9000 $proxy_pid
 
     # echo "All servers are up. Starting benchmark..."
 
@@ -169,7 +188,7 @@ main() {
     $(which vllm) bench serve --port 9000 --seed $(date +%s) \
         --model $MODEL \
         --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN \
-        --num-prompts $NUM_PROMPTS --max-concurrency 5 \
+        --num-prompts $NUM_PROMPTS --max-concurrency 1 \
         2>&1 | tee benchmark.log
 
     # curl -X POST http://localhost:9000/v1/completions -H "Content-Type: application/json" -d '{    "model": "'"$MODEL"'",    "prompt": "Write a detailed, vivid, and slightly humorous free-verse poem about the craft of software engineering and coding. Touch on long nights spent debugging, collaborating with teammates, wrestling with legacy code, and the relief when all the tests finally pass. Use clear imagery, a hopeful tone.", "max_tokens": 10,    "temperature": 0.7  }' |& tee -a benchmark.log
