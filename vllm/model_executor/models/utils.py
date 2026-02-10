@@ -2,13 +2,15 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, overload
 
 import torch
 import torch.nn as nn
 from torch.func import functional_call
+from torch.nn.modules.module import register_module_module_registration_hook
 from transformers import PretrainedConfig
 
 import vllm.envs as envs
@@ -211,8 +213,8 @@ class AutoWeightsLoader:
                     continue
 
                 raise ValueError(
-                    f"Attempted to load nested weight '{weight_qualname}' "
-                    f"into a single parameter '{base_prefix}'"
+                    f"Attempted to load nested weight {weight_qualname!r} "
+                    f"into a single parameter {base_prefix!r}"
                 )
 
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
@@ -251,7 +253,7 @@ class AutoWeightsLoader:
         module: nn.Module,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> Iterable[str]:
-        if isinstance(module, PPMissingLayer):
+        if isinstance(module, (StageMissingLayer, PPMissingLayer)):
             return
 
         # Avoid infinite recursion since this function is typically
@@ -313,9 +315,14 @@ class AutoWeightsLoader:
 
                     continue
 
+                desc_param_keys = {
+                    base_prefix + k for k, _ in module.named_parameters(recurse=True)
+                }
                 msg = (
-                    f"There is no module or parameter named '{prefix}' "
-                    f"in {type(self.module).__name__}"
+                    f"There is no module or parameter named {prefix!r} "
+                    f"in {self.module._get_name()}. "
+                    f"The available parameters belonging to {base_prefix} "
+                    f"({module._get_name()}) are: {desc_param_keys}"
                 )
                 raise ValueError(msg)
 
@@ -493,6 +500,100 @@ def isin_list(
     return torch.isin(elements, test_elements)
 
 
+class StageMissingLayer(nn.Module):
+    def __init__(self, stage_name: str, module: nn.Module | None = None) -> None:
+        super().__init__()
+
+        self.stage_name = stage_name
+
+        # Don't register this as a child module in order to
+        # avoid missing keys when loading weights
+        self.__dict__["module"] = module
+
+    def __getattr__(self, name: str):
+        return getattr(self.__dict__["module"], name)
+
+    def __call__(self, *args, **kwargs):
+        raise RuntimeError(f"{self} should not be called")
+
+    def extra_repr(self) -> str:
+        return f"stage_name={self.stage_name!r}"
+
+
+@contextmanager
+def collect_children(
+    module: nn.Module,
+    *,
+    targets: type[nn.Module] | tuple[type[nn.Module], ...] | None = None,
+):
+    """
+    Within this context, collect all direct child assignments to `module`,
+    returning a list of children names that is internally updated until the
+    context is exited.
+
+    If `targets` is set, instead collect descendents of `module`
+    that are an instance of `targets`, even if they aren't direct children.
+    """
+    children_names = list[str]()
+
+    if targets is None:
+
+        def hook(module_: nn.Module, name: str, submodule: nn.Module):
+            if module_ is module:
+                children_names.append(name)
+
+        with register_module_module_registration_hook(hook):
+            yield children_names
+    else:
+        yield children_names
+
+        for name, module_ in module.named_modules():
+            if isinstance(module_, targets):
+                children_names.append(name)
+
+
+@contextmanager
+def no_init_weights(
+    module: nn.Module,
+    placeholder: Callable[[nn.Module], nn.Module],
+    *,
+    targets: type[nn.Module] | tuple[type[nn.Module], ...] | None = None,
+):
+    """
+    Within this context, prevent weight initialization from using device memory and
+    replace direct child assignments to `module` with the result of `placeholder()`.
+
+    If `targets` is set, instead prevent weight initialization and
+    replace assignments where the child is an instance of `targets`,
+    even if they aren't direct children of `module`.
+    """
+    if targets is None:
+
+        def hook(module_: nn.Module, name: str, submodule: nn.Module):
+            if module_ is module:
+                return placeholder(submodule)
+
+            return submodule
+
+        with register_module_module_registration_hook(hook), torch.device("meta"):
+            yield
+    else:
+
+        def hook(module_: nn.Module, name: str, submodule: nn.Module):
+            if isinstance(module_, targets):
+                submodule.to("meta")  # Free memory
+            if isinstance(submodule, targets):
+                submodule.to("meta")  # Free memory
+                return placeholder(submodule)
+
+            return submodule
+
+        # Not all descendents are targeted, so we can't use a blanket
+        # `torch.device("meta")` context
+        with register_module_module_registration_hook(hook):
+            yield
+
+
 class LayerFn(Protocol):
     def __call__(self, prefix: str) -> torch.nn.Module: ...
 
@@ -634,13 +735,13 @@ def make_layers(
 
         for module in modules[start_layer:end_layer]:
             required_gpu_bytes = 0 
-            for p in module.parameters():
-                required_gpu_bytes += p.data.numel() * p.data.element_size()
+            for _, p in module.state_dict().items():
+                required_gpu_bytes += p.numel() * p.element_size()
 
             # Assigning twice the max layer size for double buffering
             if required_gpu_bytes * 2 > _GPU_CURRENT_BYTES:  
-                _GPU_TENSOR = torch.empty(2 * required_gpu_bytes // p.data.element_size(), 
-                                        dtype=p.data.dtype, device=device)
+                _GPU_TENSOR = torch.empty(2 * required_gpu_bytes, 
+                                        dtype=torch.uint8, device=device)
                 _GPU_CURRENT_BYTES = _GPU_TENSOR.numel() * _GPU_TENSOR.element_size()
 
         dataCopyStream = torch.Stream()
@@ -683,13 +784,13 @@ def make_layers(
 
                     if layer_idx == start_layer:
                         # Split the tensors[tensor_idx] into module.state_dict() sizes
-                        curr_tensor_split_sizes = [v.numel() for _, v in module.state_dict().items()]
+                        curr_tensor_split_sizes = [v.numel() * v.element_size() for _, v in module.state_dict().items()]
                         curr_split_tensors = torch.split(tensors[curr_tensor_idx], curr_tensor_split_sizes)
 
                         # logger.debug("Copying start layer")
                         
                         for split_idx, (k, v) in enumerate(module.state_dict().items()):
-                            chunk = curr_split_tensors[split_idx].reshape(v.size())
+                            chunk = curr_split_tensors[split_idx].view(v.dtype).view(v.size())
                             chunk.copy_(v, non_blocking=True)
                             curr_device_state[k] = chunk
 
@@ -697,11 +798,11 @@ def make_layers(
                         next_device_state.clear()
 
                         next_module = modules[layer_idx + 1]
-                        next_tensor_split_sizes = [v.numel() for _, v in next_module.state_dict().items()]
+                        next_tensor_split_sizes = [v.numel() * v.element_size() for _, v in next_module.state_dict().items()]
                         next_split_tensors = torch.split(tensors[next_tensor_idx], next_tensor_split_sizes)            
 
                         for split_idx, (k, v) in enumerate(next_module.state_dict().items()):
-                            chunk = next_split_tensors[split_idx].reshape(v.size())
+                            chunk = next_split_tensors[split_idx].view(v.dtype).view(v.size())
                             dataCopyStream.wait_event(compute_event)
                             with dataCopyStream:
                                 # logger.debug("Copying chunk %s weights to %s", k, v.device)
@@ -718,7 +819,10 @@ def make_layers(
                     output = functional_call(module,
                                             curr_device_state,
                                             args=args,
-                                            kwargs=kwargs)
+                                            kwargs=kwargs,
+                                            # tie_weights=False is needed for MoE for some reason. TODO: investigate this further and remove if not needed, since it can cause correctness issues if the model relies on weight tying.
+                                            # tie_weights=False
+                                            )
                     compute_event.record(curr_stream)
                     module.forward = forward
 
@@ -806,7 +910,7 @@ def get_pp_missing_layer_names(model: torch.nn.Module) -> list[str]:
 
     missing_layer_names = []
     for name, module in model.named_modules():
-        if isinstance(module, PPMissingLayer):
+        if isinstance(module, (StageMissingLayer, PPMissingLayer)):
             # NOTE: the trailing dot is used to match the prefix of the layer.
             # without the dot, we could match a layer that is not missing,
             # e.g., 'encoder.layer.1' would match 'encoder.layer.11'
@@ -818,7 +922,7 @@ def get_pp_missing_layer_names(model: torch.nn.Module) -> list[str]:
 
 def is_pp_missing_parameter(name: str, model: torch.nn.Module) -> bool:
     """Check if a parameter is missing in a pipeline parallel model."""
-    if isinstance(model, PPMissingLayer):
+    if isinstance(model, (StageMissingLayer, PPMissingLayer)):
         return True
 
     return any(
@@ -1013,3 +1117,16 @@ def process_eagle_weight(
         model.has_own_lm_head = True
     if "embed_tokens" in name:
         model.has_own_embed_tokens = True
+
+
+def get_layer_index(feature_layer_index: int, num_hidden_layers: int) -> int:
+    """Given a signed vision feature layer, get the number of hidden layers
+       needed to leverage it.
+
+    Args:
+        feature_layer_index: Index of a required layer in the visual encoder.
+        num_hidden_layers: The total number of hidden layers in the visual encoder.
+    """
+    if feature_layer_index < 0:
+        return num_hidden_layers + feature_layer_index + 1
+    return feature_layer_index

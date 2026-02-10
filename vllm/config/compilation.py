@@ -32,6 +32,9 @@ else:
 
 logger = init_logger(__name__)
 
+# Explicitly exports Range
+__all__ = ["Range"]
+
 
 class CompilationMode(enum.IntEnum):
     """The compilation approach used for torch.compile-based compilation of the
@@ -275,7 +278,11 @@ class DynamicShapesConfig:
     artifacts also.
     When type is backed, aot_compile must be disabled for this mode to work.
     until this change picked up https://github.com/pytorch/pytorch/pull/169239.
+    """
 
+    assume_32_bit_indexing: bool = True
+    """
+    whether all tensor sizes can use 32 bit indexing.
     """
 
     def compute_hash(self) -> str:
@@ -404,7 +411,8 @@ class CompilationConfig:
     - 'none,+op1,+op2' to enable only op1 and op2
 
     By default, all custom ops are enabled when running without Inductor and
-    disabled when running with Inductor: mode>=VLLM_COMPILE and backend="inductor".
+    disabled when running with Inductor: mode>CompilationMode.NONE and
+    backend="inductor".
     Inductor generates (fused) Triton kernels for disabled custom ops."""
     splitting_ops: list[str] | None = None
     """A list of ops to exclude from cudagraphs, used in piecewise compilation.
@@ -426,8 +434,9 @@ class CompilationConfig:
     If empty list [], no ops are excluded (suitable for full cudagraphs)."""
     compile_mm_encoder: bool = False
     """Whether or not to compile the multimodal encoder.
-    Currently, this only works for `Qwen2_5_vl` on selected platforms.
-    Disabled by default until more models are supported/tested to work."""
+    Currently, this only works for `Qwen2_5_vl` and `mLLaMa4` models
+    on selected platforms. Disabled by default until more models
+    are supported/tested to work."""
 
     # Inductor capture
     compile_sizes: list[int | str] | None = None
@@ -437,14 +446,14 @@ class CompilationConfig:
 
     compile_ranges_split_points: list[int] | None = None
     """Split points that represent compile ranges for inductor.
-    The compile ranges are 
-    [1, split_points[0]], 
-    [split_points[0] + 1, split_points[1]], ..., 
+    The compile ranges are
+    [1, split_points[0]],
+    [split_points[0] + 1, split_points[1]], ...,
     [split_points[-1] + 1, max_num_batched_tokens].
     Compile sizes are also used single element ranges,
     the range is represented as [compile_sizes[i], compile_sizes[i]].
-    
-    If a range overlaps with the compile size, graph for compile size 
+
+    If a range overlaps with the compile size, graph for compile size
     will be prioritized, i.e. if we have a range [1, 8] and a compile size 4,
     graph for compile size 4 will be compiled and used instead of the graph
     for range [1, 8].
@@ -572,14 +581,23 @@ class CompilationConfig:
     local_cache_dir: str = field(default=None, init=False)  # type: ignore
     """local cache dir for each rank"""
 
-    bs_to_padded_graph_size: list[int] = field(
-        default=None,  # type: ignore
-        init=False,
-    )
-    """optimization:
-    Intuitively, bs_to_padded_graph_size should be dict[int, int].
-    since we know all keys are in a range [0, max_cudagraph_capture_size],
-    we can optimize it to list[int] for better lookup performance."""
+    fast_moe_cold_start = True
+    """Optimization for fast MOE cold start.
+
+    This is a bit of a hack that assumes that:
+    1. the only decoder forward pass being run is the current model
+    2. the decoder forward pass runs all of the MOEs in the order in which they
+       are initialized
+
+    When the above two conditions hold, this option greatly decreases cold start
+    time for MOE models.
+
+    If the above two conditions don't hold, then this option will lead to silent
+    incorrectness. The only condition in which this doesn't hold is speculative
+    decoding, where there is a draft model that may have MOEs in them.
+
+    NB: We're working on a longer-term solution that doesn't need these assumptions.
+    """
 
     # keep track of enabled and disabled custom ops
     enabled_custom_ops: Counter[str] = field(default_factory=Counter, init=False)
@@ -596,6 +614,10 @@ class CompilationConfig:
     Map from layer name to layer objects that need to be accessed outside
     model code, e.g., Attention, FusedMOE when dp_size>1."""
 
+    static_all_moe_layers: list[str] = field(default_factory=list, init=False)
+    """The names of all the MOE layers in the model
+    """
+
     # Attention ops; used for piecewise cudagraphs
     # Use PyTorch operator format: "namespace::name"
     _attention_ops: ClassVar[list[str]] = [
@@ -611,6 +633,7 @@ class CompilationConfig:
         "vllm::gdn_attention_core",
         "vllm::kda_attention",
         "vllm::sparse_attn_indexer",
+        "vllm::rocm_aiter_sparse_attn_indexer",
     ]
 
     def compute_hash(self) -> str:
@@ -630,11 +653,11 @@ class CompilationConfig:
             "debug_dump_path",
             "cache_dir",
             "local_cache_dir",
-            "bs_to_padded_graph_size",
             "traced_files",
             "compilation_time",
             "static_forward_context",
             "pass_config",  # handled separately below
+            "dynamic_shapes_config",  # handled separately below
         }
 
         from vllm.config.utils import get_hash_factors, hash_factors
@@ -642,6 +665,7 @@ class CompilationConfig:
         factors = get_hash_factors(self, ignored_factors)
 
         factors["pass_config"] = self.pass_config.compute_hash()
+        factors["dynamic_shapes_config"] = self.dynamic_shapes_config.compute_hash()
         return hash_factors(factors)
 
     def __repr__(self) -> str:
@@ -650,7 +674,6 @@ class CompilationConfig:
             "enabled_custom_ops": True,
             "disabled_custom_ops": True,
             "compilation_time": True,
-            "bs_to_padded_graph_size": True,
             "traced_files": True,
             "inductor_compile_config": {
                 "post_grad_custom_post_pass": True,
@@ -839,9 +862,9 @@ class CompilationConfig:
         """
         if self.mode is None:
             raise ValueError(
-                "No compilation mode is set. This method should only be \
-                called via vllm config where the level is set if none is \
-                provided."
+                "No compilation mode is set. This method should only be "
+                "called via vllm config where the level is set if none is "
+                "provided."
             )
         if self.mode == CompilationMode.NONE:
             raise ValueError("No compilation mode is set.")
@@ -871,7 +894,6 @@ class CompilationConfig:
         """To complete the initialization after cudagraph related
         configs are set. This includes:
         - initialize compile_sizes
-        - pre-compute the mapping bs_to_padded_graph_size
         """
 
         computed_compile_sizes = []
@@ -895,11 +917,8 @@ class CompilationConfig:
         if self.cudagraph_capture_sizes:
             assert self.cudagraph_capture_sizes[-1] == self.max_cudagraph_capture_size
 
-        # May get recomputed in the model runner if adjustment is needed for spec-decode
-        self.compute_bs_to_padded_graph_size()
-
     def set_splitting_ops_for_v1(
-        self, all2all_backend: str | None = None, data_parallel_size: int | None = None
+        self, all2all_backend: str, data_parallel_size: int = 1
     ):
         # To compatible with OOT hardware plugin platform (for example vllm-ascend)
         # which currently only supports sequence parallelism in eager mode.
@@ -928,18 +947,27 @@ class CompilationConfig:
                 # for details. Make a copy to avoid mutating the class-level
                 # list via reference.
                 self.splitting_ops = list(self._attention_ops)
+
+                # unified_kv_cache_update has a string param that prevents Inductor
+                # from reusing piecewise graphs. Remove it from the compiled graph.
+                # This has the side-effect of excluding cache from cudagraphs but
+                # that doesn't seem to affect performance.
+                # https://github.com/vllm-project/vllm/issues/33267
+                if not self.use_inductor_graph_partition:
+                    self.splitting_ops.append("vllm::unified_kv_cache_update")
+
             elif len(self.splitting_ops) == 0:
                 if (
                     self.cudagraph_mode == CUDAGraphMode.PIECEWISE
                     or self.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE
                 ):
                     logger.warning_once(
-                        "Using piecewise compilation with empty splitting_ops"
+                        "Using piecewise cudagraph with empty splitting_ops"
                     )
                 if self.cudagraph_mode == CUDAGraphMode.PIECEWISE:
                     logger.warning_once(
-                        "Piecewise compilation with empty splitting_ops do not"
-                        "contains piecewise cudagraph. Setting cudagraph_"
+                        "Piecewise compilation with empty splitting_ops does not "
+                        "contain piecewise cudagraph. Setting cudagraph_"
                         "mode to NONE. Hint: If you are using attention "
                         "backends that support cudagraph, consider manually "
                         "setting cudagraph_mode to FULL or FULL_DECODE_ONLY "
@@ -948,19 +976,17 @@ class CompilationConfig:
                     self.cudagraph_mode = CUDAGraphMode.NONE
                 elif self.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE:
                     logger.warning_once(
-                        "Piecewise compilation with empty splitting_ops do "
-                        "not contains piecewise cudagraph. Setting "
+                        "Piecewise compilation with empty splitting_ops does "
+                        "not contain piecewise cudagraph. Setting "
                         "cudagraph_mode to FULL."
                     )
                     self.cudagraph_mode = CUDAGraphMode.FULL
                 self.splitting_ops = []
 
         # Disable CUDA graphs for DeepEP high-throughput since its not CG compatible
-        backend = all2all_backend or envs.VLLM_ALL2ALL_BACKEND
-        dp_size = data_parallel_size if data_parallel_size is not None else 1
         if (
-            backend == "deepep_high_throughput"
-            and dp_size > 1
+            all2all_backend == "deepep_high_throughput"
+            and data_parallel_size > 1
             and self.cudagraph_mode != CUDAGraphMode.NONE
         ):
             # TODO: Piecewise Cuda graph might be enabled
@@ -1038,13 +1064,13 @@ class CompilationConfig:
             # check if op name exists in model
             op_name = op[1:]
             if op_name not in all_ops_in_model:
-                from vllm.model_executor.custom_op import CustomOp
+                from vllm.model_executor.custom_op import op_registry
 
                 # Does op exist at all or is it just not present in this model?
                 # Note: Only imported op classes appear in the registry.
                 missing_str = (
                     "doesn't exist (or wasn't imported/registered)"
-                    if op_name not in CustomOp.op_registry
+                    if op_name not in op_registry
                     else "not present in model"
                 )
 
@@ -1110,24 +1136,6 @@ class CompilationConfig:
 
         self.max_cudagraph_capture_size = rounded_sizes[-1]
         self.cudagraph_capture_sizes = rounded_sizes
-
-        # Recompute after adjusting the cudagraph sizes
-        self.compute_bs_to_padded_graph_size()
-
-    def compute_bs_to_padded_graph_size(self):
-        # pre-compute the mapping from batch size to padded graph size
-        self.bs_to_padded_graph_size = [
-            0 for i in range(self.max_cudagraph_capture_size + 1)
-        ]
-        for end, start in zip(
-            self.cudagraph_capture_sizes + [self.max_cudagraph_capture_size + 1],
-            [0] + self.cudagraph_capture_sizes,
-        ):
-            for bs in range(start, end):
-                if bs == start:
-                    self.bs_to_padded_graph_size[bs] = start
-                else:
-                    self.bs_to_padded_graph_size[bs] = end
 
     def get_compile_ranges(self) -> list[Range]:
         """Get the compile ranges for the compilation config."""

@@ -53,8 +53,8 @@ _REASONING_PARSERS_TO_REGISTER = {
         "HunyuanA13BReasoningParser",
     ),
     "kimi_k2": (
-        "deepseek_r1_reasoning_parser",
-        "DeepSeekR1ReasoningParser",
+        "kimi_k2_reasoning_parser",
+        "KimiK2ReasoningParser",
     ),
     "minimax_m2": (
         "minimax_m2_reasoning_parser",
@@ -83,6 +83,10 @@ _REASONING_PARSERS_TO_REGISTER = {
     "step3": (
         "step3_reasoning_parser",
         "Step3ReasoningParser",
+    ),
+    "step3p5": (
+        "step3p5_reasoning_parser",
+        "Step3p5ReasoningParser",
     ),
 }
 

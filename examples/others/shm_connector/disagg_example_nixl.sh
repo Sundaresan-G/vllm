@@ -113,8 +113,8 @@ wait_for_server() {
   done
 }
 
-# GPU_ENV="vllm_0.13.0_shm_cuda"
-GPU_ENV="vllm_0.13.0_shm_xpu"
+GPU_ENV="vllm_0.15.1_shm_cuda"
+# GPU_ENV="vllm_0.13.0_shm_xpu"
 
 
 main() {
@@ -141,7 +141,7 @@ main() {
 
     # If VLLM_OFFLOAD_KV_CACHE_TO_CPU=1, then KV_BUFFER_DEVICE does not matter and it will be ignored.
     ONEAPI_DEVICE_SELECTOR="level_zero:0,4;opencl:0,4" \
-    VLLM_TP=2 \
+    VLLM_TP=1 \
     VLLM_LOGGING_PREFIX="PREFILLER " \
     bash prefiller_decoder_vllm_launcher.sh prefiller $MODEL \
         > >(tee prefiller.log) 2>&1 &
@@ -149,9 +149,9 @@ main() {
     PIDS+=($prefiller_pid)
 
     # conda activate vllm_0.13.0_cpu_nonAvx
-    conda activate vllm_0.13.0_cpu
+    conda activate vllm_0.15.1_cpu
 
-    VLLM_TP=2 \
+    VLLM_TP=1 \
     VLLM_LOGGING_PREFIX="DECODER " \
     bash prefiller_decoder_vllm_launcher.sh decoder $MODEL \
         > >(tee decoder.log)  2>&1 &
