@@ -11,7 +11,7 @@
 set -x
 
 PIDS=()
-MODEL="Qwen/Qwen2.5-1.5B-Instruct"
+MODEL="Qwen/Qwen3-30B-A3B"
 INPUT_LEN=8192
 OUTPUT_LEN=8
 NUM_PROMPTS=1
@@ -149,7 +149,7 @@ main() {
     PIDS+=($prefiller_pid)
 
     # conda activate vllm_0.13.0_cpu_nonAvx
-    conda activate vllm_0.15.1_cpu
+    conda activate vllm_0.15.1_shm_cpu
 
     VLLM_TP=1 \
     VLLM_LOGGING_PREFIX="DECODER " \
