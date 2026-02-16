@@ -734,16 +734,20 @@ def make_layers(
         _GPU_TENSOR = None
 
         unique_params : dict[int, dict[str, torch.Tensor]] = {}
+        tensor_split_sizes : dict[int, list[int]] = {}
         for layer_idx, module in enumerate(modules[start_layer:end_layer], start=start_layer):
             seen_data_ptrs = set()
             local_unique_params = {}
+            local_tensor_split_sizes = []
             for k, p in module.state_dict().items():
                 data_ptr = p.data_ptr()
                 if data_ptr not in seen_data_ptrs:
                     seen_data_ptrs.add(data_ptr)
                     local_unique_params[k] = p
+                    local_tensor_split_sizes.append(p.numel() * p.element_size())
 
             unique_params[layer_idx] = local_unique_params
+            tensor_split_sizes[layer_idx] = local_tensor_split_sizes
             required_gpu_bytes = 0 
             for _, p in local_unique_params.items():
                 required_gpu_bytes += p.numel() * p.element_size()
@@ -759,14 +763,8 @@ def make_layers(
         # split gpu tensor into two without creating new
         tensors = torch.chunk(_GPU_TENSOR, 2)
 
-        curr_tensor_idx = 0
-        next_tensor_idx = 1
-
-        curr_device_state = {}
-        next_device_state = {}
-
-        copy_event = torch.Event()
-        compute_event = torch.Event()
+        copy_events = [torch.Event() for _ in range(2)]
+        compute_events = [torch.Event() for _ in range(2)]
 
         # Get the current stream
         device_type = getattr(torch, device.type, None)
@@ -776,7 +774,7 @@ def make_layers(
         stream_type = getattr(device_type, "current_stream", lambda: None)
         if not callable(stream_type):
             raise RuntimeError(f"'current_stream' is not callable for device: {device.type}")
-        curr_stream = stream_type()
+        default_stream = stream_type()
 
         # Modify the forward function to use the pre-allocated tensor
         for layer_idx, module in enumerate(modules[start_layer:end_layer], start=start_layer):
@@ -790,59 +788,40 @@ def make_layers(
 
                     module.forward = original_forward
 
-                    nonlocal curr_tensor_idx, next_tensor_idx, curr_device_state, next_device_state, copy_event, compute_event, dataCopyStream, tensors, unique_params
+                    nonlocal default_stream, copy_events, compute_events, dataCopyStream, tensors, unique_params, tensor_split_sizes
 
-                    if layer_idx == start_layer:
-                        # Split the tensors[tensor_idx] into module.state_dict() sizes
-                        unique_items = unique_params[layer_idx]
+                    tensor_idx = layer_idx % 2
+                    unique_items = unique_params[layer_idx]
                         
-                        curr_tensor_split_sizes = [v.numel() * v.element_size() for v in unique_items.values()]
-                        curr_split_tensors = torch.split(tensors[curr_tensor_idx], curr_tensor_split_sizes)
+                    split_sizes = tensor_split_sizes[layer_idx]
+                    split_tensors = torch.split(tensors[tensor_idx], split_sizes)
 
-                        # logger.debug("Copying start layer")
-                        
-                        for split_idx, (k, v) in enumerate(unique_items.items()):
-                            chunk = curr_split_tensors[split_idx].view(v.dtype).view(v.size())
+                    device_state : dict[str, torch.Tensor] = {}
+
+                    for split_idx, (k, v) in enumerate(unique_items.items()):
+                        chunk = split_tensors[split_idx].view(v.dtype).view(v.size())
+                        dataCopyStream.wait_event(compute_events[tensor_idx])
+                        with dataCopyStream:
+                            # logger.debug("Copying chunk %s weights to %s", k, v.device)
                             chunk.copy_(v, non_blocking=True)
-                            curr_device_state[k] = chunk
+                        device_state[k] = chunk
 
-                    if layer_idx < end_layer - 1:
-                        next_device_state.clear()
-
-                        next_module = modules[layer_idx + 1]
-                        unique_items = unique_params[layer_idx + 1]
-                        
-                        next_tensor_split_sizes = [v.numel() * v.element_size() for v in unique_items.values()]
-                        next_split_tensors = torch.split(tensors[next_tensor_idx], next_tensor_split_sizes)
-
-                        for split_idx, (k, v) in enumerate(unique_items.items()):
-                            chunk = next_split_tensors[split_idx].view(v.dtype).view(v.size())
-                            dataCopyStream.wait_event(compute_event)
-                            with dataCopyStream:
-                                # logger.debug("Copying chunk %s weights to %s", k, v.device)
-                                chunk.copy_(v, non_blocking=True)
-                            next_device_state[k] = chunk
+                    copy_events[tensor_idx].record(dataCopyStream)
 
                     # Make the default stream wait for the current events to complete
-                    curr_stream.wait_event(copy_event)
-
-                    copy_event.record(dataCopyStream)            
+                    default_stream.wait_event(copy_events[tensor_idx])            
 
                     # logger.debug("Executing modified forward for layer")
 
                     output = functional_call(module,
-                                            curr_device_state,
+                                            device_state,
                                             args=args,
                                             kwargs=kwargs,
                                             # tie_weights=False is needed for MoE for some reason. TODO: investigate this further and remove if not needed, since it can cause correctness issues if the model relies on weight tying.
                                             # tie_weights=False
                                             )
-                    compute_event.record(curr_stream)
+                    compute_events[tensor_idx].record(default_stream)
                     module.forward = forward
-
-                    # Swap the tensor indices
-                    curr_tensor_idx, next_tensor_idx = next_tensor_idx, curr_tensor_idx
-                    curr_device_state, next_device_state = next_device_state, curr_device_state
 
                     return output
                 
