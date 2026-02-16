@@ -733,9 +733,19 @@ def make_layers(
         _GPU_CURRENT_BYTES = 0
         _GPU_TENSOR = None
 
-        for module in modules[start_layer:end_layer]:
+        unique_params : dict[int, dict[str, torch.Tensor]] = {}
+        for layer_idx, module in enumerate(modules[start_layer:end_layer], start=start_layer):
+            seen_data_ptrs = set()
+            local_unique_params = {}
+            for k, p in module.state_dict().items():
+                data_ptr = p.data_ptr()
+                if data_ptr not in seen_data_ptrs:
+                    seen_data_ptrs.add(data_ptr)
+                    local_unique_params[k] = p
+
+            unique_params[layer_idx] = local_unique_params
             required_gpu_bytes = 0 
-            for _, p in module.state_dict().items():
+            for _, p in local_unique_params.items():
                 required_gpu_bytes += p.numel() * p.element_size()
 
             # Assigning twice the max layer size for double buffering
@@ -769,7 +779,7 @@ def make_layers(
         curr_stream = stream_type()
 
         # Modify the forward function to use the pre-allocated tensor
-        for layer_idx, module in enumerate(modules[start_layer:end_layer]):
+        for layer_idx, module in enumerate(modules[start_layer:end_layer], start=start_layer):
             original_forward = module.forward 
 
             def make_forward(module, original_forward, layer_idx):
@@ -780,16 +790,18 @@ def make_layers(
 
                     module.forward = original_forward
 
-                    nonlocal curr_tensor_idx, next_tensor_idx, curr_device_state, next_device_state, copy_event, compute_event, dataCopyStream, tensors
+                    nonlocal curr_tensor_idx, next_tensor_idx, curr_device_state, next_device_state, copy_event, compute_event, dataCopyStream, tensors, unique_params
 
                     if layer_idx == start_layer:
                         # Split the tensors[tensor_idx] into module.state_dict() sizes
-                        curr_tensor_split_sizes = [v.numel() * v.element_size() for _, v in module.state_dict().items()]
+                        unique_items = unique_params[layer_idx]
+                        
+                        curr_tensor_split_sizes = [v.numel() * v.element_size() for v in unique_items.values()]
                         curr_split_tensors = torch.split(tensors[curr_tensor_idx], curr_tensor_split_sizes)
 
                         # logger.debug("Copying start layer")
                         
-                        for split_idx, (k, v) in enumerate(module.state_dict().items()):
+                        for split_idx, (k, v) in enumerate(unique_items.items()):
                             chunk = curr_split_tensors[split_idx].view(v.dtype).view(v.size())
                             chunk.copy_(v, non_blocking=True)
                             curr_device_state[k] = chunk
@@ -798,10 +810,12 @@ def make_layers(
                         next_device_state.clear()
 
                         next_module = modules[layer_idx + 1]
-                        next_tensor_split_sizes = [v.numel() * v.element_size() for _, v in next_module.state_dict().items()]
-                        next_split_tensors = torch.split(tensors[next_tensor_idx], next_tensor_split_sizes)            
+                        unique_items = unique_params[layer_idx + 1]
+                        
+                        next_tensor_split_sizes = [v.numel() * v.element_size() for v in unique_items.values()]
+                        next_split_tensors = torch.split(tensors[next_tensor_idx], next_tensor_split_sizes)
 
-                        for split_idx, (k, v) in enumerate(next_module.state_dict().items()):
+                        for split_idx, (k, v) in enumerate(unique_items.items()):
                             chunk = next_split_tensors[split_idx].view(v.dtype).view(v.size())
                             dataCopyStream.wait_event(compute_event)
                             with dataCopyStream:
