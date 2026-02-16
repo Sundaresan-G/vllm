@@ -29,11 +29,6 @@ export VLLM_LOGGING_LEVEL=DEBUG
 export TORCH_CUDA_ARCH_LIST="12.0"
 export UCX_NET_DEVICES=all
 export UCX_TLS=all
-# export VLLM_KV_CACHE_LAYOUT="NHD" # Do not use this. VLLM accuracy goes for a toss when using this.
-# export VLLM_TORCH_PROFILER_WITH_STACK=1 
-# export VLLM_TORCH_PROFILER_WITH_FLOPS=1
-# export VLLM_TORCH_PROFILER_RECORD_SHAPES=1
-# export VLLM_TORCH_PROFILER_DIR="."
 # --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile", "torch_profiler_record_shapes": 1, "torch_profiler_with_flops": 1, "torch_profiler_with_stack": 1, "torch_profiler_with_memory": 1}' \
 export BLOCK_SIZE=64
 export VLLM_TP=${VLLM_TP:-1}
@@ -49,18 +44,18 @@ if [[ $1 == "prefiller" ]]; then
     VLLM_KV_CACHE_LAYOUT="NHD" \
     VLLM_OFFLOAD_KV_CACHE_TO_CPU=1 \
     VLLM_CPU_SGL_KERNEL="1" \
-    VLLM_DOUBLE_BUFFER_PIPELINE=0 \
+    VLLM_DOUBLE_BUFFER_PIPELINE=1 \
     CUDA_VISIBLE_DEVICES=0,1 \
     $(which vllm) serve $MODEL \
     --port 8100 \
     --max-model-len 9000 \
     --max-num-seqs 10 \
-    --max-num-batched-tokens 70000 \
+    --max-num-batched-tokens 10000 \
     --block-size $BLOCK_SIZE \
     --kv-transfer-config '{"kv_connector":"ShmConnector","kv_role":"kv_both"}' \
     --enforce-eager \
     -tp $VLLM_TP \
-    --num-gpu-blocks-override $((2 * 70000 / BLOCK_SIZE)) \
+    --num-gpu-blocks-override $((2 * 10000 / BLOCK_SIZE)) \
     --no-enable-prefix-caching # Ensure prefiller does not use prefix caching when VLLM_OFFLOAD_KV_CACHE_TO_CPU=1
     
 elif [[ $1 == "decoder" ]]; then

@@ -2,7 +2,7 @@
 ## NVIDIA GPUs:
 ```bash
 echo '
-set -x
+set -xe
 # Ensure that the tag is present as it is needed for proper versioning purpose
 # git fetch origin tag v0.15.1 --no-tags
 # git reset --hard v0.15.1
@@ -15,13 +15,32 @@ pip install setuptools_scm
 rm -rf .deps build dist *.egg-info
 TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install . --no-build-isolation -v --extra-index-url https://download.pytorch.org/whl/cu129 --no-cache-dir
 # TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install -e . --no-build-isolation -v --extra-index-url https://download.pytorch.org/whl/cu129 --no-cache-dir --config-settings editable_mode=strict
-set +x
+set +xe
 ' | bash 2>&1 | tee build_cuda_$(date +%Y%m%d_%H%M%S).log
+```
+## Intel GPUs:
+```bash
+echo '
+set -xe
+# Ensure that the tag is present as it is needed for proper versioning purpose
+# git fetch origin tag v0.15.1 --no-tags
+# git reset --hard v0.15.1
+conda create -n vllm_0.15.1_shm_xpu python==3.12 -y
+eval "$(conda shell.bash hook)"
+# Load oneAPI2025.2 and driver modules
+mkdir ~/miniforge3/envs/vllm_0.15.1_shm_xpu/etc/conda/activate.d
+cp ~/miniforge3/envs/vllm_0.13.0_shm_xpu/etc/conda/activate.d/xpu-vars.activate.sh ~/miniforge3/envs/vllm_0.15.1_shm_xpu/etc/conda/activate.d
+conda activate vllm_0.15.1_shm_xpu
+pip install -r requirements/xpu.txt --extra-index-url=https://download.pytorch.org/whl/xpu -v
+rm -rf .deps build dist *.egg-info
+VLLM_TARGET_DEVICE=xpu pip install . --no-build-isolation -v --extra-index-url=https://download.pytorch.org/whl/xpu --no-cache-dir
+set +xe
+' | bash 2>&1 | tee build_xpu_$(date +%Y%m%d_%H%M%S).log
 ```
 ## CPUs:
 ```bash
 echo '
-set -x
+set -xe
 # Ensure that the tag is present as it is needed for proper versioning purpose
 # git fetch origin tag v0.15.1 --no-tags
 # git reset --hard v0.15.1
@@ -33,7 +52,7 @@ pip install -r requirements/cpu.txt --extra-index-url https://download.pytorch.o
 rm -rf .deps build dist *.egg-info
 VLLM_CPU_AMXBF16=true VLLM_TARGET_DEVICE=cpu pip install . --no-build-isolation -v --extra-index-url https://download.pytorch.org/whl/cpu --no-cache-dir 
 # VLLM_CPU_AMXBF16=true VLLM_TARGET_DEVICE=cpu pip install -e . --no-build-isolation -v --extra-index-url https://download.pytorch.org/whl/cpu --no-cache-dir --config-settings editable_mode=strict
-set +x
+set +xe
 ' | bash 2>&1 | tee build_cpu_$(date +%Y%m%d_%H%M%S).log
 ```
 
@@ -68,7 +87,7 @@ export VLLM_LOGGING_LEVEL=DEBUG
 export VLLM_KV_CACHE_LAYOUT="NHD"
 # Has effect for CPU only
 export VLLM_CPU_SGL_KERNEL="1" 
-export VLLM_CPU_OMP_THREADS_BIND="0-59|60-119"
+export VLLM_CPU_OMP_THREADS_BIND="0-63|64-127"
 export VLLM_CPU_KVCACHE_SPACE=40 
 # TORCH_COMPILE_DISABLE=1
 # Remove profiler config if profiling not required
