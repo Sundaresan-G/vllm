@@ -47,29 +47,29 @@ bash disagg_example_shm.sh
 
 ### GPU Server side
 ```bash
-MODEL="Qwen/Qwen3-30B-A3B"
-VLLM_LOGGING_LEVEL=DEBUG 
+export MODEL="Qwen/Qwen3-30B-A3B"
+export VLLM_LOGGING_LEVEL=DEBUG 
 # Optional
-VLLM_KV_CACHE_LAYOUT="NHD"
+export VLLM_KV_CACHE_LAYOUT="NHD"
 # Has effect for GPU only. For offloading KV cache to CPU
-VLLM_OFFLOAD_KV_CACHE_TO_CPU=1 
+export VLLM_OFFLOAD_KV_CACHE_TO_CPU=0 
 # TORCH_COMPILE_DISABLE=1
 # Has effect for GPU only. For weights offloading
-VLLM_DOUBLE_BUFFER_PIPELINE=1 
+export VLLM_DOUBLE_BUFFER_PIPELINE=0 
 # Remove profiler config if profiling not required
 $(which vllm) serve $MODEL --port 9000 --max-model-len 9000     --max-num-seqs 10     --max-num-batched-tokens 70000 --enforce-eager --no-enable-prefix-caching --block-size 64 --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile", "torch_profiler_record_shapes": 1, "torch_profiler_with_flops": 1, "torch_profiler_with_stack": 1, "torch_profiler_with_memory": 1}'
 ```
 
 ### CPU Server side
 ```bash
-MODEL="Qwen/Qwen3-30B-A3B"
-VLLM_LOGGING_LEVEL=DEBUG 
+export MODEL="Qwen/Qwen3-30B-A3B"
+export VLLM_LOGGING_LEVEL=DEBUG 
 # Optional
-VLLM_KV_CACHE_LAYOUT="NHD"
+export VLLM_KV_CACHE_LAYOUT="NHD"
 # Has effect for CPU only
-VLLM_CPU_SGL_KERNEL="1" 
-VLLM_CPU_OMP_THREADS_BIND="0-59|60-119"
-VLLM_CPU_KVCACHE_SPACE=40 
+export VLLM_CPU_SGL_KERNEL="1" 
+export VLLM_CPU_OMP_THREADS_BIND="0-59|60-119"
+export VLLM_CPU_KVCACHE_SPACE=40 
 # TORCH_COMPILE_DISABLE=1
 # Remove profiler config if profiling not required
 $(which vllm) serve $MODEL --port 9000 --max-model-len 9000     --max-num-seqs 10     --max-num-batched-tokens 70000 --enforce-eager --no-enable-prefix-caching --block-size 64 --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile", "torch_profiler_record_shapes": 1, "torch_profiler_with_flops": 1, "torch_profiler_with_stack": 1, "torch_profiler_with_memory": 1}'
@@ -78,16 +78,16 @@ $(which vllm) serve $MODEL --port 9000 --max-model-len 9000     --max-num-seqs 1
 ## Evaluation Scripts - Client side:
 ### For Performance measurement
 ```bash
-MODEL="Qwen/Qwen3-30B-A3B"
-INPUT_LEN=8192
-OUTPUT_LEN=8
-NUM_PROMPTS=1
-VLLM_LOGGING_LEVEL=debug 
+export MODEL="Qwen/Qwen3-30B-A3B"
+export INPUT_LEN=8192
+export OUTPUT_LEN=8
+export NUM_PROMPTS=1
+export VLLM_LOGGING_LEVEL=DEBUG 
 # Remove profile at the end if not needed
 $(which vllm) bench serve --port 9000 --seed $(date +%s)         --model $MODEL         --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN         --num-prompts $NUM_PROMPTS --max-concurrency 1 --ignore-eos --profile
 ```
 ### For accuracy test
 ```bash
-MODEL="Qwen/Qwen3-30B-A3B"
+export MODEL="Qwen/Qwen3-30B-A3B"
 curl -X POST http://localhost:9000/v1/completions -H "Content-Type: application/json" -d '{    "model": "'"$MODEL"'",    "prompt": "Write a rich, vivid, slightly humorous free-verse poem about the craft of software engineering and coding. Describe in detail long nights spent debugging elusive bugs, the glow of multiple monitors, half-finished mugs of cold coffee, and the quiet hum of machines in an almost empty office or home workspace. Show the emotional roller coaster of reading confusing legacy code, adding one more log line, watching stack traces scroll by, and wondering what the previous developer was thinking when they designed this system. Include scenes of collaboration: pair programming sessions, code review comments that are both kind and blunt, whiteboard diagrams that start neat and end as chaotic scribbles, and chat messages full of links to docs, tickets, and pull requests. Mention modern tools and rituals of the craft: version control, feature branches, continuous integration pipelines, flaky tests, deployment scripts, and dashboards that flip from red to green. Contrast the stress of production incidents, paging alerts, and frantic hotfixes with the quiet, satisfying moment when all tests finally pass, the pipeline is green, and the release is tagged. Use concrete imagery that developers recognize, add gentle inside jokes about off by one errors and mysterious race conditions, and keep the overall tone hopeful and affirming. Celebrate the creativity, persistence, and teamwork that make software possible, and end on a note of cautious but genuine optimism about the next refactor, the next big feature, and the next late night that somehow feels worth it.", "max_tokens": 100,    "temperature": 0.7  }'
 ```
