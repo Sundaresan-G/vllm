@@ -816,9 +816,7 @@ def make_layers(
                     output = functional_call(module,
                                             device_state,
                                             args=args,
-                                            kwargs=kwargs,
-                                            # tie_weights=False is needed for MoE for some reason. TODO: investigate this further and remove if not needed, since it can cause correctness issues if the model relies on weight tying.
-                                            # tie_weights=False
+                                            kwargs=kwargs
                                             )
                     compute_events[tensor_idx].record(default_stream)
                     module.forward = forward
