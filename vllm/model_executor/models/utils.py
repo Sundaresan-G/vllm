@@ -798,9 +798,9 @@ def make_layers(
 
                     device_state : dict[str, torch.Tensor] = {}
 
+                    dataCopyStream.wait_event(compute_events[tensor_idx])
                     for split_idx, (k, v) in enumerate(unique_items.items()):
                         chunk = split_tensors[split_idx].view(v.dtype).view(v.size())
-                        dataCopyStream.wait_event(compute_events[tensor_idx])
                         with dataCopyStream:
                             # logger.debug("Copying chunk %s weights to %s", k, v.device)
                             chunk.copy_(v, non_blocking=True)
