@@ -776,6 +776,9 @@ def make_layers(
             raise RuntimeError(f"'current_stream' is not callable for device: {device.type}")
         default_stream = stream_type()
 
+        # This variable to keep track of how many layers have been initialized so far for xpu purpose, since xpu mlp layers are prepacked
+        num_layers_initialized = 0
+
         # Modify the forward function to use the pre-allocated tensor
         for layer_idx, module in enumerate(modules[start_layer:end_layer], start=start_layer):
             original_forward = module.forward 
@@ -820,6 +823,30 @@ def make_layers(
                                             )
                     compute_events[tensor_idx].record(default_stream)
                     module.forward = forward
+
+                    # The below snippet is since XPU's mlp layers are prepacked and new storage is allocated. 
+                    # We need to prevent the new storage allocation
+                    nonlocal num_layers_initialized
+                    if device.type == "xpu" and hasattr(module, "mlp") and hasattr(module.mlp, "experts") and num_layers_initialized < (end_layer - start_layer):
+                        num_layers_initialized += 1
+                        for k in ["mlp.experts.w13_weight", "mlp.experts.w2_weight"]:
+                            unique_items[k].data = torch.empty(0)
+                            unique_items[k].data = torch.empty_strided(
+                                size=device_state[k].size(),
+                                stride=device_state[k].stride(),
+                                dtype=device_state[k].dtype,
+                                layout=device_state[k].layout,
+                                device="cpu",
+                                pin_memory=True
+                            )
+                            unique_items[k].copy_(device_state[k], non_blocking=True)
+                            key_idx = list(unique_items.keys()).index(k)
+                            split_tensor = torch.split(tensors[tensor_idx], split_sizes)[key_idx]
+                            device_state[k].data = split_tensor.view(unique_items[k].dtype).view(unique_items[k].size())
+                        
+                        # TODO: do a better way
+                        module.mlp.experts.quant_method.ipex_fusion.linear_fusion.W13.data = device_state["mlp.experts.w13_weight"]
+                        module.mlp.experts.quant_method.ipex_fusion.linear_fusion.W2.data = device_state["mlp.experts.w2_weight"]
 
                     return output
                 

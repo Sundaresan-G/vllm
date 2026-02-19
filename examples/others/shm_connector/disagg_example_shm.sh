@@ -1,10 +1,14 @@
 #!/bin/bash
 #SBATCH --partition=bmtxg31
+##SBATCH --partition=rtx5070
+##SBATCH --partition=hopper
+##SBATCH --gres=gpu:h100:1
+##SBATCH --cpus-per-task=60
 #SBATCH --job-name=vllm_g31
 #SBATCH --output=slurm-g31-runs-%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --time=08:00:00
+#SBATCH --time=00:59:00
 
 # echo "Warning: LMCache disaggregated prefill support for vLLM v1 is experimental and subject to change."
 
@@ -14,7 +18,7 @@ PIDS=()
 MODEL="Qwen/Qwen3-30B-A3B"
 INPUT_LEN=8192
 OUTPUT_LEN=8
-NUM_PROMPTS=1
+NUM_PROMPTS=5
 
 # Switch to the directory of the current script
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -143,7 +147,7 @@ main() {
 
     # If VLLM_OFFLOAD_KV_CACHE_TO_CPU=1, then KV_BUFFER_DEVICE does not matter and it will be ignored.
     # ONEAPI_DEVICE_SELECTOR="level_zero:0,4;opencl:0,4" \
-    VLLM_TP=4 \
+    VLLM_TP=1 \
     VLLM_LOGGING_PREFIX="PREFILLER " \
     bash prefiller_decoder_vllm_launcher.sh prefiller $MODEL \
         > >(tee prefiller.log) 2>&1 &
@@ -153,7 +157,7 @@ main() {
     # conda activate vllm_0.13.0_cpu_nonAvx
     conda activate vllm_0.15.1_shm_cpu
 
-    VLLM_TP=2 \
+    VLLM_TP=1 \
     VLLM_LOGGING_PREFIX="DECODER " \
     bash prefiller_decoder_vllm_launcher.sh decoder $MODEL \
         > >(tee decoder.log)  2>&1 &
