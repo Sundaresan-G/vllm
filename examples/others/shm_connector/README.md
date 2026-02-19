@@ -34,19 +34,37 @@ set +xe
 echo '
 set -xe
 # Ensure that the tag is present as it is needed for proper versioning purpose
-# git fetch origin tag v0.15.1 --no-tags
-# git reset --hard v0.15.1
-conda create -n vllm_0.15.1_shm_xpu python==3.12 -y
+# git fetch origin tag v0.18.0 --no-tags
+# git reset --hard v0.18.0
+# conda create -n vllm_0.18.0_xpu python==3.12 -y
 eval "$(conda shell.bash hook)"
-# Load oneAPI2025.2 and driver modules
-mkdir ~/miniforge3/envs/vllm_0.15.1_shm_xpu/etc/conda/activate.d
-cp ~/miniforge3/envs/vllm_0.13.0_shm_xpu/etc/conda/activate.d/xpu-vars.activate.sh ~/miniforge3/envs/vllm_0.15.1_shm_xpu/etc/conda/activate.d
-conda activate vllm_0.15.1_shm_xpu
-pip install -r requirements/xpu.txt --extra-index-url=https://download.pytorch.org/whl/xpu -v
-rm -rf .deps build dist *.egg-info
-VLLM_TARGET_DEVICE=xpu pip install . --no-build-isolation -v --extra-index-url=https://download.pytorch.org/whl/xpu --no-cache-dir
+# Load oneAPI2025.3 and driver modules
+# mkdir -p ~/miniforge3/envs/vllm_0.18.0_xpu/etc/conda/activate.d
+# cat > ~/miniforge3/envs/vllm_0.18.0_xpu/etc/conda/activate.d/xpu-vars.activate.sh << 'EOF'
+# #!/bin/bash
+
+# set -x
+
+# source /swtools/intel/2025.3/oneapi-vars.sh 
+# # source /swtools/intel-gpu/latest/intel_gpu_vars.sh
+# source /swtools/intel-gpu/26.01.36711.4/intel_gpu_vars.sh
+# # source /swtools/intel-gpu/main_20251004/intel_gpu_vars.sh
+# # export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+
+# export FI_PROVIDER=tcp
+
+# set +x
+# EOF
+conda activate vllm_0.18.0_xpu
+# set -x
+# pip install -r requirements/xpu.txt --extra-index-url=https://download.pytorch.org/whl/xpu -v
+# pip uninstall -y triton triton-xpu
+# pip install triton-xpu==3.6.0 --extra-index-url https://download.pytorch.org/whl/xpu
+# rm -rf .deps dist *.egg-info
+# git ls-files --others --exclude='.vscode' --exclude='example*' --exclude="build*" --exclude=".deps" | xargs rm
+VLLM_VERSION_OVERRIDE="0.18.0" VLLM_TARGET_DEVICE=xpu pip install -e . --no-build-isolation -v --extra-index-url=https://download.pytorch.org/whl/xpu --config-settings editable_mode=strict
 set +xe
-' | bash 2>&1 | tee build_xpu_$(date +%Y%m%d_%H%M%S).log
+' | bash 2>&1 | tee build_xpu_0.18.0_$(date +%Y%m%d_%H%M%S).log
 ```
 ## CPUs:
 ```bash
@@ -86,7 +104,7 @@ bash disagg_example_shm.sh
 ```
 ## Pure GPU/CPU:
 
-### GPU Server side
+### Nvidia GPU Server side
 ```bash
 export MODEL="Qwen/Qwen2.5-1.5B"
 export VLLM_LOGGING_LEVEL=DEBUG 
@@ -99,6 +117,19 @@ export VLLM_OFFLOAD_KV_CACHE_TO_CPU=0
 export VLLM_DOUBLE_BUFFER_PIPELINE=0 
 # Remove profiler config if profiling not required
 $(which vllm) serve $MODEL --port 9000 --max-model-len 9000     --max-num-seqs 10     --max-num-batched-tokens 70000 --enforce-eager --no-enable-prefix-caching --block-size 64 --offload-group-size 1 --offload-num-in-group 1 --offload-prefetch-step 2 --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile", "torch_profiler_record_shapes": 1, "torch_profiler_with_flops": 1, "torch_profiler_with_stack": 1, "torch_profiler_with_memory": 1}'
+```
+
+### Intel GPU Server side
+```bash
+export MODEL="Qwen/Qwen2.5-1.5B"
+export VLLM_LOGGING_LEVEL=DEBUG 
+# Optional
+export VLLM_KV_CACHE_LAYOUT="NHD"
+# Has effect for GPU only. For offloading KV cache to CPU
+export VLLM_OFFLOAD_KV_CACHE_TO_CPU=0 
+# TORCH_COMPILE_DISABLE=1
+# Remove profiler config if profiling not required
+$(which vllm) serve $MODEL --port 9000 --max-model-len 9000     --max-num-seqs 10     --max-num-batched-tokens 70000 --enforce-eager --no-enable-prefix-caching --block-size 64 --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile", "torch_profiler_record_shapes": 1, "torch_profiler_with_flops": 1, "torch_profiler_with_stack": 1, "torch_profiler_with_memory": 1}'
 ```
 
 ### CPU Server side

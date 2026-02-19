@@ -1,20 +1,23 @@
 #!/bin/bash
-##SBATCH --partition=bmtxg31
+##SBATCH --partition=b50
+#SBATCH --partition=bmtxg31
 ##SBATCH --partition=rtx5070
-#SBATCH --partition=h100
+##SBATCH --partition=h100
 ##SBATCH --cpus-per-task=60
-#SBATCH --job-name=vllm_h100
-#SBATCH --output=slurm-h100-runs-%j.out
+#SBATCH --job-name=vllm_g31
+#SBATCH --output=slurm-g31-runs-%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --time=00:59:00
+#SBATCH --time=02:59:00
 
 # echo "Warning: LMCache disaggregated prefill support for vLLM v1 is experimental and subject to change."
 
 set -x
 
 PIDS=()
-MODEL="Qwen/Qwen2.5-1.5B-Instruct"
+# MODEL="Qwen/Qwen2.5-1.5B-Instruct"
+# MODEL="Qwen/Qwen2.5-72B"
+MODEL="Qwen/Qwen3-30B-A3B"
 INPUT_LEN=8192
 OUTPUT_LEN=8
 NUM_PROMPTS=5
@@ -116,7 +119,7 @@ wait_for_server() {
   done
 }
 
-GPU_ENV="vllm_0.18.0_cuda"
+GPU_ENV="vllm_0.18.0_xpu"
 
 
 main() {
@@ -126,7 +129,6 @@ main() {
     source /data/nfs_home/sundares/miniforge3/etc/profile.d/conda.sh
     # conda activate vllm_0.13.0_cpu_nonAvx
     # conda activate vllm_0.13.0_shm_xpu
-    conda activate $GPU_ENV
 
     # check_hf_token
     # check_num_gpus
@@ -143,15 +145,6 @@ main() {
     echo "Launching prefiller, decoder and proxy..."
     echo "Please check prefiller.log, decoder.log and proxy.log for logs."
 
-    # If VLLM_OFFLOAD_KV_CACHE_TO_CPU=1, then KV_BUFFER_DEVICE does not matter and it will be ignored.
-    # ONEAPI_DEVICE_SELECTOR="level_zero:0,4;opencl:0,4" \
-    VLLM_TP=1 \
-    VLLM_LOGGING_PREFIX="PREFILLER " \
-    bash prefiller_decoder_vllm_launcher.sh prefiller $MODEL \
-        > >(tee prefiller.log) 2>&1 &
-    prefiller_pid=$!
-    PIDS+=($prefiller_pid)
-
     # conda activate vllm_0.13.0_cpu_nonAvx
     conda activate vllm_0.18.0_cpu
 
@@ -163,6 +156,15 @@ main() {
     PIDS+=($decoder_pid)
 
     conda activate $GPU_ENV
+
+    # If VLLM_OFFLOAD_KV_CACHE_TO_CPU=1, then KV_BUFFER_DEVICE does not matter and it will be ignored.
+    # ONEAPI_DEVICE_SELECTOR="level_zero:0,4;opencl:0,4" \
+    VLLM_TP=1 \
+    VLLM_LOGGING_PREFIX="PREFILLER " \
+    bash prefiller_decoder_vllm_launcher.sh prefiller $MODEL \
+        > >(tee prefiller.log) 2>&1 &
+    prefiller_pid=$!
+    PIDS+=($prefiller_pid)
 
     # Use proxy_server.py or toy_proxy_server.py
     # python -m debugpy --listen 0.0.0.0:5678 --wait-for-client \

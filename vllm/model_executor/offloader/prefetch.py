@@ -22,6 +22,7 @@ import vllm.model_executor.offloader.prefetch_ops  # noqa: F401
 from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import BaseOffloader
 from vllm.utils.platform_utils import is_pin_memory_available
+from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
 
@@ -253,7 +254,7 @@ class PrefetchOffloader(BaseOffloader):
         """
         offloader = self.module_offloaders[layer_idx]
 
-        if torch.cuda.is_current_stream_capturing():
+        if current_platform.is_cuda() and torch.cuda.is_current_stream_capturing():
             # During capture, skip wait for pre-capture prefetches.
             # sync_before_graph_capture() ensures pre-capture work is complete.
             if not offloader._prefetch_in_capture:
@@ -492,7 +493,7 @@ class _ModuleOffloader:
         assert self._buffer_pool is not None, "Buffer pool not assigned"
 
         # Track if this prefetch is being captured (for _wait_for_layer logic)
-        self._prefetch_in_capture = torch.cuda.is_current_stream_capturing()
+        self._prefetch_in_capture = torch.cuda.is_current_stream_capturing() if current_platform.is_cuda() else self._prefetch_in_capture
 
         # Fork: record event on compute stream, copy_stream waits on it
         # This joins copy_stream to any active CUDA graph capture
@@ -518,7 +519,7 @@ class _ModuleOffloader:
         self._copy_done_event.record(self.copy_stream)
         # Event is only valid for eager wait_event if recorded outside capture.
         # Events recorded during capture become invalid after capture ends.
-        self._event_valid_for_eager = not torch.cuda.is_current_stream_capturing()
+        self._event_valid_for_eager = not torch.cuda.is_current_stream_capturing() if current_platform.is_cuda() else self._event_valid_for_eager
 
 
 class _BaseParamOffloader(ABC):
