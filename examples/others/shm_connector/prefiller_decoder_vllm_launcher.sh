@@ -27,8 +27,6 @@ fi
 export PYTHONHASHSEED=${VLLM_PYTHON_HASH_SEED:-123}
 export VLLM_LOGGING_LEVEL=DEBUG
 export TORCH_CUDA_ARCH_LIST="12.0"
-export UCX_NET_DEVICES=all
-export UCX_TLS=all
 # --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile", "torch_profiler_record_shapes": 1, "torch_profiler_with_flops": 1, "torch_profiler_with_stack": 1, "torch_profiler_with_memory": 1}' \
 export BLOCK_SIZE=64
 export VLLM_TP=${VLLM_TP:-1}
@@ -43,8 +41,6 @@ if [[ $1 == "prefiller" ]]; then
     EnableSharedSystemUsmSupport=1 \
     VLLM_KV_CACHE_LAYOUT="NHD" \
     VLLM_OFFLOAD_KV_CACHE_TO_CPU=1 \
-    VLLM_CPU_SGL_KERNEL="1" \
-    VLLM_DOUBLE_BUFFER_PIPELINE=1 \
     CUDA_VISIBLE_DEVICES=0,1 \
     $(which vllm) serve $MODEL \
     --port 8100 \
@@ -56,10 +52,16 @@ if [[ $1 == "prefiller" ]]; then
     --enforce-eager \
     -tp $VLLM_TP \
     --num-gpu-blocks-override $((2 * 10000 / BLOCK_SIZE)) \
+    --offload-group-size 1 --offload-num-in-group 1 --offload-prefetch-step 2 \
     --no-enable-prefix-caching # Ensure prefiller does not use prefix caching when VLLM_OFFLOAD_KV_CACHE_TO_CPU=1
     
 elif [[ $1 == "decoder" ]]; then
     # Decoder listens on port 8200
+
+    TC_PATH="/data/nfs_home/sundares/miniforge3/envs/vllm_0.18.0_cpu/lib/libtcmalloc_minimal.so"
+    IOMP_PATH="/swtools/intel/2025.3/lib/libiomp5.so"
+
+    export LD_PRELOAD="$TC_PATH:$IOMP_PATH:$LD_PRELOAD"
 
     # 2nd GPU as decoder
     # OMP_NUM_THREADS=32 \
@@ -67,8 +69,6 @@ elif [[ $1 == "decoder" ]]; then
     TORCH_COMPILE_DISABLE=1 \
     VLLM_CPU_KVCACHE_SPACE=40 \
     VLLM_CPU_SGL_KERNEL="1" \
-    VLLM_DOUBLE_BUFFER_PIPELINE=0 \
-    CUDA_VISIBLE_DEVICES=1 \
     $(which vllm) serve $MODEL \
     --port 8200 \
     --enforce-eager \

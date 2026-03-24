@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, overload
 
+import regex as re
 import torch
 import torch.nn as nn
 from torch.func import functional_call
@@ -23,7 +24,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
 )
-from vllm.model_executor.model_loader.online_quantization import (
+from vllm.model_executor.model_loader.reload import (
     support_quantized_model_reload_from_hp_weights,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -33,26 +34,24 @@ from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
 from vllm.utils.platform_utils import (
     is_pin_memory_available,
-    is_uva_available,
 )
 from vllm.utils.torch_utils import (
     direct_register_custom_op,
-    get_cuda_view_from_cpu_tensor,
 )
 
 logger = init_logger(__name__)
 
-WeightsMapping = Mapping[str, str | None]
-"""If a key maps to a value of `None`, the corresponding weight is ignored."""
-
 
 @dataclass
 class WeightsMapper:
-    """Maps the name of each weight if they match the following patterns."""
+    """Maps the name of each weight if they match the following patterns.
 
-    orig_to_new_substr: WeightsMapping = field(default_factory=dict)
-    orig_to_new_prefix: WeightsMapping = field(default_factory=dict)
-    orig_to_new_suffix: WeightsMapping = field(default_factory=dict)
+    If a key maps to a value of `None`, the corresponding weight is ignored."""
+
+    orig_to_new_regex: Mapping[re.Pattern, str | None] = field(default_factory=dict)
+    orig_to_new_substr: Mapping[str, str | None] = field(default_factory=dict)
+    orig_to_new_prefix: Mapping[str, str | None] = field(default_factory=dict)
+    orig_to_new_suffix: Mapping[str, str | None] = field(default_factory=dict)
 
     def __or__(self, other: "WeightsMapper") -> "WeightsMapper":
         """Combine two `WeightsMapper`s by merging their mappings."""
@@ -63,6 +62,13 @@ class WeightsMapper:
         )
 
     def _map_name(self, key: str) -> str | None:
+        for pattern, new_key in self.orig_to_new_regex.items():
+            if pattern.search(key):
+                if new_key is None:
+                    return None
+
+                key = pattern.sub(new_key, key)
+
         for substr, new_key in self.orig_to_new_substr.items():
             if substr in key:
                 if new_key is None:
@@ -315,8 +321,9 @@ class AutoWeightsLoader:
 
                     continue
 
+                named_parameters = module.named_parameters(recurse=True)
                 desc_param_keys = {
-                    base_prefix + k for k, _ in module.named_parameters(recurse=True)
+                    maybe_prefix(base_prefix, k) for k, _ in named_parameters
                 }
                 msg = (
                     f"There is no module or parameter named {prefix!r} "
@@ -611,92 +618,6 @@ class PPMissingLayer(torch.nn.Identity):
         return args[0] if args else next(iter(kwargs.values()))
 
 
-_CPU_OFFLOAD_BYTES = 0
-_CPU_OFFLOAD_MAX_BYTES = 0
-
-
-def set_cpu_offload_max_bytes(max_bytes: int) -> None:
-    global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES
-    _CPU_OFFLOAD_BYTES = 0
-    _CPU_OFFLOAD_MAX_BYTES = max_bytes
-
-
-def maybe_offload_to_cpu(module: torch.nn.Module) -> torch.nn.Module:
-    if (params := next(module.parameters(), None)) is None:
-        return module
-
-    device = params.device
-
-    if device == torch.device("cpu"):
-        return module
-
-    # Read env var to decide whether to offload layers to CPU
-    double_buffer_pipeline = envs.VLLM_DOUBLE_BUFFER_PIPELINE
-
-    global _CPU_OFFLOAD_MAX_BYTES, _CPU_OFFLOAD_BYTES
-    if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES and not double_buffer_pipeline:
-        return module
-
-    pin_memory = is_pin_memory_available()
-    uva_available = is_uva_available()
-
-    assert uva_available, "V1 CPU offloading requires uva (pin memory) support"
-    uva_offloading = True
-
-    # offload parameters to CPU
-    # use pin_memory if possible, which helps cudagraph capture speed
-    offloaded_parameters = False
-    for p in module.parameters():
-        if _CPU_OFFLOAD_BYTES >= _CPU_OFFLOAD_MAX_BYTES and not double_buffer_pipeline:
-            # we use per-parameter offloading
-            # one module might have some parameters offloaded and some not
-            break
-
-        # `torch.empty_like` does not support `pin_memory` argument
-        cpu_data = torch.empty_strided(
-            size=p.data.size(),
-            stride=p.data.stride(),
-            dtype=p.data.dtype,
-            layout=p.data.layout,
-            device="cpu",
-            pin_memory=pin_memory,
-        )
-        cpu_data.copy_(p.data)
-        if (not uva_offloading) or double_buffer_pipeline:
-            # Save the original device in case we need to move
-            p._vllm_original_device = p.device
-            p.data = cpu_data
-        else:
-            # keep the cpu data alive
-            p._vllm_offloaded_cpu_data = cpu_data
-            p.data = get_cuda_view_from_cpu_tensor(cpu_data)
-        _CPU_OFFLOAD_BYTES += p.data.numel() * p.data.element_size()
-        offloaded_parameters = True
-    
-    if not double_buffer_pipeline:
-        if offloaded_parameters and not uva_offloading:
-            original_forward = module.forward
-
-            def forward(*args, **kwargs):
-                module.forward = original_forward
-                device_state = {
-                    # here we blindly call `to(device)`
-                    # if the parameter is already on the device, it will be a no-op
-                    k: v.to(device, non_blocking=True)
-                    for k, v in module.state_dict().items()
-                }
-                output = functional_call(module,
-                                        device_state,
-                                        args=args,
-                                        kwargs=kwargs)
-                module.forward = forward
-                return output
-
-            module.forward = forward
-
-    return module
-
-
 def make_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,
@@ -704,130 +625,35 @@ def make_layers(
 ) -> tuple[int, int, torch.nn.ModuleList]:
     """Make a list of layers with the given layer function, taking
     pipeline parallelism into account.
+
+    Args:
+        num_hidden_layers: Total number of hidden layers in the model.
+        layer_fn: Function to create a layer given its index.
+        prefix: Prefix for layer names.
+
+    Returns:
+        Tuple of (start_layer, end_layer, modules).
     """
     from vllm.distributed.parallel_state import get_pp_group
     from vllm.distributed.utils import get_pp_indices
-    start_layer, end_layer = get_pp_indices(num_hidden_layers,
-                                            get_pp_group().rank_in_group,
-                                            get_pp_group().world_size)
+    from vllm.model_executor.offloader import get_offloader
 
-    # Read env var to decide whether to offload layers to CPU
-    double_buffer_pipeline = envs.VLLM_DOUBLE_BUFFER_PIPELINE
-
-    if double_buffer_pipeline:
-        logger.info("Using double buffer pipeline parallelism")
+    start_layer, end_layer = get_pp_indices(
+        num_hidden_layers, get_pp_group().rank_in_group, get_pp_group().world_size
+    )
 
     modules = torch.nn.ModuleList(
         [PPMissingLayer() for _ in range(start_layer)]
-        + [
-            maybe_offload_to_cpu(layer_fn(prefix=f"{prefix}.{idx}"))
-            for idx in range(start_layer, end_layer)
-        ] + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)])
+        + get_offloader().wrap_modules(
+            layer_fn(prefix=f"{prefix}.{idx}") for idx in range(start_layer, end_layer)
+        )
+        + [PPMissingLayer() for _ in range(end_layer, num_hidden_layers)]
+    )
 
     vllm_config = get_current_vllm_config()
 
     device = vllm_config.device_config.device
 
-    if double_buffer_pipeline and device.type != "cpu":    
-    
-        _GPU_CURRENT_BYTES = 0
-        _GPU_TENSOR = None
-
-        unique_params : dict[int, dict[str, torch.Tensor]] = {}
-        tensor_split_sizes : dict[int, list[int]] = {}
-        for layer_idx, module in enumerate(modules[start_layer:end_layer], start=start_layer):
-            seen_data_ptrs = set()
-            local_unique_params = {}
-            local_tensor_split_sizes = []
-            for k, p in module.state_dict().items():
-                data_ptr = p.data_ptr()
-                if data_ptr not in seen_data_ptrs:
-                    seen_data_ptrs.add(data_ptr)
-                    local_unique_params[k] = p
-                    local_tensor_split_sizes.append(p.numel() * p.element_size())
-
-            unique_params[layer_idx] = local_unique_params
-            tensor_split_sizes[layer_idx] = local_tensor_split_sizes
-            required_gpu_bytes = 0 
-            for _, p in local_unique_params.items():
-                required_gpu_bytes += p.numel() * p.element_size()
-
-            # Assigning twice the max layer size for double buffering
-            if required_gpu_bytes * 2 > _GPU_CURRENT_BYTES:  
-                _GPU_TENSOR = torch.empty(2 * required_gpu_bytes, 
-                                        dtype=torch.uint8, device=device)
-                _GPU_CURRENT_BYTES = _GPU_TENSOR.numel() * _GPU_TENSOR.element_size()
-
-        dataCopyStream = torch.Stream()
-
-        # split gpu tensor into two without creating new
-        tensors = torch.chunk(_GPU_TENSOR, 2)
-
-        copy_events = [torch.Event() for _ in range(2)]
-        compute_events = [torch.Event() for _ in range(2)]
-
-        # Get the current stream
-        device_type = getattr(torch, device.type, None)
-        if device_type is None:
-            raise ValueError(f"Invalid device type: {device.type}")
-
-        stream_type = getattr(device_type, "current_stream", lambda: None)
-        if not callable(stream_type):
-            raise RuntimeError(f"'current_stream' is not callable for device: {device.type}")
-        default_stream = stream_type()
-
-        # Modify the forward function to use the pre-allocated tensor
-        for layer_idx, module in enumerate(modules[start_layer:end_layer], start=start_layer):
-            original_forward = module.forward 
-
-            def make_forward(module, original_forward, layer_idx):
-            
-                def forward(*args, **kwargs):
-
-                    # logger.debug("Executing with modified forward for %s", module)
-
-                    module.forward = original_forward
-
-                    nonlocal default_stream, copy_events, compute_events, dataCopyStream, tensors, unique_params, tensor_split_sizes
-
-                    tensor_idx = layer_idx % 2
-                    unique_items = unique_params[layer_idx]
-                        
-                    split_sizes = tensor_split_sizes[layer_idx]
-                    split_tensors = torch.split(tensors[tensor_idx], split_sizes)
-
-                    device_state : dict[str, torch.Tensor] = {}
-
-                    dataCopyStream.wait_event(compute_events[tensor_idx])
-                    for split_idx, (k, v) in enumerate(unique_items.items()):
-                        chunk = split_tensors[split_idx].view(v.dtype).view(v.size())
-                        with dataCopyStream:
-                            # logger.debug("Copying chunk %s weights to %s", k, v.device)
-                            chunk.copy_(v, non_blocking=True)
-                        device_state[k] = chunk
-
-                    copy_events[tensor_idx].record(dataCopyStream)
-
-                    # Make the default stream wait for the current events to complete
-                    default_stream.wait_event(copy_events[tensor_idx])            
-
-                    # logger.debug("Executing modified forward for layer")
-
-                    output = functional_call(module,
-                                            device_state,
-                                            args=args,
-                                            kwargs=kwargs
-                                            )
-                    compute_events[tensor_idx].record(default_stream)
-                    module.forward = forward
-
-                    return output
-                
-                return forward
-            
-            module.forward = make_forward(module, original_forward, layer_idx)
-
-    
     offload_kv_cache_to_cpu : bool = envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU
 
     if offload_kv_cache_to_cpu:

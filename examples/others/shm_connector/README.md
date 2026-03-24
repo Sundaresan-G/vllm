@@ -4,19 +4,30 @@
 echo '
 set -xe
 # Ensure that the tag is present as it is needed for proper versioning purpose
-# git fetch origin tag v0.15.1 --no-tags
-# git reset --hard v0.15.1
-conda create -n vllm_0.15.1_shm_cuda python==3.12 -y
+# git fetch vllm_public tag v0.18.0 --no-tags
+# git reset --hard v0.18.0
+# conda create -n vllm_0.18.0_cuda python==3.12 -y
 eval "$(conda shell.bash hook)"
-conda activate vllm_0.15.1_shm_cuda
+conda activate vllm_0.18.0_cuda
 source /swtools/cuda/12.9.0/cuda_vars.sh
-TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install -r requirements/cuda.txt --extra-index-url https://download.pytorch.org/whl/cu129 -v 
-pip install setuptools_scm
-rm -rf .deps build dist *.egg-info
-TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install . --no-build-isolation -v --extra-index-url https://download.pytorch.org/whl/cu129 --no-cache-dir
-# TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install -e . --no-build-isolation -v --extra-index-url https://download.pytorch.org/whl/cu129 --no-cache-dir --config-settings editable_mode=strict
+# TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install -r requirements/cuda.txt --extra-index-url https://download.pytorch.org/whl/cu129 -v 
+# pip install setuptools_scm
+# rm -rf .deps dist *.egg-info
+# TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install . --no-build-isolation -v --extra-index-url https://download.pytorch.org/whl/cu129
+# git ls-files --others --exclude='.vscode' --exclude='example*' --exclude="build*" --exclude=".deps" | xargs rm
+# Ensure to comment out optional modules in setup.py
+NVCC_THREADS=4 TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install -e . --no-build-isolation -v --extra-index-url https://download.pytorch.org/whl/cu129 --config-settings editable_mode=strict
+TARGET_DIR=$(ls -dt build/__editable__.vllm-* 2>/dev/null | head -1) && \
+[ -n "$TARGET_DIR" ] || { echo "Error: No editable build directory found"; exit 1; } && \
+git ls-files --others --exclude='.vscode' --exclude='example*' --exclude="build*" --exclude=".deps" | \
+grep -E "\.so$" | \
+while IFS= read -r file; do \
+  mkdir -p "$TARGET_DIR/$(dirname "$file")" && \
+  mv "$file" "$TARGET_DIR/$file" && \
+  echo "Moved: $file"; \
+done
 set +xe
-' | bash 2>&1 | tee build_cuda_$(date +%Y%m%d_%H%M%S).log
+' | bash 2>&1 | tee build_cuda_0.18.0_$(date +%Y%m%d_%H%M%S).log
 ```
 ## Intel GPUs:
 ```bash
@@ -42,18 +53,29 @@ set +xe
 echo '
 set -xe
 # Ensure that the tag is present as it is needed for proper versioning purpose
-# git fetch origin tag v0.15.1 --no-tags
-# git reset --hard v0.15.1
-conda create -n vllm_0.15.1_shm_cpu python==3.12 -y
+# git fetch origin tag v0.18.0 --no-tags
+# git reset --hard v0.18.0
+# conda create -n vllm_0.18.0_cpu python==3.12 -y
 eval "$(conda shell.bash hook)"
-conda activate vllm_0.15.1_shm_cpu
-pip install -r requirements/cpu-build.txt --extra-index-url https://download.pytorch.org/whl/cpu
-pip install -r requirements/cpu.txt --extra-index-url https://download.pytorch.org/whl/cpu
-rm -rf .deps build dist *.egg-info
-VLLM_CPU_AMXBF16=true VLLM_TARGET_DEVICE=cpu pip install . --no-build-isolation -v --extra-index-url https://download.pytorch.org/whl/cpu --no-cache-dir 
-# VLLM_CPU_AMXBF16=true VLLM_TARGET_DEVICE=cpu pip install -e . --no-build-isolation -v --extra-index-url https://download.pytorch.org/whl/cpu --no-cache-dir --config-settings editable_mode=strict
+conda activate vllm_0.18.0_cpu
+# pip install -r requirements/cpu-build.txt --extra-index-url https://download.pytorch.org/whl/cpu
+# pip install -r requirements/cpu.txt --extra-index-url https://download.pytorch.org/whl/cpu
+conda install gperftools
+rm -rf .deps dist *.egg-info
+# git ls-files --others --exclude='.vscode' --exclude='example*' --exclude="build*" --exclude=".deps" | xargs rm
+# VLLM_CPU_AMXBF16=true VLLM_TARGET_DEVICE=cpu pip install . --no-build-isolation -v --extra-index-url https://download.pytorch.org/whl/cpu 
+VLLM_CPU_AMXBF16=true VLLM_TARGET_DEVICE=cpu pip install -e . --no-build-isolation -v --extra-index-url https://download.pytorch.org/whl/cpu --config-settings editable_mode=strict
+TARGET_DIR=$(ls -dt build/__editable__.vllm-* 2>/dev/null | head -1) && \
+[ -n "$TARGET_DIR" ] || { echo "Error: No editable build directory found"; exit 1; } && \
+git ls-files --others --exclude='.vscode' --exclude='example*' --exclude="build*" --exclude=".deps" | \
+grep -E "\.so$" | \
+while IFS= read -r file; do \
+  mkdir -p "$TARGET_DIR/$(dirname "$file")" && \
+  mv "$file" "$TARGET_DIR/$file" && \
+  echo "Moved: $file"; \
+done
 set +xe
-' | bash 2>&1 | tee build_cpu_$(date +%Y%m%d_%H%M%S).log
+' | bash 2>&1 | tee build_cpu_0.18.0_$(date +%Y%m%d_%H%M%S).log
 ```
 
 # Run Scripts
@@ -66,7 +88,7 @@ bash disagg_example_shm.sh
 
 ### GPU Server side
 ```bash
-export MODEL="Qwen/Qwen3-30B-A3B"
+export MODEL="Qwen/Qwen2.5-1.5B"
 export VLLM_LOGGING_LEVEL=DEBUG 
 # Optional
 export VLLM_KV_CACHE_LAYOUT="NHD"
@@ -76,7 +98,7 @@ export VLLM_OFFLOAD_KV_CACHE_TO_CPU=0
 # Has effect for GPU only. For weights offloading
 export VLLM_DOUBLE_BUFFER_PIPELINE=0 
 # Remove profiler config if profiling not required
-$(which vllm) serve $MODEL --port 9000 --max-model-len 9000     --max-num-seqs 10     --max-num-batched-tokens 70000 --enforce-eager --no-enable-prefix-caching --block-size 64 --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile", "torch_profiler_record_shapes": 1, "torch_profiler_with_flops": 1, "torch_profiler_with_stack": 1, "torch_profiler_with_memory": 1}'
+$(which vllm) serve $MODEL --port 9000 --max-model-len 9000     --max-num-seqs 10     --max-num-batched-tokens 70000 --enforce-eager --no-enable-prefix-caching --block-size 64 --offload-group-size 1 --offload-num-in-group 1 --offload-prefetch-step 2 --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile", "torch_profiler_record_shapes": 1, "torch_profiler_with_flops": 1, "torch_profiler_with_stack": 1, "torch_profiler_with_memory": 1}'
 ```
 
 ### CPU Server side
@@ -97,10 +119,10 @@ $(which vllm) serve $MODEL --port 9000 --max-model-len 9000     --max-num-seqs 1
 ## Evaluation Scripts - Client side:
 ### For Performance measurement
 ```bash
-export MODEL="Qwen/Qwen3-30B-A3B"
+export MODEL="Qwen/Qwen2.5-1.5B"
 export INPUT_LEN=8192
 export OUTPUT_LEN=8
-export NUM_PROMPTS=1
+export NUM_PROMPTS=2
 export VLLM_LOGGING_LEVEL=DEBUG 
 # Remove profile at the end if not needed
 $(which vllm) bench serve --port 9000 --seed $(date +%s)         --model $MODEL         --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN         --num-prompts $NUM_PROMPTS --max-concurrency 1 --ignore-eos --profile

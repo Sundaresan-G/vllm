@@ -13,14 +13,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from transformers.image_processing_utils import BatchFeature
-from transformers.tokenization_utils import TensorType
+from transformers.utils import TensorType
 from typing_extensions import TypedDict, Unpack
 
 from vllm.config import VllmConfig
 from vllm.config.model import ModelConfig
+from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import parallel_state
 from vllm.distributed import utils as dist_utils
-from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention
+from vllm.model_executor.layers.attention import MMEncoderAttention
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     QKVParallelLinear,
@@ -550,7 +551,7 @@ def process_vision_for_patches(
             `(num_images, height, width, channels)` for a batch. Channels are
             expected to be RGB.
         patch_size (`int`):
-            Edge length of square patches; implictly controls resize grid granularity.
+            Edge length of square patches; implicitly controls resize grid granularity.
         max_num_patches (`int`):
             Maximum number of patches allowed after resizing.
         min_num_patches (`int`, *optional*):
@@ -645,7 +646,7 @@ class IsaacImageProcessor:
         return_tensors: str | TensorType | None,
         **kwargs: Unpack[IsaacImageProcessorKwargs],
     ) -> BatchFeature:
-        """Preprocess images into format compatibile with vLLM input processing."""
+        """Preprocess images into format compatible with vLLM input processing."""
 
         all_pixel_values: list[torch.Tensor] = []
         all_image_grids: list[torch.Tensor] = []
@@ -759,6 +760,7 @@ class IsaacProcessor:
                 # Regular text message
                 processed_messages.append(message)
 
+        kwargs["return_dict"] = False
         return self.tokenizer.apply_chat_template(
             processed_messages,
             tokenize=tokenize,
@@ -848,12 +850,12 @@ class IsaacDummyInputsBuilder(BaseDummyInputsBuilder[IsaacProcessingInfo]):
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: Mapping[str] | None = None,
+        mm_options: Mapping[str, BaseDummyOptions],
     ) -> MultiModalDataDict:
         num_images = mm_counts.get("image", 0)
 
         target_width, target_height = self.info.get_image_size_with_most_features()
-        image_overrides = mm_options.get("image") if mm_options else None
+        image_overrides = mm_options.get("image")
 
         return {
             "image": self._get_dummy_images(
@@ -1450,7 +1452,7 @@ class IsaacForConditionalGeneration(
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,

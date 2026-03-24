@@ -33,8 +33,8 @@ _REASONING_PARSERS_TO_REGISTER = {
         "Ernie45ReasoningParser",
     ),
     "glm45": (
-        "glm4_moe_reasoning_parser",
-        "Glm4MoeModelReasoningParser",
+        "deepseek_v3_reasoning_parser",
+        "DeepSeekV3ReasoningWithThinkingParser",
     ),
     "openai_gptoss": (
         "gptoss_reasoning_parser",
@@ -45,8 +45,8 @@ _REASONING_PARSERS_TO_REGISTER = {
         "GraniteReasoningParser",
     ),
     "holo2": (
-        "holo2_reasoning_parser",
-        "Holo2ReasoningParser",
+        "deepseek_v3_reasoning_parser",
+        "DeepSeekV3ReasoningWithThinkingParser",
     ),
     "hunyuan_a13b": (
         "hunyuan_a13b_reasoning_parser",
@@ -67,6 +67,10 @@ _REASONING_PARSERS_TO_REGISTER = {
     "mistral": (
         "mistral_reasoning_parser",
         "MistralReasoningParser",
+    ),
+    "nemotron_v3": (
+        "nemotron_v3_reasoning_parser",
+        "NemotronV3ReasoningParser",
     ),
     "olmo3": (
         "olmo3_reasoning_parser",

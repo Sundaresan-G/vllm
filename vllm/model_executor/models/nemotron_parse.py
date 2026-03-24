@@ -58,8 +58,9 @@ from vllm.multimodal.processing import (
     PromptReplacement,
     PromptUpdate,
 )
+from vllm.renderers import TokenizeParams
+from vllm.tokenizers import TokenizerLike
 from vllm.transformers_utils.configs.radio import RadioConfig
-from vllm.transformers_utils.tokenizer import TokenizerLike
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
 from vllm.v1.attention.backend import AttentionType
 
@@ -289,7 +290,7 @@ class MBartDecoderNoPos(nn.Module):
 
     def forward(
         self,
-        decoder_input_ids: torch.Tensor,
+        decoder_input_ids: torch.Tensor | None,
         *,
         encoder_hidden_states: torch.Tensor | None,
         inputs_embeds: torch.Tensor | None = None,
@@ -608,6 +609,9 @@ class NemotronParseProcessingInfo(BaseProcessingInfo):
             **kwargs,
         )
 
+    def get_default_tok_params(self) -> TokenizeParams:
+        return super().get_default_tok_params().with_kwargs(add_special_tokens=False)
+
     @property
     def skip_prompt_length_check(self) -> bool:
         return True  # Because the encoder prompt is padded
@@ -641,7 +645,7 @@ class NemotronParseDummyInputsBuilder(
         self,
         seq_len: int,
         mm_counts: Mapping[str, int],
-        mm_options: Mapping[str, BaseDummyOptions] | None = None,
+        mm_options: Mapping[str, BaseDummyOptions],
     ) -> MultiModalDataDict:
         num_images = mm_counts.get("image", 0)
 
@@ -660,7 +664,7 @@ class NemotronParseMultiModalProcessor(
     def create_encoder_prompt(
         self,
         prompt: str | list[int],
-        mm_data: MultiModalDataDict,
+        mm_items: MultiModalDataItems,
     ) -> str | list[int]:
         return [0]
 
@@ -897,7 +901,7 @@ class NemotronParseForConditionalGeneration(nn.Module, SupportsMultiModal):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         encoder_outputs: list[torch.Tensor] | None = None,
         **kwargs,

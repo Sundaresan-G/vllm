@@ -7,6 +7,7 @@ import warnings
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
 from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass
 from functools import cached_property, lru_cache, partial
 from itertools import accumulate
 from pathlib import Path
@@ -50,8 +51,8 @@ from vllm.multimodal.inputs import (
     VisionChunkImage,
     VisionChunkVideo,
 )
+from vllm.multimodal.media import MEDIA_CONNECTOR_REGISTRY, MediaConnector
 from vllm.multimodal.processing import BaseMultiModalProcessor
-from vllm.multimodal.utils import MEDIA_CONNECTOR_REGISTRY, MediaConnector
 from vllm.utils import random_uuid
 from vllm.utils.collection_utils import is_list_of
 from vllm.utils.import_utils import LazyLoader
@@ -454,78 +455,6 @@ def _get_embeds_data(
     raise NotImplementedError(type(data_items))
 
 
-def rebuild_mm_uuids_from_mm_data(
-    mm_uuids: MultiModalUUIDDict,
-    mm_data: MultiModalDataDict,
-) -> MultiModalUUIDDict:
-    """Rebuild mm_uuids after vision_chunk processing.
-
-    When videos are split into chunks, the original UUIDs need to be updated
-    to reflect the new UUIDs generated for each chunk.
-
-    Args:
-        mm_uuids: Original UUIDs dictionary
-        mm_data: Processed multimodal data with vision_chunk items
-
-    Returns:
-        Updated UUIDs dictionary with chunk UUIDs
-    """
-    vision_chunks = mm_data.get("vision_chunk")
-    if vision_chunks is None:
-        return mm_uuids
-
-    new_uuids = dict(mm_uuids)
-    vision_chunk_uuids = []
-
-    for item in vision_chunks:
-        # vision_chunk items are always dicts (VisionChunkImage/VisionChunkVideo)
-        assert isinstance(item, dict)
-        uuid_val = item.get("uuid")
-        if uuid_val is not None:
-            vision_chunk_uuids.append(uuid_val)
-
-    if vision_chunk_uuids:
-        new_uuids["vision_chunk"] = vision_chunk_uuids
-
-    return new_uuids
-
-
-def build_video_prompts_from_mm_data(
-    mm_data: MultiModalDataDict,
-) -> list[str]:
-    """Build video prompts from vision_chunk data.
-
-    Collects prompts from video chunks and groups them by video_idx.
-
-    Args:
-        mm_data: Processed multimodal data with vision_chunk items
-
-    Returns:
-        List of video prompts, one per video.
-    """
-    vision_chunks = mm_data.get("vision_chunk")
-    if vision_chunks is None:
-        return []
-
-    # Group chunks by video_idx
-    video_prompts_dict: dict[int, list[str]] = defaultdict(list)
-
-    for item in vision_chunks:
-        # vision_chunk items are always dicts (VisionChunkImage/VisionChunkVideo)
-        assert isinstance(item, dict)
-        if item.get("type") == "video_chunk":
-            video_idx = item.get("video_idx", 0)
-            prompt = item.get("prompt", "")
-            video_prompts_dict[video_idx].append(prompt)
-
-    # Build prompts in video order
-    video_prompts = []
-    for video_idx in sorted(video_prompts_dict.keys()):
-        video_prompts.append("".join(video_prompts_dict[video_idx]))
-
-    return video_prompts
-
-
 class BaseMultiModalItemTracker(ABC, Generic[_T]):
     """
     Tracks multi-modal items in a given request and ensures that the number
@@ -533,10 +462,15 @@ class BaseMultiModalItemTracker(ABC, Generic[_T]):
     maximum per prompt.
     """
 
-    def __init__(self, model_config: ModelConfig):
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        media_io_kwargs: dict[str, dict[str, Any]] | None = None,
+    ):
         super().__init__()
 
         self._model_config = model_config
+        self._media_io_kwargs = media_io_kwargs
 
         self._items_by_modality = defaultdict[str, list[_T]](list)
         # Track original modality for each vision_chunk item (image or video)
@@ -557,6 +491,14 @@ class BaseMultiModalItemTracker(ABC, Generic[_T]):
 
         model_cls = get_model_cls(self.model_config)
         return cast(type[SupportsMultiModal], model_cls)
+
+    @property
+    def media_io_kwargs(self) -> dict[str, dict[str, Any]] | None:
+        return self._media_io_kwargs or (
+            self._model_config.multimodal_config.media_io_kwargs
+            if self._model_config.multimodal_config
+            else None
+        )
 
     @property
     def allowed_local_media_path(self):
@@ -600,7 +542,17 @@ class BaseMultiModalItemTracker(ABC, Generic[_T]):
         else:
             num_items = len(self._items_by_modality[original_modality]) + 1
 
-        self.mm_processor.validate_num_items(input_modality, num_items)
+        mm_config = self.model_config.multimodal_config
+        if (
+            mm_config is not None
+            and mm_config.enable_mm_embeds
+            and mm_config.get_limit_per_prompt(input_modality) == 0
+            and original_modality.endswith("_embeds")
+        ):
+            # Skip validation: embeddings bypass limit when enable_mm_embeds=True
+            pass
+        else:
+            self.mm_processor.info.validate_num_items(input_modality, num_items)
 
         # Track original modality for vision_chunk items
         if use_vision_chunk:
@@ -612,14 +564,78 @@ class BaseMultiModalItemTracker(ABC, Generic[_T]):
         return self.model_cls.get_placeholder_str(modality, num_items)
 
     @abstractmethod
-    def create_parser(self) -> "BaseMultiModalContentParser":
+    def create_parser(
+        self, mm_processor_kwargs: dict[str, Any] | None = None
+    ) -> "BaseMultiModalContentParser":
         raise NotImplementedError
+
+
+def _resolve_vision_chunk_items(
+    vision_chunk_items: list[tuple[object, str | None]],
+    mm_processor: BaseMultiModalProcessor,
+    vision_chunks_modality_order: list[str],
+):
+    # Process vision_chunk items - extract from (data, modality) tuples
+    # and convert to VisionChunk types with proper UUID handling
+    vision_chunks_uuids = [uuid for data, uuid in vision_chunk_items]
+
+    assert len(vision_chunk_items) == len(vision_chunks_modality_order), (
+        f"vision_chunk items ({len(vision_chunk_items)}) and "
+        f"modality_order ({len(vision_chunks_modality_order)}) must have same length"
+    )
+
+    processed_chunks: list[VisionChunk] = []
+    video_idx = 0
+    for inner_modality, (data, uuid) in zip(
+        vision_chunks_modality_order, vision_chunk_items
+    ):
+        if inner_modality == "image":
+            # Cast data to proper type for image
+            # Use .media (PIL.Image) directly to avoid redundant
+            # bytes→PIL conversion in media_processor
+            if hasattr(data, "media"):
+                image_data = data.media  # type: ignore[union-attr]
+                processed_chunks.append(
+                    VisionChunkImage(type="image", image=image_data, uuid=uuid)
+                )
+            else:
+                processed_chunks.append(data)  # type: ignore[arg-type]
+        elif inner_modality == "video":
+            # For video, we may need to split into chunks
+            # if processor supports it
+            # For now, just wrap as a video chunk placeholder
+            if hasattr(mm_processor, "split_video_chunks") and data is not None:
+                try:
+                    video_uuid = uuid or random_uuid()
+                    # video await result is (video_data, video_meta) tuple
+                    if isinstance(data, tuple) and len(data) >= 1:
+                        video_data = data[0]
+                    else:
+                        video_data = data
+                    video_chunks = mm_processor.split_video_chunks(video_data)
+                    for i, vc in enumerate(video_chunks):
+                        processed_chunks.append(
+                            VisionChunkVideo(
+                                type="video_chunk",
+                                video_chunk=vc["video_chunk"],
+                                uuid=f"{video_uuid}-{i}",
+                                video_idx=video_idx,
+                                prompt=vc["prompt"],
+                            )
+                        )
+                    video_idx += 1
+                except Exception as e:
+                    logger.warning("Failed to split video chunks: %s", e)
+                    processed_chunks.append(data)  # type: ignore[arg-type]
+            else:
+                processed_chunks.append(data)  # type: ignore[arg-type]
+    return processed_chunks, vision_chunks_uuids
 
 
 def _resolve_items(
     items_by_modality: dict[str, list[tuple[object, str | None]]],
     mm_processor: BaseMultiModalProcessor,
-    vision_chunk_modality_order: dict[str, list[str]],
+    modality_order: dict[str, list[str]],
 ) -> tuple[MultiModalDataDict, MultiModalUUIDDict]:
     if "image" in items_by_modality and "image_embeds" in items_by_modality:
         raise ValueError("Mixing raw image and embedding inputs is not allowed")
@@ -654,71 +670,13 @@ def _resolve_items(
     if "vision_chunk" in items_by_modality:
         # Process vision_chunk items - extract from (data, modality) tuples
         # and convert to VisionChunk types with proper UUID handling
-        vision_chunk_items = items_by_modality["vision_chunk"]
-        modality_order = vision_chunk_modality_order.get("vision_chunk", [])
-        mm_uuids["vision_chunk"] = [
-            uuid for data, uuid in items_by_modality["vision_chunk"]
-        ]
-
-        # Filter out None items (from asyncio.sleep(0) placeholders)
-        filtered_items = [
-            (idx, item)
-            for idx, item in enumerate(vision_chunk_items)
-            if item is not None
-        ]
-
-        assert len(filtered_items) == len(modality_order), (
-            f"vision_chunk items ({len(filtered_items)}) and "
-            f"modality_order ({len(modality_order)}) must have same length"
+        processed_chunks, vision_chunk_uuids = _resolve_vision_chunk_items(
+            items_by_modality["vision_chunk"],
+            mm_processor,
+            modality_order.get("vision_chunk", []),
         )
-
-        processed_chunks: list[VisionChunk] = []
-        video_idx = 0
-        for i, (idx, item) in enumerate(filtered_items):
-            inner_modality = modality_order[i]
-            data, uuid = item
-            uuid_val = uuid if idx < len(mm_uuids["vision_chunk"]) else None
-            if inner_modality == "image":
-                # Cast data to proper type for image
-                # Use .media (PIL.Image) directly to avoid redundant
-                # bytes→PIL conversion in media_processor
-                if hasattr(data, "media"):
-                    image_data = data.media  # type: ignore[union-attr]
-                    processed_chunks.append(
-                        VisionChunkImage(type="image", image=image_data, uuid=uuid_val)
-                    )
-                else:
-                    processed_chunks.append(data)  # type: ignore[arg-type]
-            elif inner_modality == "video":
-                # For video, we may need to split into chunks
-                # if processor supports it
-                # For now, just wrap as a video chunk placeholder
-                if hasattr(mm_processor, "split_video_chunks") and data is not None:
-                    try:
-                        video_uuid = uuid_val or random_uuid()
-                        # video await result is (video_data, video_meta) tuple
-                        if isinstance(data, tuple) and len(data) >= 1:
-                            video_data = data[0]
-                        else:
-                            video_data = data
-                        video_chunks = mm_processor.split_video_chunks(video_data)
-                        for i, vc in enumerate(video_chunks):
-                            processed_chunks.append(
-                                VisionChunkVideo(
-                                    type="video_chunk",
-                                    video_chunk=vc["video_chunk"],
-                                    uuid=f"{video_uuid}-{i}",
-                                    video_idx=video_idx,
-                                    prompt=vc["prompt"],
-                                )
-                            )
-                        video_idx += 1
-                    except Exception as e:
-                        logger.warning("Failed to split video chunks: %s", e)
-                        processed_chunks.append(data)  # type: ignore[arg-type]
-                else:
-                    processed_chunks.append(data)  # type: ignore[arg-type]
         mm_data["vision_chunk"] = processed_chunks
+        mm_uuids["vision_chunk"] = vision_chunk_uuids
 
     return mm_data, mm_uuids
 
@@ -734,8 +692,10 @@ class MultiModalItemTracker(BaseMultiModalItemTracker[tuple[object, str | None]]
             dict(self._items_by_modality), self.mm_processor, self._modality_order
         )
 
-    def create_parser(self) -> "BaseMultiModalContentParser":
-        return MultiModalContentParser(self)
+    def create_parser(
+        self, mm_processor_kwargs: dict[str, Any] | None = None
+    ) -> "BaseMultiModalContentParser":
+        return MultiModalContentParser(self, mm_processor_kwargs=mm_processor_kwargs)
 
 
 class AsyncMultiModalItemTracker(
@@ -756,8 +716,12 @@ class AsyncMultiModalItemTracker(
             resolved_items_by_modality, self.mm_processor, self._modality_order
         )
 
-    def create_parser(self) -> "BaseMultiModalContentParser":
-        return AsyncMultiModalContentParser(self)
+    def create_parser(
+        self, mm_processor_kwargs: dict[str, Any] | None = None
+    ) -> "BaseMultiModalContentParser":
+        return AsyncMultiModalContentParser(
+            self, mm_processor_kwargs=mm_processor_kwargs
+        )
 
 
 class BaseMultiModalContentParser(ABC):
@@ -822,19 +786,23 @@ class BaseMultiModalContentParser(ABC):
 
 
 class MultiModalContentParser(BaseMultiModalContentParser):
-    def __init__(self, tracker: MultiModalItemTracker) -> None:
+    def __init__(
+        self,
+        tracker: MultiModalItemTracker,
+        mm_processor_kwargs: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__()
 
         self._tracker = tracker
-        multimodal_config = self._tracker.model_config.multimodal_config
-        media_io_kwargs = getattr(multimodal_config, "media_io_kwargs", None)
 
         self._connector: MediaConnector = MEDIA_CONNECTOR_REGISTRY.load(
             envs.VLLM_MEDIA_CONNECTOR,
-            media_io_kwargs=media_io_kwargs,
+            media_io_kwargs=tracker.media_io_kwargs,
             allowed_local_media_path=tracker.allowed_local_media_path,
             allowed_media_domains=tracker.allowed_media_domains,
         )
+
+        self._mm_processor_kwargs = mm_processor_kwargs
 
     @property
     def model_config(self) -> ModelConfig:
@@ -932,20 +900,33 @@ class MultiModalContentParser(BaseMultiModalContentParser):
         placeholder = self._tracker.add("video", (video, uuid))
         self._add_placeholder("video", placeholder)
 
+        # Extract audio from video if use_audio_in_video is True
+        if (
+            video_url
+            and self._mm_processor_kwargs
+            and self._mm_processor_kwargs.get("use_audio_in_video", False)
+        ):
+            audio = self._connector.fetch_audio(video_url) if video_url else None
+            audio_placeholder = self._tracker.add("audio", (audio, uuid))
+            self._add_placeholder("audio", audio_placeholder)
+
 
 class AsyncMultiModalContentParser(BaseMultiModalContentParser):
-    def __init__(self, tracker: AsyncMultiModalItemTracker) -> None:
+    def __init__(
+        self,
+        tracker: AsyncMultiModalItemTracker,
+        mm_processor_kwargs: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__()
 
         self._tracker = tracker
-        multimodal_config = self._tracker.model_config.multimodal_config
-        media_io_kwargs = getattr(multimodal_config, "media_io_kwargs", None)
         self._connector: MediaConnector = MEDIA_CONNECTOR_REGISTRY.load(
             envs.VLLM_MEDIA_CONNECTOR,
-            media_io_kwargs=media_io_kwargs,
+            media_io_kwargs=tracker.media_io_kwargs,
             allowed_local_media_path=tracker.allowed_local_media_path,
             allowed_media_domains=tracker.allowed_media_domains,
         )
+        self._mm_processor_kwargs: dict[str, Any] | None = mm_processor_kwargs
 
     @property
     def model_config(self) -> ModelConfig:
@@ -1080,6 +1061,23 @@ class AsyncMultiModalContentParser(BaseMultiModalContentParser):
 
         placeholder = self._tracker.add("video", coro)
         self._add_placeholder("video", placeholder)
+
+        # Extract audio from video if use_audio_in_video is True
+        if (
+            video_url
+            and self._mm_processor_kwargs
+            and self._mm_processor_kwargs.get("use_audio_in_video", False)
+        ):
+            audio_coro = self._audio_with_uuid_async(video_url, uuid)
+            audio_placeholder = self._tracker.add("audio", audio_coro)
+            self._add_placeholder("audio", audio_placeholder)
+
+
+@dataclass
+class ChatTemplateConfig:
+    chat_template: str | None = None
+    chat_template_content_format: ChatTemplateContentFormatOption = "auto"
+    trust_request_chat_template: bool = False
 
 
 def validate_chat_template(chat_template: Path | str | None):
@@ -1232,7 +1230,10 @@ def _get_full_multimodal_text_prompt(
 
     # NOTE: Default behaviour: we always add missing placeholders
     # at the front of the prompt, if interleave_strings=False
-    return "\n".join(missing_placeholders + [text_prompt])
+    if text_prompt:
+        return "\n".join(missing_placeholders + [text_prompt])
+    else:
+        return "\n".join(missing_placeholders)
 
 
 # No need to validate using Pydantic again
@@ -1381,10 +1382,11 @@ def _parse_chat_message_content_parts(
     *,
     wrap_dicts: bool,
     interleave_strings: bool,
+    mm_processor_kwargs: dict[str, Any] | None = None,
 ) -> list[ConversationMessage]:
     content = list[_ContentPart]()
 
-    mm_parser = mm_tracker.create_parser()
+    mm_parser = mm_tracker.create_parser(mm_processor_kwargs=mm_processor_kwargs)
 
     for part in parts:
         parse_res = _parse_chat_message_content_part(
@@ -1426,6 +1428,8 @@ def _parse_chat_message_content_part(
     with multimodal placeholders.
     """
     if isinstance(part, str):  # Handle plain text parts
+        if wrap_dicts:
+            return {"type": "text", "text": part}
         return part
     # Handle structured dictionary parts
     part_type, content = _parse_chat_message_content_mm_part(part)
@@ -1485,11 +1489,9 @@ def _parse_chat_message_content_part(
     else:
         raise NotImplementedError(f"Unknown part type: {part_type}")
 
-    return (
-        {"type": modality}
-        if wrap_dicts
-        else (MODALITY_PLACEHOLDERS_MAP[modality] if interleave_strings else None)
-    )
+    if wrap_dicts:
+        return {"type": modality}
+    return MODALITY_PLACEHOLDERS_MAP[modality] if interleave_strings else None
 
 
 # No need to validate using Pydantic again
@@ -1502,10 +1504,11 @@ def _parse_chat_message_content(
     mm_tracker: BaseMultiModalItemTracker,
     content_format: ChatTemplateContentFormat,
     interleave_strings: bool,
+    mm_processor_kwargs: dict[str, Any] | None = None,
 ) -> list[ConversationMessage]:
     role = message["role"]
     content = message.get("content")
-    reasoning = message.get("reasoning") or message.get("reasoning_content")
+    reasoning = message.get("reasoning")
 
     if content is None:
         content = []
@@ -1517,6 +1520,7 @@ def _parse_chat_message_content(
         mm_tracker,
         wrap_dicts=(content_format == "openai"),
         interleave_strings=interleave_strings,
+        mm_processor_kwargs=mm_processor_kwargs,
     )
 
     for result_msg in result:
@@ -1577,13 +1581,15 @@ def parse_chat_messages(
     messages: list[ChatCompletionMessageParam],
     model_config: ModelConfig,
     content_format: ChatTemplateContentFormat,
+    media_io_kwargs: dict[str, dict[str, Any]] | None = None,
+    mm_processor_kwargs: dict[str, Any] | None = None,
 ) -> tuple[
     list[ConversationMessage],
     MultiModalDataDict | None,
     MultiModalUUIDDict | None,
 ]:
     conversation: list[ConversationMessage] = []
-    mm_tracker = MultiModalItemTracker(model_config)
+    mm_tracker = MultiModalItemTracker(model_config, media_io_kwargs=media_io_kwargs)
 
     for msg in messages:
         sub_messages = _parse_chat_message_content(
@@ -1595,6 +1601,7 @@ def parse_chat_messages(
                 and model_config.multimodal_config is not None
                 and model_config.multimodal_config.interleave_mm_strings
             ),
+            mm_processor_kwargs=mm_processor_kwargs,
         )
 
         conversation.extend(sub_messages)
@@ -1610,13 +1617,17 @@ async def parse_chat_messages_async(
     messages: list[ChatCompletionMessageParam],
     model_config: ModelConfig,
     content_format: ChatTemplateContentFormat,
+    media_io_kwargs: dict[str, dict[str, Any]] | None = None,
+    mm_processor_kwargs: dict[str, Any] | None = None,
 ) -> tuple[
     list[ConversationMessage],
     MultiModalDataDict | None,
     MultiModalUUIDDict | None,
 ]:
     conversation: list[ConversationMessage] = []
-    mm_tracker = AsyncMultiModalItemTracker(model_config)
+    mm_tracker = AsyncMultiModalItemTracker(
+        model_config, media_io_kwargs=media_io_kwargs
+    )
 
     for msg in messages:
         sub_messages = _parse_chat_message_content(
@@ -1628,6 +1639,7 @@ async def parse_chat_messages_async(
                 and model_config.multimodal_config is not None
                 and model_config.multimodal_config.interleave_mm_strings
             ),
+            mm_processor_kwargs=mm_processor_kwargs,
         )
 
         conversation.extend(sub_messages)

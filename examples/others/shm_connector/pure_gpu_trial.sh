@@ -1,0 +1,220 @@
+#!/bin/bash
+##SBATCH --partition=bmtxg31
+#SBATCH --partition=rtx5070
+##SBATCH --partition=h100
+##SBATCH --cpus-per-task=60
+#SBATCH --job-name=vllm_rtx5070
+#SBATCH --output=slurm-rtx5070-runs-%j.out
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --time=00:59:00
+
+# echo "Warning: LMCache disaggregated prefill support for vLLM v1 is experimental and subject to change."
+
+set -x
+
+PIDS=()
+MODEL="Qwen/Qwen3-30B-A3B"
+INPUT_LEN=8192
+OUTPUT_LEN=2
+NUM_PROMPTS=2
+
+# Switch to the directory of the current script
+cd "$(dirname "${BASH_SOURCE[0]}")"
+
+check_hf_token() {
+    if [ -z "$HF_TOKEN" ]; then
+        echo "HF_TOKEN is not set. Please set it to your Hugging Face token."
+        exit 1
+    fi
+    if [[ "$HF_TOKEN" != hf_* ]]; then
+        echo "HF_TOKEN is not a valid Hugging Face token. Please set it to your Hugging Face token."
+        exit 1
+    fi
+    echo "HF_TOKEN is set and valid."
+}
+
+check_num_gpus() {
+    # can you check if the number of GPUs are >=2 via nvidia-smi/rocm-smi?
+    which rocm-smi > /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+	num_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
+    else
+	num_gpus=$(rocm-smi --showid | grep Instinct | wc -l)
+    fi
+
+    if [ "$num_gpus" -lt 2 ]; then
+        echo "You need at least 2 GPUs to run disaggregated prefill."
+        exit 1
+    else
+        echo "Found $num_gpus GPUs."
+    fi
+}
+
+ensure_python_library_installed() {
+    echo "Checking if $1 is installed..."
+    python3 -c "import $1" > /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        if [ "$1" == "nixl" ]; then
+            echo "$1 is not installed. Please refer to https://github.com/ai-dynamo/nixl for installation."
+        else
+            echo "$1 is not installed. Please install it via pip install $1."
+        fi
+        exit 1
+    else
+        echo "$1 is installed."
+    fi
+}
+
+cleanup() {
+    echo "Stopping everything…"
+    set -x
+    trap - INT TERM        # prevent re-entrancy
+    pgrep -af "vllm serve" -u $USER
+    pkill -f "vllm serve" -u $USER
+    sleep 10
+    pkill -9 -f "vllm serve" -u $USER
+    kill -9 -- ${PIDS[@]}
+    wait -- ${PIDS[@]}
+    echo "Cleaning up shared memory..."
+    find /dev/shm -maxdepth 1 -user $USER -type f -exec rm -f {} +
+    exit 0
+}
+
+wait_for_server() {
+  local port=$1
+  local pid=$2
+  local timeout_seconds=1200
+  local start_time=$(date +%s)
+
+  echo "Waiting for server on port $port..."
+
+  while true; do
+    if curl -s "localhost:${port}/healthcheck" > /dev/null; then
+      return 0
+    # Fallback to POST request to completions
+    elif curl -s -X POST "localhost:${port}/v1/completions" \
+        -H "Content-Type: application/json" \
+        -d '{"model": "test", "prompt": "test", "max_tokens": 1}' > /dev/null 2>&1; then
+      return 0
+    fi
+
+    local now=$(date +%s)
+    echo "Waiting for server on port $port..."
+    if (( now - start_time >= timeout_seconds )); then
+      echo "Timeout waiting for server on port $port"
+      return 1
+    fi
+
+    sleep 1
+
+    # Check if the process is still running
+    if ! kill -0 $pid 2>/dev/null; then
+        echo "Process with PID $pid and port $port has terminated unexpectedly."
+        cleanup
+    fi
+  done
+}
+
+GPU_ENV="vllm_0.18.0_cuda"
+# GPU_ENV="vllm_0.15.1_shm_xpu"
+
+
+main() {
+
+    cd /data/nfs_home/sundares/vllm/vllm/examples/others/shm_connector
+
+    source /data/nfs_home/sundares/miniforge3/etc/profile.d/conda.sh
+    # conda activate vllm_0.13.0_cpu_nonAvx
+    # conda activate vllm_0.13.0_shm_xpu
+    conda activate $GPU_ENV
+
+    set -x
+
+    # check_hf_token
+    # check_num_gpus
+    # ensure_python_library_installed lmcache
+    # ensure_python_library_installed nixl
+    # ensure_python_library_installed pandas
+    # ensure_python_library_installed datasets
+    # ensure_python_library_installed vllm
+
+    trap cleanup INT
+    trap cleanup USR1
+    trap cleanup TERM
+
+    export VLLM_LOGGING_LEVEL=DEBUG
+
+    # If VLLM_OFFLOAD_KV_CACHE_TO_CPU=1, then KV_BUFFER_DEVICE does not matter and it will be ignored.
+    # ONEAPI_DEVICE_SELECTOR="level_zero:0,4;opencl:0,4" \
+    $(which vllm) serve $MODEL --port 9000 --max-model-len 9000     --max-num-seqs 1     --max-num-batched-tokens 9000 --no-enable-prefix-caching --block-size 64 --num-gpu-blocks-override 150 --offload-group-size 1 --offload-num-in-group 1 --offload-prefetch-step 2 &
+    server_pid=$!
+    PIDS+=($server_pid)
+
+    wait_for_server 9000 $server_pid
+
+    # echo "All servers are up. Starting benchmark..."
+
+    # begin benchmark
+    # cd ../../../benchmarks/
+
+    # python -m debugpy --listen 0.0.0.0:5678 --wait-for-client \
+    $(which vllm) bench serve --port 9000 --seed $(date +%s) \
+        --model $MODEL \
+        --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN \
+        --num-prompts $NUM_PROMPTS --max-concurrency 1 \
+        2>&1 | tee benchmark.log
+
+    # curl -X POST http://localhost:9000/v1/completions -H "Content-Type: application/json" -d '{    "model": "'"$MODEL"'",    "prompt": "Write a detailed, vivid, and slightly humorous free-verse poem about the craft of software engineering and coding. Touch on long nights spent debugging, collaborating with teammates, wrestling with legacy code, and the relief when all the tests finally pass. Use clear imagery, a hopeful tone.", "max_tokens": 10,    "temperature": 0.7  }' |& tee -a benchmark.log
+
+    # curl -X POST http://localhost:9000/v1/completions -H "Content-Type: application/json" -d '{    "model": "'"$MODEL"'",    "prompt": "Write a rich, vivid, slightly humorous free-verse poem about the craft of software engineering and coding. Describe in detail long nights spent debugging elusive bugs, the glow of multiple monitors, half-finished mugs of cold coffee, and the quiet hum of machines in an almost empty office or home workspace. Show the emotional roller coaster of reading confusing legacy code, adding one more log line, watching stack traces scroll by, and wondering what the previous developer was thinking when they designed this system. Include scenes of collaboration: pair programming sessions, code review comments that are both kind and blunt, whiteboard diagrams that start neat and end as chaotic scribbles, and chat messages full of links to docs, tickets, and pull requests. Mention modern tools and rituals of the craft: version control, feature branches, continuous integration pipelines, flaky tests, deployment scripts, and dashboards that flip from red to green. Contrast the stress of production incidents, paging alerts, and frantic hotfixes with the quiet, satisfying moment when all tests finally pass, the pipeline is green, and the release is tagged.", "max_tokens": 100,    "temperature": 0.7  }' |& tee -a benchmark.log
+
+    # curl -X POST http://localhost:9000/v1/completions -H "Content-Type: application/json" -d '{    "model": "'"$MODEL"'",    "prompt": "Write a rich, vivid, slightly humorous free-verse poem about the craft of software engineering and coding. Describe in detail long nights spent debugging elusive bugs, the glow of multiple monitors, half-finished mugs of cold coffee, and the quiet hum of machines in an almost empty office or home workspace. Show the emotional roller coaster of reading confusing legacy code, adding one more log line, watching stack traces scroll by, and wondering what the previous developer was thinking when they designed this system. Include scenes of collaboration: pair programming sessions, code review comments that are both kind and blunt, whiteboard diagrams that start neat and end as chaotic scribbles, and chat messages full of links to docs, tickets, and pull requests. Mention modern tools and rituals of the craft: version control, feature branches, continuous integration pipelines, flaky tests, deployment scripts, and dashboards that flip from red to green. Contrast the stress of production incidents, paging alerts, and frantic hotfixes with the quiet, satisfying moment when all tests finally pass, the pipeline is green, and the release is tagged. Use concrete imagery that developers recognize, add gentle inside jokes about off by one errors and mysterious race conditions, and keep the overall tone hopeful and affirming. Celebrate the creativity, persistence, and teamwork that make software possible, and end on a note of cautious but genuine optimism about the next refactor, the next big feature, and the next late night that somehow feels worth it.", "max_tokens": 100,    "temperature": 0.7  }' |& tee -a benchmark.log
+
+    # To check the prefix caching effect
+    curl -X POST http://localhost:9000/v1/completions -H "Content-Type: application/json" -d '{    "model": "'"$MODEL"'",    "prompt": "Write a rich, vivid, slightly humorous free-verse poem about the craft of software engineering and coding. Describe in detail long nights spent debugging elusive bugs, the glow of multiple monitors, half-finished mugs of cold coffee, and the quiet hum of machines in an almost empty office or home workspace. Show the emotional roller coaster of reading confusing legacy code, adding one more log line, watching stack traces scroll by, and wondering what the previous developer was thinking when they designed this system. Include scenes of collaboration: pair programming sessions, code review comments that are both kind and blunt, whiteboard diagrams that start neat and end as chaotic scribbles, and chat messages full of links to docs, tickets, and pull requests. Mention modern tools and rituals of the craft: version control, feature branches, continuous integration pipelines, flaky tests, deployment scripts, and dashboards that flip from red to green. Contrast the stress of production incidents, paging alerts, and frantic hotfixes with the quiet, satisfying moment when all tests finally pass, the pipeline is green, and the release is tagged. Use concrete imagery that developers recognize, add gentle inside jokes about off by one errors and mysterious race conditions, and keep the overall tone hopeful and affirming. Celebrate the creativity, persistence, and teamwork that make software possible, and end on a note of cautious but genuine optimism about the next refactor, the next big feature, and the next late night that somehow feels worth it.", "max_tokens": 100,    "temperature": 0.7  }' |& tee -a benchmark.log
+
+    # while true; do
+    #     # python -m debugpy --listen 0.0.0.0:5678 --wait-for-client \
+    #     $(which vllm) bench serve --port 9000 --seed $(date +%s) \
+    #         --model $MODEL \
+    #         --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN \
+    #         --num-prompts $NUM_PROMPTS \
+    #         2>&1 | tee benchmark.log
+    # done
+
+    # vllm bench serve --port 9000 --seed $(date +%s) \
+    #     --model $MODEL \
+    #     --dataset-name random --random-input-len 20 --random-output-len 10 \
+    #     --num-prompts 2 --burstiness 1 --request-rate 3.6 | tee benchmark.log
+
+    # vllm bench latency --port 9000 \
+    #     --model $MODEL \
+
+    # echo "Benchmarking done. Cleaning up..."
+
+    # cleanup
+
+    echo "==================================================="
+    echo "All servers are up. You can send request now..."
+    echo "Press Ctrl-C to terminate all instances."
+
+    # Keep the script running until interrupted
+    echo "Script is running. Waiting for termination signal..."
+    echo "==================================================="
+
+    # vllm bench serve --port 9000 --seed $(date +%s) \
+    #     --model $MODEL \
+    #     --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN \
+    #     --num-prompts $NUM_PROMPTS \
+    #     2>&1 | tee benchmark.log
+
+    # while true; do
+    #     sleep 1
+    # done
+
+    cleanup
+
+}
+
+main

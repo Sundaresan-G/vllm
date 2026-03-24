@@ -1,20 +1,23 @@
 #!/bin/bash
-#SBATCH --partition=bmtxg31
-#SBATCH --job-name=vllm_g31
-#SBATCH --output=slurm-g31-runs-%j.out
+##SBATCH --partition=bmtxg31
+##SBATCH --partition=rtx5070
+#SBATCH --partition=h100
+##SBATCH --cpus-per-task=60
+#SBATCH --job-name=vllm_h100
+#SBATCH --output=slurm-h100-runs-%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --time=08:00:00
+#SBATCH --time=00:59:00
 
 # echo "Warning: LMCache disaggregated prefill support for vLLM v1 is experimental and subject to change."
 
 set -x
 
 PIDS=()
-MODEL="Qwen/Qwen3-30B-A3B"
+MODEL="Qwen/Qwen2.5-1.5B-Instruct"
 INPUT_LEN=8192
 OUTPUT_LEN=8
-NUM_PROMPTS=1
+NUM_PROMPTS=5
 
 # Switch to the directory of the current script
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -113,8 +116,7 @@ wait_for_server() {
   done
 }
 
-# GPU_ENV="vllm_0.15.1_shm_cuda"
-GPU_ENV="vllm_0.15.1_shm_xpu"
+GPU_ENV="vllm_0.18.0_cuda"
 
 
 main() {
@@ -143,7 +145,7 @@ main() {
 
     # If VLLM_OFFLOAD_KV_CACHE_TO_CPU=1, then KV_BUFFER_DEVICE does not matter and it will be ignored.
     # ONEAPI_DEVICE_SELECTOR="level_zero:0,4;opencl:0,4" \
-    VLLM_TP=4 \
+    VLLM_TP=1 \
     VLLM_LOGGING_PREFIX="PREFILLER " \
     bash prefiller_decoder_vllm_launcher.sh prefiller $MODEL \
         > >(tee prefiller.log) 2>&1 &
@@ -151,22 +153,21 @@ main() {
     PIDS+=($prefiller_pid)
 
     # conda activate vllm_0.13.0_cpu_nonAvx
-    conda activate vllm_0.15.1_shm_cpu
+    conda activate vllm_0.18.0_cpu
 
-    VLLM_TP=2 \
+    VLLM_TP=1 \
     VLLM_LOGGING_PREFIX="DECODER " \
     bash prefiller_decoder_vllm_launcher.sh decoder $MODEL \
         > >(tee decoder.log)  2>&1 &
     decoder_pid=$!
     PIDS+=($decoder_pid)
 
-    # conda activate vllm_0.13.0_shm_xpu
     conda activate $GPU_ENV
 
     # Use proxy_server.py or toy_proxy_server.py
     # python -m debugpy --listen 0.0.0.0:5678 --wait-for-client \
     python toy_proxy_server.py \
-        --host localhost \
+        --host 0.0.0.0 \
         --port 9000 \
         --prefiller-host localhost \
         --prefiller-port 8100 \
