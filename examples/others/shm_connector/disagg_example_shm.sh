@@ -1,5 +1,6 @@
 #!/bin/bash
-##SBATCH --partition=b50
+##SBATCH --partition=b70
+##SBATCH -w pcl-zen4
 #SBATCH --partition=bmtxg31
 ##SBATCH --partition=rtx5070
 ##SBATCH --partition=h100
@@ -17,10 +18,11 @@ set -x
 PIDS=()
 # MODEL="Qwen/Qwen2.5-1.5B-Instruct"
 # MODEL="Qwen/Qwen2.5-72B"
-MODEL="Qwen/Qwen3-30B-A3B"
+# MODEL="Qwen/Qwen3-30B-A3B"
+MODEL="sarvamai/sarvam-30b"
 INPUT_LEN=8192
 OUTPUT_LEN=8
-NUM_PROMPTS=5
+NUM_PROMPTS=2
 
 # Switch to the directory of the current script
 cd "$(dirname "${BASH_SOURCE[0]}")"

@@ -1,12 +1,12 @@
 #!/bin/bash
-##SBATCH --partition=b580
-##SBATCH -w pcl-zen4
-#SBATCH --partition=bmtxg31
+#SBATCH --partition=b70
+#SBATCH -w pcl-zen4
+##SBATCH --partition=bmtxg31
 ##SBATCH --partition=rtx5070
 ##SBATCH --partition=h100
 ##SBATCH --cpus-per-task=60
-#SBATCH --job-name=vllm_g31
-#SBATCH --output=slurm-g31-runs-%j.out
+#SBATCH --job-name=vllm_b70
+#SBATCH --output=slurm-b70-runs-%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time=01:59:00
@@ -16,8 +16,8 @@
 set -x
 
 PIDS=()
-MODEL="Qwen/Qwen3-30B-A3B"
-INPUT_LEN=8192
+MODEL="Qwen/Qwen2.5-1.5B-Instruct"
+INPUT_LEN=2048
 OUTPUT_LEN=1
 NUM_PROMPTS=2
 
@@ -119,7 +119,7 @@ wait_for_server() {
 }
 
 # GPU_ENV="vllm_0.18.0_cuda"
-GPU_ENV="vllm_0.18.0_xpu"
+GPU_ENV="vllm_0.18.0_xpu_uv"
 
 
 main() {
@@ -156,7 +156,8 @@ main() {
     EnableSharedSystemUsmSupport=1 \
     VLLM_KV_CACHE_LAYOUT="NHD" \
     VLLM_OFFLOAD_KV_CACHE_TO_CPU=1 \
-    $(which vllm) serve $MODEL --port 9000 --max-model-len 9000  --enforce-eager --max-num-seqs 1     --max-num-batched-tokens 9000 --no-enable-prefix-caching --block-size 64 --num-gpu-blocks-override 150 --offload-group-size 1 --offload-num-in-group 1 --offload-prefetch-step 2 --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile", "torch_profiler_record_shapes": 1, "torch_profiler_with_flops": 1, "torch_profiler_with_stack": 1, "torch_profiler_with_memory": 1}' &
+    $(which vllm) serve $MODEL --port 9000 --max-model-len 9000  --enforce-eager --max-num-seqs 1     --max-num-batched-tokens 9000 --no-enable-prefix-caching --block-size 64 --num-gpu-blocks-override 150 \
+    --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile", "torch_profiler_record_shapes": 1, "torch_profiler_with_flops": 1, "torch_profiler_with_stack": 1, "torch_profiler_with_memory": 1}' &
     server_pid=$!
     PIDS+=($server_pid)
 
@@ -171,7 +172,7 @@ main() {
     $(which vllm) bench serve --port 9000 --seed $(date +%s) \
         --model $MODEL \
         --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN \
-        --num-prompts $NUM_PROMPTS --max-concurrency 1 --profile \
+        --num-prompts $NUM_PROMPTS --max-concurrency 1 \
         2>&1 | tee benchmark.log
 
     # curl -X POST http://localhost:9000/v1/completions -H "Content-Type: application/json" -d '{    "model": "'"$MODEL"'",    "prompt": "Write a detailed, vivid, and slightly humorous free-verse poem about the craft of software engineering and coding. Touch on long nights spent debugging, collaborating with teammates, wrestling with legacy code, and the relief when all the tests finally pass. Use clear imagery, a hopeful tone.", "max_tokens": 10,    "temperature": 0.7  }' |& tee -a benchmark.log

@@ -667,7 +667,11 @@ def make_layers(
 
         # Modify the forward function to use the pre-allocated tensor
         for module in modules[start_layer:end_layer]:
-            attn_module = module.self_attn.attn
+            if hasattr(module, 'self_attn'):
+                attn_module = module.self_attn.attn
+            # For sarvam AI models, the attention module is named 'attention' instead of 'self_attn'
+            elif hasattr(module, 'attention'):
+                attn_module = module.attention.attn
             original_forward = attn_module.forward
 
             def make_forward(module, original_forward):
