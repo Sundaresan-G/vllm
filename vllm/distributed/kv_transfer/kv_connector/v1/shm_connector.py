@@ -840,6 +840,11 @@ class ShmConnectorWorker:
             # Pin the memory
             if self.device_type == "cuda":
                 torch.cuda.cudart().cudaHostRegister(cache_or_caches.data_ptr(), original_cache_size, 0)
+            elif self.device_type == "xpu":
+                from vllm.distributed.kv_transfer.kv_connector.v1 import shm_connector_utils
+
+                xpu_pin_memory_ext = shm_connector_utils.load_xpu_pin_memory_extension()
+                xpu_pin_memory_ext.pin_existing(cache_or_caches.data_ptr(), original_cache_size, torch.xpu.current_stream().sycl_queue)
 
             # cache_or_caches[0, 0, 0, 0, :4] = torch.tensor([1, 2, 3, 4], dtype=cache_or_caches.dtype)
 

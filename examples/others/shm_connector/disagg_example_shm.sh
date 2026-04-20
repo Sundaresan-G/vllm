@@ -1,12 +1,12 @@
 #!/bin/bash
 ##SBATCH --partition=b70
 ##SBATCH -w pcl-zen4
-#SBATCH --partition=bmtxg31
-##SBATCH --partition=rtx5070
+##SBATCH --partition=bmtxg31
+#SBATCH --partition=rtx5070
 ##SBATCH --partition=h100
 ##SBATCH --cpus-per-task=60
-#SBATCH --job-name=vllm_g31
-#SBATCH --output=slurm-g31-runs-%j.out
+#SBATCH --job-name=vllm_b70
+#SBATCH --output=slurm-b70-runs-%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time=02:59:00
@@ -17,10 +17,10 @@ set -x
 
 PIDS=()
 # MODEL="Qwen/Qwen2.5-1.5B-Instruct"
-# MODEL="Qwen/Qwen2.5-72B"
+MODEL="Qwen/Qwen2.5-7B"
 # MODEL="Qwen/Qwen3-30B-A3B"
-MODEL="sarvamai/sarvam-30b"
-INPUT_LEN=8192
+# MODEL="sarvamai/sarvam-30b"
+INPUT_LEN=2048
 OUTPUT_LEN=8
 NUM_PROMPTS=2
 
@@ -121,7 +121,7 @@ wait_for_server() {
   done
 }
 
-GPU_ENV="vllm_0.18.0_xpu"
+GPU_ENV="vllm_0.18.0_xpu_uv"
 
 
 main() {
