@@ -62,7 +62,7 @@ conda activate vllm_0.18.0_xpu
 # pip install -y triton-xpu==3.6.0 --extra-index-url https://download.pytorch.org/whl/xpu
 # rm -rf .deps dist *.egg-info
 # git ls-files --others --exclude='.vscode' --exclude='example*' --exclude="build*" --exclude=".deps" | xargs rm
-VLLM_VERSION_OVERRIDE="0.18.0" VLLM_TARGET_DEVICE=xpu pip install -e . --no-build-isolation -v --extra-index-url=https://download.pytorch.org/whl/xpu --config-settings editable_mode=strict
+VLLM_TARGET_DEVICE=xpu pip install -e . --no-build-isolation -v --extra-index-url=https://download.pytorch.org/whl/xpu --config-settings editable_mode=strict
 set +xe
 ' | bash 2>&1 | tee build_xpu_0.18.0_$(date +%Y%m%d_%H%M%S).log
 ```

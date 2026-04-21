@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import os
 from collections.abc import Generator
+from typing import TYPE_CHECKING, cast
 
 import gguf
 import regex as re
@@ -26,6 +27,9 @@ from vllm.model_executor.model_loader.weight_utils import (
 )
 from vllm.transformers_utils.gguf_utils import detect_gguf_multimodal
 from vllm.utils.torch_utils import set_default_torch_dtype
+
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.quantization.gguf import GGUFConfig
 
 logger = init_logger(__name__)
 
@@ -205,12 +209,24 @@ class GGUFModelLoader(BaseModelLoader):
                 GGUF tensor name with suffix (e.g., 'mm.soft_emb_norm.weight')
                 or None if no mapping found
             """
+            # In transformers v5, multimodal models (e.g. Gemma3) wrap
+            # all sub-models under an outer 'model.' attribute, producing
+            # state_dict keys like 'model.language_model.layers.0...' and
+            # 'model.vision_tower.vision_model...'.  Strip this outer
+            # prefix so the keys match what gguf-py expects.
+            if is_multimodal and hf_name.startswith("model."):
+                hf_name = hf_name[6:]  # Remove outer 'model.'
+
             # Strip 'language_model.' prefix for multimodal models - gguf-py
             # tensor mappings expect parameter names without this prefix.
             # Note: 'model.' prefix should be KEPT for text-only models as
             # gguf-py expects it.
             if hf_name.startswith("language_model."):
                 hf_name = hf_name[15:]  # Remove 'language_model.'
+                # Re-add 'model.' prefix because gguf-py text tensor maps
+                # expect 'model.layers...' format.
+                if is_multimodal:
+                    hf_name = "model." + hf_name
 
             # Parse parameter name and suffix
             if hf_name.endswith((".weight", ".bias")):
@@ -350,10 +366,9 @@ class GGUFModelLoader(BaseModelLoader):
             for name, weight_type in weight_type_map.items()
             if weight_type in ("F32", "F16", "BF16") and name.endswith(".weight")
         ]
-        logger.debug(
-            "GGUF unquantized modules: %s",
-            unquant_names,
-        )
+        logger.debug("GGUF unquantized modules: %s", unquant_names)
+        if TYPE_CHECKING:
+            vllm_config.quant_config = cast(GGUFConfig, vllm_config.quant_config)
         vllm_config.quant_config.unquantized_modules.extend(unquant_names)
 
         target_device = torch.device(device_config.device)

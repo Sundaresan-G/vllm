@@ -235,8 +235,15 @@ class AutoWeightsLoader:
     ):
         """
         Add tensor names that are not in the model params that may be in the
-        safetensors, e.g., batch normalization stats.
+        safetensors, e.g., batch normalization stats and registered buffers.
         """
+        # Add persistent registered buffers.
+        # Non-persistent buffers are excluded, matching PyTorch state_dict().
+        non_persistent = getattr(module, "_non_persistent_buffers_set", set())
+        for buf_name, buf in module.named_buffers(recurse=False):
+            if buf_name not in child_params and buf_name not in non_persistent:
+                child_params[buf_name] = buf
+
         if isinstance(
             module,
             (
@@ -686,12 +693,12 @@ def make_layers(
                     nonlocal kv_tensor
 
                     if forward_context.attn_metadata is not None:
-                        original_kv_cache = forward_context.no_compile_layers[module.layer_name].kv_cache[forward_context.virtual_engine]
+                        original_kv_cache = forward_context.no_compile_layers[module.layer_name].kv_cache
                         if kv_tensor is None:
                             kv_tensor = torch.zeros_like(original_kv_cache, device=device)
                         # assert kv_tensors[kv_tensor_idx].numel() >= original_kv_cache.numel(), \
                         #     f"Preallocated kv tensor size {kv_tensors[kv_tensor_idx].numel()} is less than required size {original_kv_cache.numel()}"
-                        forward_context.no_compile_layers[module.layer_name].kv_cache[forward_context.virtual_engine] = kv_tensor
+                        forward_context.no_compile_layers[module.layer_name].kv_cache = kv_tensor
 
                         # Add addl. attribute
                         forward_context._curr_layer_offloaded_kv_tensor = original_kv_cache
@@ -708,7 +715,7 @@ def make_layers(
 
                     # Restore original kv_cache and metadata
                     if forward_context.attn_metadata is not None:
-                        forward_context.no_compile_layers[module.layer_name].kv_cache[forward_context.virtual_engine] = original_kv_cache
+                        forward_context.no_compile_layers[module.layer_name].kv_cache = original_kv_cache
 
                     return output
                 
