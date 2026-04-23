@@ -121,7 +121,7 @@ wait_for_server() {
   done
 }
 
-GPU_ENV="vllm_0.18.0_xpu_uv"
+GPU_ENV="vllm_0.18.0_xpu"
 
 
 main() {
