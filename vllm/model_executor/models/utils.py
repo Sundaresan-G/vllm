@@ -668,7 +668,7 @@ def make_layers(
 
     if offload_kv_cache_to_cpu and device.type != "cpu": 
 
-        kv_tensor = None
+        kv_tensor : torch.Tensor | None = None
 
         from vllm.forward_context import ForwardContext, get_forward_context
 
@@ -702,6 +702,55 @@ def make_layers(
 
                         # Add addl. attribute
                         forward_context._curr_layer_offloaded_kv_tensor = original_kv_cache
+                        
+                        # Compute offload blocks on first layer of this PP rank
+                        layer_idx = extract_layer_index(module.layer_name)
+                        
+                        if layer_idx == start_layer:
+                            # Compute which blocks need to be copied from CPU to GPU
+                            attn_metadata = forward_context.attn_metadata.get(module.layer_name)
+                            block_table = attn_metadata.block_table
+                            slot_mapping = forward_context.slot_mapping.get(module.layer_name)
+                            
+                            if slot_mapping is not None:
+                                block_size = kv_tensor.shape[2]
+
+                                flat_block_table = block_table.flatten()
+                                nonzero_block_table = flat_block_table[flat_block_table > 0]
+
+                                nonzero_block_table_2_slot_indices = torch.mul(nonzero_block_table, block_size)
+
+                                offload_mask = torch.isin(nonzero_block_table_2_slot_indices,
+                                                        slot_mapping,
+                                                        invert=True)
+                                offload_blocks = nonzero_block_table[offload_mask]
+                                forward_context._curr_offloaded_kv_cache_blocks = offload_blocks
+
+                            # logger.info(f"slot_mapping for layer {module.layer_name}: {slot_mapping}")
+                            # logger.info(f"block_table for layer {module.layer_name}: {attn_metadata.block_table}")
+                            # logger.info(f"offloaded blocks for layer {module.layer_name}: {forward_context._curr_offloaded_kv_cache_blocks}")
+
+                        key_cache, value_cache = kv_tensor.unbind(0)
+                        key_cache_cpu, value_cache_cpu = original_kv_cache.unbind(0)
+                        
+                        torch.ops._C_cache_ops.copy_cache_flash(key_cache_cpu, value_cache_cpu, key_cache, value_cache, forward_context._curr_offloaded_kv_cache_blocks)
+
+                        # from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+
+                        # # kv_cache_cpu_gpu_view = get_accelerator_view_from_cpu_tensor(original_kv_cache)
+                        # # kv_tensor.index_copy_(1, forward_context._curr_offloaded_kv_cache_blocks, kv_cache_cpu_gpu_view[:,forward_context._curr_offloaded_kv_cache_blocks])
+
+                        # key_cache, value_cache = kv_tensor.unbind(0)
+                        # key_cache_cpu, value_cache_cpu = original_kv_cache.unbind(0)
+
+                        # key_cache_cpu_gpu_view = get_accelerator_view_from_cpu_tensor(key_cache_cpu)
+                        # value_cache_cpu_gpu_view = get_accelerator_view_from_cpu_tensor(value_cache_cpu)
+
+                        # # for block_idx in forward_context._curr_offloaded_kv_cache_blocks:
+                        # #     key_cache[block_idx].copy_(key_cache_cpu[block_idx], non_blocking=True)
+                        # #     value_cache[block_idx].copy_(value_cache_cpu[block_idx], non_blocking=True)
+                        # key_cache.index_copy_(0, forward_context._curr_offloaded_kv_cache_blocks, key_cache_cpu_gpu_view[forward_context._curr_offloaded_kv_cache_blocks])
+                        # value_cache.index_copy_(0, forward_context._curr_offloaded_kv_cache_blocks, value_cache_cpu_gpu_view[forward_context._curr_offloaded_kv_cache_blocks])
  
                     output = functional_call(module,
                                             module.state_dict(),
