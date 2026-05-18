@@ -121,12 +121,12 @@ $(which vllm) serve $MODEL --port 9000 --max-model-len 9000     --max-num-seqs 1
 
 ### Intel GPU Server side
 ```bash
-export MODEL="Qwen/Qwen2.5-1.5B"
+export MODEL="Qwen/Qwen2.5-7B"
 export VLLM_LOGGING_LEVEL=DEBUG 
 # Optional
 export VLLM_KV_CACHE_LAYOUT="NHD"
 # Has effect for GPU only. For offloading KV cache to CPU
-export VLLM_OFFLOAD_KV_CACHE_TO_CPU=0 
+export VLLM_OFFLOAD_KV_CACHE_TO_CPU=1 
 # TORCH_COMPILE_DISABLE=1
 # Remove profiler config if profiling not required
 $(which vllm) serve $MODEL --port 9000 --max-model-len 9000     --max-num-seqs 10     --max-num-batched-tokens 70000 --enforce-eager --no-enable-prefix-caching --block-size 64 --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile", "torch_profiler_record_shapes": 1, "torch_profiler_with_flops": 1, "torch_profiler_with_stack": 1, "torch_profiler_with_memory": 1}'
@@ -134,6 +134,11 @@ $(which vllm) serve $MODEL --port 9000 --max-model-len 9000     --max-num-seqs 1
 
 ### CPU Server side
 ```bash
+# Update the below paths accordingly
+TC_PATH="/data/nfs_home/sundares/miniforge3/envs/vllm_0.18.0_cpu/lib/libtcmalloc_minimal.so"
+IOMP_PATH="/swtools/intel/2025.3/lib/libiomp5.so"
+
+export LD_PRELOAD="$TC_PATH:$IOMP_PATH:$LD_PRELOAD"
 export MODEL="Qwen/Qwen3-30B-A3B"
 export VLLM_LOGGING_LEVEL=DEBUG 
 # Optional
@@ -150,10 +155,10 @@ $(which vllm) serve $MODEL --port 9000 --max-model-len 9000     --max-num-seqs 1
 ## Evaluation Scripts - Client side:
 ### For Performance measurement
 ```bash
-export MODEL="Qwen/Qwen2.5-1.5B"
+export MODEL="Qwen/Qwen2.5-1.5B-Instruct"
 export INPUT_LEN=8192
 export OUTPUT_LEN=8
-export NUM_PROMPTS=2
+export NUM_PROMPTS=5
 export VLLM_LOGGING_LEVEL=DEBUG 
 # Remove profile at the end if not needed
 $(which vllm) bench serve --port 9000 --seed $(date +%s)         --model $MODEL         --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN         --num-prompts $NUM_PROMPTS --max-concurrency 1 --ignore-eos --profile

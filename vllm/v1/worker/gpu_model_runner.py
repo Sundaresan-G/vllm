@@ -2348,6 +2348,49 @@ class GPUModelRunner(
                 spec_decode_common_attn_metadata.unpadded(num_tokens, num_reqs)
             )
 
+        if envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU and num_computed_tokens_cpu is not None and num_computed_tokens_cpu.numel() > 0:
+
+            block_indices_to_fetch_cpu_set = set()
+
+            block_table_cpu: np.ndarray = self.input_batch.block_table[0].get_numpy_array()[:num_reqs_padded]
+            block_table_cpu[num_reqs:num_reqs_padded].fill(-1)
+
+            block_size = self.cache_config.block_size
+
+            for req_idx in range(num_reqs_padded):
+                computed_tokens = num_computed_tokens_cpu[req_idx].item()
+                computed_blocks = (computed_tokens + block_size - 1) // block_size
+                block_table_req = block_table_cpu[req_idx]
+
+                block_indices_to_fetch_cpu_set.update(block_table_req[:computed_blocks].tolist())
+
+            block_indices_to_fetch_cpu_tensor = torch.tensor(
+                list(block_indices_to_fetch_cpu_set),
+                device="cpu",
+                pin_memory=True,
+            )
+
+            block_indices_to_fetch_gpu_tensor = block_indices_to_fetch_cpu_tensor.to(
+                device=self.device,
+                non_blocking=True,
+            )
+
+
+            # cu_num_computed_tokens_gpu = torch.zeros(num_reqs_padded, dtype=torch.int32, device=self.device)
+            # cu_num_computed_tokens_cpu = torch.zeros(num_reqs_padded, dtype=torch.int32, device="cpu", pin_memory=True)
+            # if isinstance(num_computed_tokens_cpu, torch.Tensor):
+            #     torch.cumsum(num_computed_tokens_cpu, dim=0, out=cu_num_computed_tokens_cpu)
+            #     cu_num_computed_tokens_gpu.copy_(cu_num_computed_tokens_cpu, non_blocking=True)
+            if isinstance(attn_metadata, list):
+                # ubatch case: list of per-ubatch dicts
+                for ub_dict in attn_metadata:
+                    for meta in ub_dict.values():
+                        meta.block_indices_to_fetch_gpu_tensor = block_indices_to_fetch_gpu_tensor
+            else:
+                # normal case: isinstance(attn_metadata, dict) single dict keyed by layer name
+                for meta in attn_metadata.values():
+                    meta.block_indices_to_fetch_gpu_tensor = block_indices_to_fetch_gpu_tensor
+
         return attn_metadata, spec_decode_common_attn_metadata
 
     def _compute_cascade_attn_prefix_lens(
@@ -6734,6 +6777,19 @@ class GPUModelRunner(
             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
+        # Find the kv_cache requiring the largest size among the layers and allocate a tensor on device
+        if envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU and self.device.type != "cpu":
+            max_size = 0
+            for kv_cache in kv_caches.values():
+                if kv_cache.numel() * kv_cache.element_size() > max_size:
+                    max_size = kv_cache.numel() * kv_cache.element_size()
+            
+            kv_cache_device: torch.Tensor = torch.empty(max_size, dtype=torch.int8, device=self.device)
+
+            # Bind it to forward_context
+            for layer_name in kv_caches.keys():
+                self.compilation_config.static_forward_context[layer_name].kv_cache_device_scratch = kv_cache_device
+        
         num_attn_module = (
             2 if self.model_config.hf_config.model_type == "longcat_flash" else 1
         )

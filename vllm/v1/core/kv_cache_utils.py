@@ -661,6 +661,7 @@ def max_memory_usage_bytes(
     """
     result = [spec.max_memory_usage_bytes(vllm_config) for spec in kv_cache_specs]
     if envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU and vllm_config.device_config.device_type != "cpu":
+        logger.info("Offloading KV cache to CPU. Allocating kv cache memory for the largest layer only.")
         return max(result) * 1 # Multiply it by 2 in case of double buffering of KV cache
     return sum(result)
 

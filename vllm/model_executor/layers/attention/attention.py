@@ -429,6 +429,23 @@ class Attention(nn.Module, AttentionLayerBase):
             if self.impl.supports_quant_query_input:
                 query, _ = self.query_quant(query, self._q_scale)
 
+        # Set forward context kv_cache to the device scratch
+        if envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU:
+            forward_context = get_forward_context()
+            if hasattr(forward_context.no_compile_layers[self.layer_name], "kv_cache_device_scratch"):
+                kv_cache_device_scratch_raw = forward_context.no_compile_layers[self.layer_name].kv_cache_device_scratch
+                kv_cache_forward_context = forward_context.no_compile_layers[self.layer_name].kv_cache
+
+                kv_cache_device_scratch = kv_cache_device_scratch_raw.view(kv_cache_forward_context.dtype).as_strided(
+                    kv_cache_forward_context.shape,
+                    kv_cache_forward_context.stride(),
+                    storage_offset=0
+                )
+
+                
+                forward_context.no_compile_layers[self.layer_name].curr_layer_kv_cache_cpu = kv_cache_forward_context
+                forward_context.no_compile_layers[self.layer_name].kv_cache = kv_cache_device_scratch
+
         if self.use_output:
             if output_shape is None:
                 # Handle both 2D [num_tokens, hidden] and
@@ -487,17 +504,28 @@ class Attention(nn.Module, AttentionLayerBase):
                     self.layer_name,
                     kv_cache_dummy_dep=kv_cache_dummy_dep,
                 )
-            return output.view(-1, hidden_size)
+            result = output.view(-1, hidden_size)
         else:
             assert self.attn_backend.forward_includes_kv_cache_update, (
                 "Split KV cache update not supported when output tensor not provided."
             )
             if self.use_direct_call:
-                return unified_attention(query, key, value, self.layer_name)
+                result = unified_attention(query, key, value, self.layer_name)
             else:
-                return torch.ops.vllm.unified_attention(
+                result = torch.ops.vllm.unified_attention(
                     query, key, value, self.layer_name
                 )
+        
+        # Restore the original CPU KV cache after attention forward
+        if envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU:
+            forward_context = get_forward_context()
+            if hasattr(forward_context.no_compile_layers[self.layer_name], "curr_layer_kv_cache_cpu"):
+                forward_context.no_compile_layers[self.layer_name].kv_cache = forward_context.no_compile_layers[self.layer_name].curr_layer_kv_cache_cpu
+
+                delattr(forward_context.no_compile_layers[self.layer_name], "curr_layer_kv_cache_cpu")
+
+
+        return result
 
     def calc_kv_scales(self, query, key, value):
         self._q_scale.copy_(torch.abs(query).max() / self.q_range)
@@ -668,7 +696,7 @@ def unified_kv_cache_update(
     Returns a dummy that is passed to unified_attention to signal a side effect and
     the data dependency between them to ensure torch.compile preserves ordering.
     """
-    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
+    attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
     if layer_slot_mapping is not None:
         assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
             f"{attn_layer.impl.__class__.__name__} does not support kv cache update"
@@ -680,6 +708,53 @@ def unified_kv_cache_update(
             kv_cache,
             layer_slot_mapping,
         )
+
+        if envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU:
+            forward_context = get_forward_context()
+            if hasattr(forward_context.no_compile_layers[layer_name], "curr_layer_kv_cache_cpu"):
+                kv_cache_cpu = forward_context.no_compile_layers[layer_name].curr_layer_kv_cache_cpu
+
+                # Write to the kv cache on cpu too
+                attn_layer.impl.do_kv_cache_update(
+                    attn_layer,
+                    key,
+                    value,
+                    kv_cache_cpu,
+                    layer_slot_mapping,
+                )
+
+                # Now copy from device scratch to CPU kv cache in the case of prefix caching
+                if attn_metadata is not None and hasattr(attn_metadata, "block_indices_to_fetch_gpu_tensor") and attn_metadata.block_indices_to_fetch_gpu_tensor.numel() > 0:
+                    # block_size = kv_cache.shape[2]
+                    # layer_block_table = attn_metadata.block_table
+                    
+                    # flat_block_table = layer_block_table.flatten()
+                    # nonzero_block_table = flat_block_table[flat_block_table > 0]
+
+                    # slot_indices_2_block_indices = layer_slot_mapping[layer_slot_mapping % block_size == 0] 
+                    # slot_indices_2_block_indices = slot_indices_2_block_indices // block_size
+
+                    # # nonzero_block_table_2_slot_indices = torch.mul(nonzero_block_table, block_size)
+
+                    # mask = torch.isin(nonzero_block_table,
+                    #                 slot_indices_2_block_indices,
+                    #                 invert=True)
+                    # blocks_to_fetch = nonzero_block_table[mask]
+                    # blocks_to_fetch = torch.ops._C_cache_ops.filter_blocks_to_fetch(layer_block_table, layer_slot_mapping, block_size)
+
+                    key_cache_cpu, value_cache_cpu = kv_cache_cpu.unbind(0)
+                    key_cache_device, value_cache_device = kv_cache.unbind(0)
+
+                    # logger.info(f"layer_block_table.shape: {layer_block_table.shape}, block_size: {block_size}, attn_metadata.cu_num_computed_tokens_gpu.shape: {attn_metadata.cu_num_computed_tokens_gpu.shape}, attn_metadata.total_num_computed_tokens: {attn_metadata.total_num_computed_tokens}")
+                    
+                    # torch.ops._C_cache_ops.copy_cache_flash(key_cache_cpu, value_cache_cpu, key_cache_device, value_cache_device, layer_block_table, attn_metadata.cu_num_computed_tokens_gpu, attn_metadata.total_num_computed_tokens)
+
+                    torch.ops._C_cache_ops.copy_cache_flash(
+                        key_cache_cpu,
+                        value_cache_cpu,
+                        key_cache_device,
+                        value_cache_device,
+                        attn_metadata.block_indices_to_fetch_gpu_tensor)
 
     return torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
 
