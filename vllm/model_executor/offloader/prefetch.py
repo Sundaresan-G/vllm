@@ -541,7 +541,10 @@ class _ModuleOffloader:
         self._copy_done_event.record(self.copy_stream)
         # Event is only valid for eager wait_event if recorded outside capture.
         # Events recorded during capture become invalid after capture ends.
-        self._event_valid_for_eager = not torch.cuda.is_current_stream_capturing() if current_platform.is_cuda() else self._event_valid_for_eager
+        if current_platform.is_cuda():
+            self._event_valid_for_eager = not torch.cuda.is_current_stream_capturing()
+        else:
+            self._event_valid_for_eager = True  # XPU has no graph capture; events are always valid
 
 
 class _BaseParamOffloader(ABC):
