@@ -1347,15 +1347,21 @@ def _max_memory_usage_bytes_from_groups(
     if not kv_cache_groups:
         return 0
 
+    offload_to_cpu = (
+        envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU
+        and vllm_config.device_config.device_type != "cpu"
+    )
+
     # UniformTypeKVCacheSpecs special case (single group, per-layer specs)
     if len(kv_cache_groups) == 1 and isinstance(
         kv_cache_groups[0].kv_cache_spec, UniformTypeKVCacheSpecs
     ):
         per_layer_specs = kv_cache_groups[0].kv_cache_spec.kv_cache_specs
-        return sum(
+        layer_usages = [
             spec.max_memory_usage_bytes(vllm_config)
             for spec in per_layer_specs.values()
-        )
+        ]
+        return max(layer_usages) if offload_to_cpu else sum(layer_usages)
 
     # General case: group_size pools, each shared by one layer per group
     # Memory = group_size * page_size * blocks_for_max_len
@@ -1368,7 +1374,8 @@ def _max_memory_usage_bytes_from_groups(
         for group in kv_cache_groups
     )
 
-    return group_size * page_size * blocks_needed
+    # TODO: Check the correctness for hybrid kv cache case too
+    return page_size * blocks_needed if offload_to_cpu else group_size * page_size * blocks_needed
 
 
 def _estimate_max_model_len_from_groups(
