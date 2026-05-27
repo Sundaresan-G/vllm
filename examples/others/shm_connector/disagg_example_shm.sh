@@ -17,15 +17,15 @@ set -x
 
 PIDS=()
 # MODEL="Qwen/Qwen2.5-1.5B-Instruct"
-MODEL="Qwen/Qwen2.5-7B"
-# MODEL="Qwen/Qwen3-30B-A3B"
+# MODEL="Qwen/Qwen2.5-7B"
+MODEL="Qwen/Qwen3-30B-A3B"
 # MODEL="sarvamai/sarvam-30b"
-INPUT_LEN=2048
+INPUT_LEN=16384
 OUTPUT_LEN=8
-NUM_PROMPTS=2
+NUM_PROMPTS=8
 
 # Switch to the directory of the current script
-cd "$(dirname "${BASH_SOURCE[0]}")"
+cd /data/nfs_home/sundares/vllm/vllm/examples/others/shm_connector
 
 check_hf_token() {
     if [ -z "$HF_TOKEN" ]; then
@@ -126,8 +126,6 @@ GPU_ENV="vllm_0.18.0_xpu"
 
 main() {
 
-    cd /data/nfs_home/sundares/vllm/vllm/examples/others/shm_connector
-
     source /data/nfs_home/sundares/miniforge3/etc/profile.d/conda.sh
     # conda activate vllm_0.13.0_cpu_nonAvx
     # conda activate vllm_0.13.0_shm_xpu
@@ -192,11 +190,11 @@ main() {
     # cd ../../../benchmarks/
 
     # python -m debugpy --listen 0.0.0.0:5678 --wait-for-client \
-    $(which vllm) bench serve --port 9000 --seed $(date +%s) \
-        --model $MODEL \
-        --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN \
-        --num-prompts $NUM_PROMPTS --max-concurrency 1 \
-        2>&1 | tee benchmark.log
+    # $(which vllm) bench serve --port 9000 --seed $(date +%s) \
+    #     --model $MODEL \
+    #     --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN \
+    #     --num-prompts $NUM_PROMPTS --max-concurrency 1 \
+    #     2>&1 | tee benchmark.log
 
     # curl -X POST http://localhost:9000/v1/completions -H "Content-Type: application/json" -d '{    "model": "'"$MODEL"'",    "prompt": "Write a detailed, vivid, and slightly humorous free-verse poem about the craft of software engineering and coding. Touch on long nights spent debugging, collaborating with teammates, wrestling with legacy code, and the relief when all the tests finally pass. Use clear imagery, a hopeful tone.", "max_tokens": 10,    "temperature": 0.7  }' |& tee -a benchmark.log
 
@@ -205,7 +203,46 @@ main() {
     # curl -X POST http://localhost:9000/v1/completions -H "Content-Type: application/json" -d '{    "model": "'"$MODEL"'",    "prompt": "Write a rich, vivid, slightly humorous free-verse poem about the craft of software engineering and coding. Describe in detail long nights spent debugging elusive bugs, the glow of multiple monitors, half-finished mugs of cold coffee, and the quiet hum of machines in an almost empty office or home workspace. Show the emotional roller coaster of reading confusing legacy code, adding one more log line, watching stack traces scroll by, and wondering what the previous developer was thinking when they designed this system. Include scenes of collaboration: pair programming sessions, code review comments that are both kind and blunt, whiteboard diagrams that start neat and end as chaotic scribbles, and chat messages full of links to docs, tickets, and pull requests. Mention modern tools and rituals of the craft: version control, feature branches, continuous integration pipelines, flaky tests, deployment scripts, and dashboards that flip from red to green. Contrast the stress of production incidents, paging alerts, and frantic hotfixes with the quiet, satisfying moment when all tests finally pass, the pipeline is green, and the release is tagged. Use concrete imagery that developers recognize, add gentle inside jokes about off by one errors and mysterious race conditions, and keep the overall tone hopeful and affirming. Celebrate the creativity, persistence, and teamwork that make software possible, and end on a note of cautious but genuine optimism about the next refactor, the next big feature, and the next late night that somehow feels worth it.", "max_tokens": 100,    "temperature": 0.7  }' |& tee -a benchmark.log
 
     # To check the prefix caching effect
-    curl -X POST http://localhost:9000/v1/completions -H "Content-Type: application/json" -d '{    "model": "'"$MODEL"'",    "prompt": "Write a rich, vivid, slightly humorous free-verse poem about the craft of software engineering and coding. Describe in detail long nights spent debugging elusive bugs, the glow of multiple monitors, half-finished mugs of cold coffee, and the quiet hum of machines in an almost empty office or home workspace. Show the emotional roller coaster of reading confusing legacy code, adding one more log line, watching stack traces scroll by, and wondering what the previous developer was thinking when they designed this system. Include scenes of collaboration: pair programming sessions, code review comments that are both kind and blunt, whiteboard diagrams that start neat and end as chaotic scribbles, and chat messages full of links to docs, tickets, and pull requests. Mention modern tools and rituals of the craft: version control, feature branches, continuous integration pipelines, flaky tests, deployment scripts, and dashboards that flip from red to green. Contrast the stress of production incidents, paging alerts, and frantic hotfixes with the quiet, satisfying moment when all tests finally pass, the pipeline is green, and the release is tagged. Use concrete imagery that developers recognize, add gentle inside jokes about off by one errors and mysterious race conditions, and keep the overall tone hopeful and affirming. Celebrate the creativity, persistence, and teamwork that make software possible, and end on a note of cautious but genuine optimism about the next refactor, the next big feature, and the next late night that somehow feels worth it.", "max_tokens": 100,    "temperature": 0.7  }' |& tee -a benchmark.log
+    # curl -X POST http://localhost:9000/v1/completions -H "Content-Type: application/json" -d '{    "model": "'"$MODEL"'",    "prompt": "Write a rich, vivid, slightly humorous free-verse poem about the craft of software engineering and coding. Describe in detail long nights spent debugging elusive bugs, the glow of multiple monitors, half-finished mugs of cold coffee, and the quiet hum of machines in an almost empty office or home workspace. Show the emotional roller coaster of reading confusing legacy code, adding one more log line, watching stack traces scroll by, and wondering what the previous developer was thinking when they designed this system. Include scenes of collaboration: pair programming sessions, code review comments that are both kind and blunt, whiteboard diagrams that start neat and end as chaotic scribbles, and chat messages full of links to docs, tickets, and pull requests. Mention modern tools and rituals of the craft: version control, feature branches, continuous integration pipelines, flaky tests, deployment scripts, and dashboards that flip from red to green. Contrast the stress of production incidents, paging alerts, and frantic hotfixes with the quiet, satisfying moment when all tests finally pass, the pipeline is green, and the release is tagged. Use concrete imagery that developers recognize, add gentle inside jokes about off by one errors and mysterious race conditions, and keep the overall tone hopeful and affirming. Celebrate the creativity, persistence, and teamwork that make software possible, and end on a note of cautious but genuine optimism about the next refactor, the next big feature, and the next late night that somehow feels worth it.", "max_tokens": 100,    "temperature": 0.7  }' |& tee -a benchmark.log
+
+    $(which vllm) bench serve --port 9000 --seed $(date +%s) \
+        --model $MODEL \
+        --dataset-name prefix_repetition \
+        --prefix-repetition-prefix-len $((INPUT_LEN/2)) \
+        --prefix-repetition-suffix-len $((INPUT_LEN/2)) \
+        --prefix-repetition-num-prefixes 2 \
+        --prefix-repetition-output-len $OUTPUT_LEN \
+        --num-prompts $NUM_PROMPTS \
+        --max-concurrency 1 \
+        2>&1 | tee benchmark_prefix_caching.log
+
+    curl -s -X POST http://localhost:9000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "'"$MODEL"'",
+      "prompt": [
+        "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, and tensor parallelism to serve large language models efficiently. Requests are scheduled by a central scheduler that tracks per-request KV cache block allocations. The KV cache is divided into fixed-size blocks, and a block table maps logical blocks to physical GPU memory. Prefix caching reuses KV blocks for identical prompt prefixes across requests, avoiding redundant computation. Now answer the following question: What are the main benefits of prefix caching in LLM serving?",
+        "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, and tensor parallelism to serve large language models efficiently. Requests are scheduled by a central scheduler that tracks per-request KV cache block allocations. The KV cache is divided into fixed-size blocks, and a block table maps logical blocks to physical GPU memory. Prefix caching reuses KV blocks for identical prompt prefixes across requests, avoiding redundant computation. Now answer the following question: How does block-level prefix caching differ from token-level caching?",
+        "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, and tensor parallelism to serve large language models efficiently. Requests are scheduled by a central scheduler that tracks per-request KV cache block allocations. The KV cache is divided into fixed-size blocks, and a block table maps logical blocks to physical GPU memory. Prefix caching reuses KV blocks for identical prompt prefixes across requests, avoiding redundant computation. Now answer the following question: What workloads benefit most from prefix caching and why?"
+      ],
+      "max_tokens": 200,
+      "temperature": 0.7
+    }' \
+    2>&1 | tee -a benchmark_prefix_caching.log
+
+    curl -s -X POST http://localhost:9000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "'"$MODEL"'",
+      "prompt": [
+        "You are a helpful AI assistant. The following context describes a large distributed inference system. ",
+        "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, ",
+        "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, "
+      ],
+      "max_tokens": 200,
+      "temperature": 0.7
+    }' \
+    2>&1 | tee -a benchmark_prefix_caching.log
 
     # while true; do
     #     # python -m debugpy --listen 0.0.0.0:5678 --wait-for-client \

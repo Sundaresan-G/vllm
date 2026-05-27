@@ -213,54 +213,143 @@ async def stream_service_response(
             yield chunk
 
 
+async def _handle_single_prompt_completions(
+    api: str,
+    request: Request,
+    req_data: dict,
+    request_id: str,
+) -> tuple[dict, dict]:
+    """
+    Prefill + decode for a single-prompt request.
+    Returns (prefill_response_json, decode_req_data) so the caller can
+    stitch pieces together for multi-prompt batches.
+    """
+    prefill_client_info = get_next_client(request.app, "prefill")
+
+    response = await send_request_to_service(
+        prefill_client_info, api, req_data, request_id
+    )
+    response_json = response.json()
+
+    # Build the decode request inheriting all fields from the prefill request
+    decode_req_data = req_data.copy()
+    kv_transfer_params = response_json.get("kv_transfer_params", {})
+    if kv_transfer_params:
+        decode_req_data["kv_transfer_params"] = kv_transfer_params
+
+    # Append the one prefilled token so the decoder continues from there
+    decode_req_data["prompt"] = (
+        decode_req_data["prompt"] + response_json["choices"][0]["text"]
+    )
+
+    # Prefill generated one token already; decrement remaining budget
+    if "max_tokens" in decode_req_data:
+        decode_req_data["max_tokens"] -= 1
+
+    return response_json, decode_req_data
+
+
 async def _handle_completions(api: str, request: Request):
     try:
         req_data = await request.json()
-        request_id = str(uuid.uuid4())
 
-        # Get the next prefill client in round-robin fashion
-        prefill_client_info = get_next_client(request.app, "prefill")
+        prompts = req_data.get("prompt")
 
-        # Send request to prefill service
-        response = await send_request_to_service(
-            prefill_client_info, api, req_data, request_id
-        )
+        if isinstance(prompts, list):
+            # Split into individual single-prompt requests so that each gets its
+            # own kv_transfer_params from the prefiller.  A shared multi-prompt
+            # request would give all sub-requests the same remote_block_ids,
+            # causing the second sub-request to fail the "block marked busy"
+            # assert in start_load_kv after the first sub-request clears the flag.
+            import asyncio
 
-        # Extract the needed fields
-        response_json = response.json()
-        kv_transfer_params = response_json.get("kv_transfer_params", {})
-        if kv_transfer_params:
-            req_data["kv_transfer_params"] = kv_transfer_params
+            single_reqs = []
+            for prompt in prompts:
+                single_req = req_data.copy()
+                single_req["prompt"] = prompt
+                single_reqs.append(single_req)
 
-        # Get the next decode client in round-robin fashion
-        decode_client_info = get_next_client(request.app, "decode")
+            # Run all prefills concurrently then all decodes concurrently
+            request_ids = [str(uuid.uuid4()) for _ in single_reqs]
 
-        logger.debug("Using %s %s", prefill_client_info, decode_client_info)
-
-        req_data['prompt'] += response_json['choices'][0]['text']
-        # Since the prefill already generated one token, decrement max_tokens by 1
-        if "max_tokens" in req_data:
-            req_data["max_tokens"] -= 1
-
-        # Stream response from decode service
-        async def generate_stream():
-            prefill_output = b"data: " + response.content
-            yield prefill_output
-            print(
-                f"Proxy server relaying chunk from prefill of size {len(prefill_output)}, chunk: {prefill_output}",
-                flush=True,
+            prefill_results = await asyncio.gather(
+                *[
+                    _handle_single_prompt_completions(api, request, r, rid)
+                    for r, rid in zip(single_reqs, request_ids)
+                ]
             )
-            async for chunk in stream_service_response(
-                decode_client_info, api, req_data, request_id=request_id
-            ):
+
+            # prefill_results is a list of (prefill_response_json, decode_req_data)
+            decode_client_info = get_next_client(request.app, "decode")
+
+            # Stream all decode responses and merge into a single SSE stream
+            async def generate_stream_multi():
+                for prefill_response_json, decode_req_data in prefill_results:
+                    # Emit the one-token prefill output first
+                    import json as _json
+                    prefill_output = b"data: " + _json.dumps(prefill_response_json).encode()
+                    yield prefill_output
+                    print(
+                        f"Proxy server relaying prefill chunk of size {len(prefill_output)}",
+                        flush=True,
+                    )
+
+                async def _decode_one(dreq, rid):
+                    chunks = []
+                    async for chunk in stream_service_response(
+                        decode_client_info, api, dreq, request_id=rid
+                    ):
+                        chunks.append(chunk)
+                    return chunks
+
+                decode_chunk_lists = await asyncio.gather(
+                    *[
+                        _decode_one(dreq, rid)
+                        for (_, dreq), rid in zip(prefill_results, request_ids)
+                    ]
+                )
+                for chunks in decode_chunk_lists:
+                    for chunk in chunks:
+                        print(
+                            f"Proxy server relaying decode chunk of size {len(chunk)}",
+                            flush=True,
+                        )
+                        yield chunk
+
+            return StreamingResponse(generate_stream_multi(), media_type="application/json")
+
+        else:
+            # Single-prompt fast path (original behaviour)
+            request_id = str(uuid.uuid4())
+            single_req = req_data.copy()
+
+            prefill_response_json, decode_req_data = (
+                await _handle_single_prompt_completions(
+                    api, request, single_req, request_id
+                )
+            )
+
+            decode_client_info = get_next_client(request.app, "decode")
+            logger.debug("Using decode client %s", decode_client_info)
+
+            async def generate_stream():
+                import json as _json
+                prefill_output = b"data: " + _json.dumps(prefill_response_json).encode()
+                yield prefill_output
                 print(
-                    f"Proxy server relaying chunk of size {len(chunk)}, chunk: {chunk}",
+                    f"Proxy server relaying chunk from prefill of size {len(prefill_output)}",
                     flush=True,
                 )
-                yield chunk
+                async for chunk in stream_service_response(
+                    decode_client_info, api, decode_req_data, request_id=request_id
+                ):
+                    print(
+                        f"Proxy server relaying chunk of size {len(chunk)}, chunk: {chunk}",
+                        flush=True,
+                    )
+                    yield chunk
 
-        output = StreamingResponse(generate_stream(), media_type="application/json")
-        return output
+            return StreamingResponse(generate_stream(), media_type="application/json")
 
     except Exception as e:
         import sys

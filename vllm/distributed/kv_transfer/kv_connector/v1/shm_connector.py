@@ -387,12 +387,12 @@ class ShmConnectorScheduler:
 
         if params.get("do_remote_decode"):
             self._reqs_in_batch.add(request.request_id)
-            unhashed_local_block_ids: BlockIds = (
-                blocks.get_unhashed_block_ids_all_groups()
-            )
-            local_block_ids = self.get_sw_clipped_blocks(
-                unhashed_local_block_ids
-            )
+            # Use all block IDs (including prefix-cached/hashed blocks), not just
+            # unhashed ones. Unhashed only returns newly computed blocks, which will
+            # be empty on a full prefix cache hit even though blocks are allocated.
+            raw_block_ids = blocks.get_block_ids()
+            all_local_block_ids: list[list[int]] = [list(g) for g in raw_block_ids] if raw_block_ids else [[]]
+            local_block_ids = self.get_sw_clipped_blocks(all_local_block_ids)
             assert request.request_id not in self._send_ReqId2BlockIds, (
                 f"Request {request.request_id} already in send_ReqId2BlockIds"
             )
@@ -1233,8 +1233,8 @@ class ShmConnectorWorker:
                 "Num local_block_ids: %s. Num remote_block_ids: %s. ",
                 req_id,
                 remote_engine_id,
-                len(meta.local_physical_block_ids),
-                len(meta.remote.block_ids),
+                len(meta.local_physical_block_ids[0]),
+                len(meta.remote.block_ids[0]),
             )
             # always store metadata for failure recovery
             self._recving_metadata[req_id] = meta
