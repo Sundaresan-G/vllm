@@ -82,7 +82,7 @@ wait_for_server() {
         cleanup unexpected
     fi
 
-    if curl -s "localhost:${port}/healthcheck" > /dev/null; then
+    if curl -s "localhost:${port}/health"; then
       return 0
     elif curl -s -X POST "localhost:${port}/v1/completions" \
         -H "Content-Type: application/json" \
@@ -135,7 +135,7 @@ main() {
     $(which vllm) bench serve --port 9000 --seed $(date +%s) \
         --model $MODEL \
         --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN \
-        --num-prompts $NUM_PROMPTS --max-concurrency 8 --profile \
+        --num-prompts $NUM_PROMPTS --max-concurrency 8 \
         2>&1 | tee benchmark.log
 
     # curl -X POST http://localhost:9000/v1/completions -H "Content-Type: application/json" -d '{    "model": "'"$MODEL"'",    "prompt": "Write a detailed, vivid, and slightly humorous free-verse poem about the craft of software engineering and coding. Touch on long nights spent debugging, collaborating with teammates, wrestling with legacy code, and the relief when all the tests finally pass. Use clear imagery, a hopeful tone.", "max_tokens": 10,    "temperature": 0.7  }' |& tee -a benchmark.log
