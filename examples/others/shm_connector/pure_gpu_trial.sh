@@ -11,74 +11,57 @@
 #SBATCH --ntasks=1
 #SBATCH --time=01:59:00
 
-# echo "Warning: LMCache disaggregated prefill support for vLLM v1 is experimental and subject to change."
-
 set -x
 
 PIDS=()
 # MODEL="sarvamai/sarvam-30b"
+# MODEL="Qwen/Qwen3-30B-A3B"
 MODEL="Qwen/Qwen2.5-7B"
 INPUT_LEN=2048
-OUTPUT_LEN=1
-NUM_PROMPTS=5
+OUTPUT_LEN=8
+NUM_PROMPTS=32
 
-# Switch to the directory of the current script
-cd "$(dirname "${BASH_SOURCE[0]}")"
+# GPU_ENV="vllm_0.18.0_cuda"
+GPU_ENV="vllm_0.18.0_xpu"
 
-check_hf_token() {
-    if [ -z "$HF_TOKEN" ]; then
-        echo "HF_TOKEN is not set. Please set it to your Hugging Face token."
-        exit 1
-    fi
-    if [[ "$HF_TOKEN" != hf_* ]]; then
-        echo "HF_TOKEN is not a valid Hugging Face token. Please set it to your Hugging Face token."
-        exit 1
-    fi
-    echo "HF_TOKEN is set and valid."
-}
+CONDA_BASE="/data/nfs_home/sundares/miniforge3"
+SCRIPT_DIR="/data/nfs_home/sundares/vllm/vllm/examples/others/shm_connector"
 
-check_num_gpus() {
-    # can you check if the number of GPUs are >=2 via nvidia-smi/rocm-smi?
-    which rocm-smi > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-	num_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
-    else
-	num_gpus=$(rocm-smi --showid | grep Instinct | wc -l)
-    fi
+export VLLM_LOGGING_LEVEL=DEBUG
 
-    if [ "$num_gpus" -lt 2 ]; then
-        echo "You need at least 2 GPUs to run disaggregated prefill."
-        exit 1
-    else
-        echo "Found $num_gpus GPUs."
-    fi
-}
-
-ensure_python_library_installed() {
-    echo "Checking if $1 is installed..."
-    python3 -c "import $1" > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        if [ "$1" == "nixl" ]; then
-            echo "$1 is not installed. Please refer to https://github.com/ai-dynamo/nixl for installation."
-        else
-            echo "$1 is not installed. Please install it via pip install $1."
-        fi
-        exit 1
-    else
-        echo "$1 is installed."
-    fi
+# Kill a PID and all its descendants at any depth (BFS collect, reverse kill)
+kill_tree() {
+    local root=$1
+    local signal=${2:-TERM}
+    [[ -z "$root" ]] && return 0
+    local -a all=("$root")
+    local i=0
+    while (( i < ${#all[@]} )); do
+        local children
+        children=$(pgrep -P "${all[$i]}" 2>/dev/null) || true
+        for c in $children; do all+=("$c"); done
+        (( i++ ))
+    done
+    # Kill in reverse so leaves die before their parents
+    for (( j=${#all[@]}-1; j>=0; j-- )); do
+        kill -"$signal" "${all[$j]}" 2>/dev/null || true
+    done
 }
 
 cleanup() {
-    echo "Stopping everything…"
-    set -x
-    trap - INT TERM        # prevent re-entrancy
-    pgrep -af "vllm serve" -u $USER
-    pkill -f "vllm serve" -u $USER
-    sleep 10
-    pkill -9 -f "vllm serve" -u $USER
-    kill -9 -- ${PIDS[@]}
-    wait -- ${PIDS[@]}
+    local reason=${1:-interrupt}
+    echo "Stopping everything… (reason: ${reason})"
+    trap '' INT TERM  # ignore signals during cleanup to prevent re-entrancy
+    # Graceful SIGTERM to each tracked PID tree
+    for pid in "${PIDS[@]}"; do
+        kill_tree "$pid" TERM
+    done
+    sleep 5
+    # Force SIGKILL any survivors
+    for pid in "${PIDS[@]}"; do
+        kill_tree "$pid" KILL
+    done
+    wait -- "${PIDS[@]}" 2>/dev/null || true
     echo "Cleaning up shared memory..."
     find /dev/shm -maxdepth 1 -user $USER -type f -exec rm -f {} +
     exit 0
@@ -93,9 +76,14 @@ wait_for_server() {
   echo "Waiting for server on port $port..."
 
   while true; do
+    # Check if the process is still running before attempting curl
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "Process with PID $pid and port $port has terminated unexpectedly."
+        cleanup unexpected
+    fi
+
     if curl -s "localhost:${port}/healthcheck" > /dev/null; then
       return 0
-    # Fallback to POST request to completions
     elif curl -s -X POST "localhost:${port}/v1/completions" \
         -H "Content-Type: application/json" \
         -d '{"model": "test", "prompt": "test", "max_tokens": 1}' > /dev/null 2>&1; then
@@ -105,48 +93,21 @@ wait_for_server() {
     local now=$(date +%s)
     echo "Waiting for server on port $port..."
     if (( now - start_time >= timeout_seconds )); then
-      echo "Timeout waiting for server on port $port"
-      return 1
+      echo "ERROR: Timeout waiting for server on port $port"
+      cleanup timeout
     fi
 
     sleep 1
-
-    # Check if the process is still running
-    if ! kill -0 $pid 2>/dev/null; then
-        echo "Process with PID $pid and port $port has terminated unexpectedly."
-        cleanup
-    fi
   done
 }
 
-# GPU_ENV="vllm_0.18.0_cuda"
-GPU_ENV="vllm_0.18.0_xpu"
-
-
 main() {
 
-    cd /data/nfs_home/sundares/vllm/vllm/examples/others/shm_connector
+    trap 'cleanup interrupt' INT TERM
 
-    source /data/nfs_home/sundares/miniforge3/etc/profile.d/conda.sh
-    # conda activate vllm_0.13.0_cpu_nonAvx
-    # conda activate vllm_0.13.0_shm_xpu
+    cd $SCRIPT_DIR
+    source $CONDA_BASE/etc/profile.d/conda.sh
     conda activate $GPU_ENV
-
-    set -x
-
-    # check_hf_token
-    # check_num_gpus
-    # ensure_python_library_installed lmcache
-    # ensure_python_library_installed nixl
-    # ensure_python_library_installed pandas
-    # ensure_python_library_installed datasets
-    # ensure_python_library_installed vllm
-
-    trap cleanup INT
-    trap cleanup USR1
-    trap cleanup TERM
-
-    export VLLM_LOGGING_LEVEL=DEBUG
 
     # --offload-group-size 1 --offload-num-in-group 1 --offload-prefetch-step 2 \
     # --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile", "torch_profiler_record_shapes": 1, "torch_profiler_with_flops": 1, "torch_profiler_with_stack": 1, "torch_profiler_with_memory": 1}'
@@ -157,10 +118,8 @@ main() {
     # EnableSharedSystemUsmSupport=1 \
     VLLM_KV_CACHE_LAYOUT="NHD" \
     VLLM_OFFLOAD_KV_CACHE_TO_CPU=0 \
-    VLLM_XPU_ENABLE_XPU_GRAPH=1 \
-    $(which vllm) serve $MODEL --trust-remote-code --port 9000 --max-model-len 9000 --max-num-seqs 1     --max-num-batched-tokens 9000 --no-enable-prefix-caching --block-size 64 --num-gpu-blocks-override 150 & \
-    # --offload-group-size 1 --offload-num-in-group 1 --offload-prefetch-step 2 & \
-    # --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile", "torch_profiler_record_shapes": 1, "torch_profiler_with_flops": 1, "torch_profiler_with_stack": 1, "torch_profiler_with_memory": 1}' &
+    VLLM_XPU_ENABLE_XPU_GRAPH=0 \
+    $(which vllm) serve $MODEL --trust-remote-code --port 9000 --max-model-len 9000 --max-num-seqs 1  --enforce-eager   --max-num-batched-tokens 9000 --no-enable-prefix-caching --block-size 64 --num-gpu-blocks-override 150 &
 
     server_pid=$!
     PIDS+=($server_pid)
@@ -176,7 +135,7 @@ main() {
     $(which vllm) bench serve --port 9000 --seed $(date +%s) \
         --model $MODEL \
         --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN \
-        --num-prompts $NUM_PROMPTS --max-concurrency 1 \
+        --num-prompts $NUM_PROMPTS --max-concurrency 8 --profile \
         2>&1 | tee benchmark.log
 
     # curl -X POST http://localhost:9000/v1/completions -H "Content-Type: application/json" -d '{    "model": "'"$MODEL"'",    "prompt": "Write a detailed, vivid, and slightly humorous free-verse poem about the craft of software engineering and coding. Touch on long nights spent debugging, collaborating with teammates, wrestling with legacy code, and the relief when all the tests finally pass. Use clear imagery, a hopeful tone.", "max_tokens": 10,    "temperature": 0.7  }' |& tee -a benchmark.log
@@ -227,7 +186,7 @@ main() {
     #     sleep 1
     # done
 
-    cleanup
+    cleanup success
 
 }
 
