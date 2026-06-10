@@ -1,10 +1,5 @@
 #!/bin/bash
-##SBATCH --partition=b70
-##SBATCH -w pcl-zen4
-##SBATCH --partition=bmtxg31
-#SBATCH --partition=rtx5070
-##SBATCH --partition=h100
-##SBATCH --cpus-per-task=60
+#SBATCH --partition=b70x1
 #SBATCH --job-name=vllm_b70
 #SBATCH --output=slurm-b70-runs-%j.out
 #SBATCH --nodes=1
@@ -16,18 +11,26 @@ set -x
 PIDS=()
 # MODEL="sarvamai/sarvam-30b"
 # MODEL="Qwen/Qwen3-30B-A3B"
-MODEL="Qwen/Qwen2.5-7B"
+MODEL="Qwen/Qwen2.5-1.5B"
 INPUT_LEN=2048
 OUTPUT_LEN=8
 NUM_PROMPTS=32
 
-# GPU_ENV="vllm_0.18.0_cuda"
-GPU_ENV="vllm_0.18.0_xpu"
+# GPU_ENV="vllm_0.19.1_cuda"
+GPU_ENV="vllm_0.19.1_xpu"
 
 CONDA_BASE="/data/nfs_home/sundares/miniforge3"
 SCRIPT_DIR="/data/nfs_home/sundares/vllm/vllm/examples/others/shm_connector"
 
 export VLLM_LOGGING_LEVEL=DEBUG
+
+# Logging helper — prints [file:line func()] message to stderr
+log() {
+    local file="${BASH_SOURCE[1]##*/}"
+    local line="${BASH_LINENO[0]}"
+    local func="${FUNCNAME[1]:-main}"
+    echo "[${file}:${line} ${func}()] $*" >&2
+}
 
 # Kill a PID and all its descendants at any depth (BFS collect, reverse kill)
 kill_tree() {
@@ -48,10 +51,8 @@ kill_tree() {
     done
 }
 
-cleanup() {
-    local reason=${1:-interrupt}
-    echo "Stopping everything… (reason: ${reason})"
-    trap '' INT TERM  # ignore signals during cleanup to prevent re-entrancy
+stop_server() {
+    log "Stopping server…"
     # Graceful SIGTERM to each tracked PID tree
     for pid in "${PIDS[@]}"; do
         kill_tree "$pid" TERM
@@ -62,8 +63,16 @@ cleanup() {
         kill_tree "$pid" KILL
     done
     wait -- "${PIDS[@]}" 2>/dev/null || true
-    echo "Cleaning up shared memory..."
+    PIDS=()
+    log "Cleaning up shared memory..."
     find /dev/shm -maxdepth 1 -user $USER -type f -exec rm -f {} +
+}
+
+cleanup() {
+    local reason=${1:-interrupt}
+    log "Stopping everything… (reason: ${reason})"
+    trap '' INT TERM  # ignore signals during cleanup to prevent re-entrancy
+    stop_server
     exit 0
 }
 
@@ -73,12 +82,12 @@ wait_for_server() {
   local timeout_seconds=1200
   local start_time=$(date +%s)
 
-  echo "Waiting for server on port $port..."
+  log "Waiting for server on port $port..."
 
   while true; do
     # Check if the process is still running before attempting curl
     if ! kill -0 "$pid" 2>/dev/null; then
-        echo "Process with PID $pid and port $port has terminated unexpectedly."
+        log "Process with PID $pid and port $port has terminated unexpectedly."
         cleanup unexpected
     fi
 
@@ -91,9 +100,9 @@ wait_for_server() {
     fi
 
     local now=$(date +%s)
-    echo "Waiting for server on port $port..."
+    log "Waiting for server on port $port..."
     if (( now - start_time >= timeout_seconds )); then
-      echo "ERROR: Timeout waiting for server on port $port"
+      log "ERROR: Timeout waiting for server on port $port"
       cleanup timeout
     fi
 
@@ -103,7 +112,8 @@ wait_for_server() {
 
 main() {
 
-    trap 'cleanup interrupt' INT TERM
+    trap cleanup INT
+    trap cleanup TERM
 
     cd $SCRIPT_DIR
     source $CONDA_BASE/etc/profile.d/conda.sh
@@ -113,18 +123,28 @@ main() {
     # --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile", "torch_profiler_record_shapes": 1, "torch_profiler_with_flops": 1, "torch_profiler_with_stack": 1, "torch_profiler_with_memory": 1}'
 
     # If VLLM_OFFLOAD_KV_CACHE_TO_CPU=1, then KV_BUFFER_DEVICE does not matter and it will be ignored.
-    # ONEAPI_DEVICE_SELECTOR="level_zero:0,4;opencl:0,4" \
-    # NEOReadDebugKeys=1 \
-    # EnableSharedSystemUsmSupport=1 \
-    VLLM_KV_CACHE_LAYOUT="NHD" \
-    VLLM_OFFLOAD_KV_CACHE_TO_CPU=0 \
-    VLLM_XPU_ENABLE_XPU_GRAPH=0 \
-    $(which vllm) serve $MODEL --trust-remote-code --port 9000 --max-model-len 9000 --max-num-seqs 1  --enforce-eager   --max-num-batched-tokens 9000 --no-enable-prefix-caching --block-size 64 --num-gpu-blocks-override 150 &
+    (
+        # ONEAPI_DEVICE_SELECTOR="level_zero:0,4;opencl:0,4" \
+        # NEOReadDebugKeys=1 \
+        # EnableSharedSystemUsmSupport=1 \
+        VLLM_KV_CACHE_LAYOUT="NHD" \
+        VLLM_OFFLOAD_KV_CACHE_TO_CPU=0 \
+        VLLM_XPU_ENABLE_XPU_GRAPH=0 \
+        $(which vllm) serve $MODEL --trust-remote-code --port 9000 --max-model-len 9000 --max-num-seqs 1  --enforce-eager   --max-num-batched-tokens 9000 --no-enable-prefix-caching --block-size 64 --num-gpu-blocks-override 150
+    ) &
 
     server_pid=$!
     PIDS+=($server_pid)
 
     wait_for_server 9000 $server_pid
+
+    log "=================================================="
+    log "All servers are up. You can send request now..."
+    log "Press Ctrl-C to terminate all instances."
+
+    # Keep the script running until interrupted
+    log "Script is running. Waiting for termination signal..."
+    log "=================================================="
 
     # echo "All servers are up. Starting benchmark..."
 
@@ -168,14 +188,6 @@ main() {
 
     # cleanup
 
-    echo "==================================================="
-    echo "All servers are up. You can send request now..."
-    echo "Press Ctrl-C to terminate all instances."
-
-    # Keep the script running until interrupted
-    echo "Script is running. Waiting for termination signal..."
-    echo "==================================================="
-
     # vllm bench serve --port 9000 --seed $(date +%s) \
     #     --model $MODEL \
     #     --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN \
@@ -185,6 +197,33 @@ main() {
     # while true; do
     #     sleep 1
     # done
+
+    # Accuracy / correctness spot-check
+    curl --fail-with-body -X POST http://localhost:9000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "'"$MODEL"'",
+      "prompt": [
+        "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, and tensor parallelism to serve large language models efficiently. Requests are scheduled by a central scheduler that tracks per-request KV cache block allocations. The KV cache is divided into fixed-size blocks, and a block table maps logical blocks to physical GPU memory. Prefix caching reuses KV blocks for identical prompt prefixes across requests, avoiding redundant computation. Now answer the following question: What are the main benefits of prefix caching in LLM serving?"
+      ],
+      "max_tokens": 200,
+      "temperature": 0.7
+    }' \
+    2>&1 | python3 -m json.tool --no-ensure-ascii 2>&1 | tee accuracy_test.log
+
+    curl --fail-with-body -X POST http://localhost:9000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+      "model": "'"$MODEL"'",
+      "prompt": [
+        "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, and tensor parallelism to serve large language models efficiently. Requests are scheduled by a central scheduler that tracks per-request KV cache block allocations. The KV cache is divided into fixed-size blocks, and a block table maps logical blocks to physical GPU memory. Prefix caching reuses KV blocks for identical prompt prefixes across requests, avoiding redundant computation. Now answer the following question: What are the main benefits of prefix caching in LLM serving?",
+        "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, and tensor parallelism to serve large language models efficiently. Requests are scheduled by a central scheduler that tracks per-request KV cache block allocations. The KV cache is divided into fixed-size blocks, and a block table maps logical blocks to physical GPU memory. Prefix caching reuses KV blocks for identical prompt prefixes across requests, avoiding redundant computation. Now answer the following question: How does block-level prefix caching differ from token-level caching?",
+        "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, and tensor parallelism to serve large language models efficiently. Requests are scheduled by a central scheduler that tracks per-request KV cache block allocations. The KV cache is divided into fixed-size blocks, and a block table maps logical blocks to physical GPU memory. Prefix caching reuses KV blocks for identical prompt prefixes across requests, avoiding redundant computation. Now answer the following question: What workloads benefit most from prefix caching and why?"
+      ],
+      "max_tokens": 200,
+      "temperature": 0.7
+    }' \
+    2>&1 | python3 -m json.tool --no-ensure-ascii 2>&1 | tee -a accuracy_test.log
 
     cleanup success
 

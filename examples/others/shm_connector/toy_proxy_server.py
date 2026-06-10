@@ -3,7 +3,6 @@
 
 import argparse
 import itertools
-import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -13,8 +12,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 import time
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+from vllm.logger import init_logger
+
+logger = init_logger("vllm.shm_proxy_server")
 
 
 @asynccontextmanager
@@ -54,10 +54,10 @@ async def lifespan(app: FastAPI):
     app.state.prefill_iterator = itertools.cycle(range(len(app.state.prefill_clients)))
     app.state.decode_iterator = itertools.cycle(range(len(app.state.decode_clients)))
 
-    print(
-        f"Initialized {len(app.state.prefill_clients)} prefill clients "
-        f"and {len(app.state.decode_clients)} decode clients.",
-        flush=True,
+    logger.info(
+        "Initialized %d prefill clients and %d decode clients.",
+        len(app.state.prefill_clients),
+        len(app.state.decode_clients),
     )
 
     yield
@@ -143,7 +143,7 @@ def measure_time(func):
         start_time = time.time()
         result = await func(*args, **kwargs)
         end_time = time.time()
-        print(f"{func.__name__} took {end_time - start_time:.4f} seconds", flush=True)
+        logger.info("%s took %.4f seconds", func.__name__, end_time - start_time)
         return result
     return wrapper
 
@@ -185,10 +185,7 @@ def measure_generator_time(func):
         start_time = time.time()  # Record the time before the item is generated
         async for item in func(*args, **kwargs):
             end_time = time.time()  # Record the time after the item is generated
-            print(
-                f"{func.__name__} generated an item in {end_time - start_time:.4f} seconds",
-                flush=True,
-            )
+            logger.info("%s generated an item in %.4f seconds", func.__name__, end_time - start_time)
             yield item
             start_time = time.time()  # Record the time before the item is generated again
     return wrapper
@@ -284,15 +281,12 @@ async def _handle_completions(api: str, request: Request):
 
             # Stream all decode responses and merge into a single SSE stream
             async def generate_stream_multi():
-                for prefill_response_json, decode_req_data in prefill_results:
+                for (prefill_response_json, decode_req_data), rid in zip(prefill_results, request_ids):
                     # Emit the one-token prefill output first
                     import json as _json
                     prefill_output = b"data: " + _json.dumps(prefill_response_json).encode()
                     yield prefill_output
-                    print(
-                        f"Proxy server relaying prefill chunk of size {len(prefill_output)}",
-                        flush=True,
-                    )
+                    logger.info("[%s] Forwarding prefill result to client (%d bytes)", rid, len(prefill_output))
 
                 async def _decode_one(dreq, rid):
                     chunks = []
@@ -308,12 +302,9 @@ async def _handle_completions(api: str, request: Request):
                         for (_, dreq), rid in zip(prefill_results, request_ids)
                     ]
                 )
-                for chunks in decode_chunk_lists:
+                for chunks, (prefill_response_json, _), rid in zip(decode_chunk_lists, prefill_results, request_ids):
                     for chunk in chunks:
-                        print(
-                            f"Proxy server relaying decode chunk of size {len(chunk)}",
-                            flush=True,
-                        )
+                        logger.info("[%s] Forwarding decode chunk to client (%d bytes)", rid, len(chunk))
                         yield chunk
 
             return StreamingResponse(generate_stream_multi(), media_type="application/json")
@@ -336,18 +327,15 @@ async def _handle_completions(api: str, request: Request):
                 import json as _json
                 prefill_output = b"data: " + _json.dumps(prefill_response_json).encode()
                 yield prefill_output
-                print(
-                    f"Proxy server relaying chunk from prefill of size {len(prefill_output)}",
-                    flush=True,
-                )
-                async for chunk in stream_service_response(
-                    decode_client_info, api, decode_req_data, request_id=request_id
-                ):
-                    print(
-                        f"Proxy server relaying chunk of size {len(chunk)}, chunk: {chunk}",
-                        flush=True,
-                    )
-                    yield chunk
+                logger.info("[%s] Forwarding prefill result to client (%d bytes)", request_id, len(prefill_output))
+                try:
+                    async for chunk in stream_service_response(
+                        decode_client_info, api, decode_req_data, request_id=request_id
+                    ):
+                        logger.info("[%s] Forwarding decode chunk to client (%d bytes): %s", request_id, len(chunk), chunk)
+                        yield chunk
+                except Exception as exc:
+                    logger.error("[%s] Error while streaming decode response: %s", request_id, exc, exc_info=True)
 
             return StreamingResponse(generate_stream(), media_type="application/json")
 
@@ -356,9 +344,9 @@ async def _handle_completions(api: str, request: Request):
         import traceback
 
         exc_info = sys.exc_info()
-        print(f"Error occurred in disagg prefill proxy server - {api} endpoint", flush=True)
-        print(e, flush=True)
-        print("".join(traceback.format_exception(*exc_info)), flush=True)
+        logger.error("Error occurred in disagg prefill proxy server - %s endpoint", api)
+        logger.error("%s", e)
+        logger.error("%s", "".join(traceback.format_exception(*exc_info)))
         raise
 
 

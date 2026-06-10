@@ -69,6 +69,7 @@ class RemoteMeta:
     engine_id: str
     request_id: str
     block_size: int
+    completion_flag_idx: int
 
 
 @dataclass
@@ -86,7 +87,7 @@ class ShmConnectorMetadata(KVConnectorMetadata):
         self.reqs_to_send: dict[ReqId, float] = {}
         self.reqs_in_batch: set[ReqId] = set()
         self.reqs_not_processed: set[ReqId] = set()
-        self.send_ReqId2BlockIds: dict[ReqId, BlockIds] = {}
+        self.send_ReqId2CompletionIdx: dict[ReqId, int] = {}
 
     def _add_new_req(
         self,
@@ -113,6 +114,7 @@ class ShmConnectorMetadata(KVConnectorMetadata):
             request_id=kv_transfer_params["remote_request_id"],
             block_size=kv_transfer_params["remote_block_size"],
             filename=kv_transfer_params["remote_filename"],
+            completion_flag_idx=kv_transfer_params["remote_completion_flag_idx"],
         )
         self.reqs_to_recv[request_id] = req
 
@@ -269,7 +271,9 @@ class ShmConnectorScheduler:
         self.engine_id: EngineId = engine_id
         self.kv_cache_config = kv_cache_config
         self.side_channel_filename = engine_id
-        self._send_ReqId2BlockIds: dict[ReqId, BlockIds] = {}
+        self.max_completion_flags_size = vllm_config.scheduler_config.max_num_seqs * 10
+        self.current_completion_flag_idx = 0
+        self._send_ReqId2CompletionIdx: dict[ReqId, int] = {}
 
         self._is_hma_required = (
             not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
@@ -387,16 +391,13 @@ class ShmConnectorScheduler:
 
         if params.get("do_remote_decode"):
             self._reqs_in_batch.add(request.request_id)
-            # Use all block IDs (including prefix-cached/hashed blocks), not just
-            # unhashed ones. Unhashed only returns newly computed blocks, which will
-            # be empty on a full prefix cache hit even though blocks are allocated.
-            raw_block_ids = blocks.get_block_ids()
-            all_local_block_ids: list[list[int]] = [list(g) for g in raw_block_ids] if raw_block_ids else [[]]
-            local_block_ids = self.get_sw_clipped_blocks(all_local_block_ids)
-            assert request.request_id not in self._send_ReqId2BlockIds, (
-                f"Request {request.request_id} already in send_ReqId2BlockIds"
-            )
-            self._send_ReqId2BlockIds[request.request_id] = local_block_ids
+            if request.request_id not in self._send_ReqId2CompletionIdx:
+                assert len(self._send_ReqId2CompletionIdx) < self.max_completion_flags_size, (
+                    "Exceeded maximum number of completion flags"
+                )
+                while self.current_completion_flag_idx in self._send_ReqId2CompletionIdx.values():
+                    self.current_completion_flag_idx = (self.current_completion_flag_idx + 1) % self.max_completion_flags_size
+                self._send_ReqId2CompletionIdx[request.request_id] = self.current_completion_flag_idx
         elif params.get("do_remote_prefill"):
             if params.get("remote_block_ids"):
                 if all(
@@ -451,8 +452,7 @@ class ShmConnectorScheduler:
                 kv_transfer_params=req.kv_transfer_params,
             )
 
-        # Make it a deepcopy to avoid mutation during transfer
-        meta.send_ReqId2BlockIds = copy.deepcopy(self._send_ReqId2BlockIds)
+        meta.send_ReqId2CompletionIdx = self._send_ReqId2CompletionIdx
 
         meta.reqs_to_send = self._reqs_need_send
         meta.reqs_in_batch = self._reqs_in_batch
@@ -463,7 +463,6 @@ class ShmConnectorScheduler:
         self._reqs_in_batch = set()
         self._reqs_not_processed = set()
         self._reqs_need_send = {}
-        self._send_ReqId2BlockIds = {}
 
         return meta
 
@@ -529,6 +528,8 @@ class ShmConnectorScheduler:
             # Here we "unpad" blocks to send the actual remote blocks to be read.
             block_ids = self.get_sw_clipped_blocks(block_ids)
 
+        assert request.request_id in self._send_ReqId2CompletionIdx, f"Completion flag idx must be assigned for request {request.request_id} "
+
         return delay_free_blocks, dict(
             do_remote_prefill=True,
             do_remote_decode=False,
@@ -538,6 +539,7 @@ class ShmConnectorScheduler:
             remote_filename=self.side_channel_filename,
             tp_size=self.vllm_config.parallel_config.tensor_parallel_size,
             remote_block_size=self.block_size,
+            remote_completion_flag_idx=self._send_ReqId2CompletionIdx[request.request_id],
         )
 
 
@@ -559,7 +561,6 @@ class ShmConnectorWorker:
             raise ValueError("kv_transfer_config must be set for NixlConnector")
         self.kv_transfer_config = vllm_config.kv_transfer_config
         
-        self._send_ReqId2BlockIds: dict[ReqId, BlockIds] = {}
         self._pending_send_reqs: set[ReqId] = set()
 
         self.side_channel_filename = engine_id
@@ -652,6 +653,8 @@ class ShmConnectorWorker:
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
 
+        self.max_completion_flags_size = vllm_config.scheduler_config.max_num_seqs * 10
+
         self.use_mla = self.model_config.use_mla
 
         # Get the attention backend from the first layer
@@ -734,6 +737,7 @@ class ShmConnectorWorker:
         self.remote_shm_objects: dict[EngineId, dict[str, list[shared_memory.SharedMemory]]] = {}
         self.remote_cached_kv_caches: dict[EngineId, dict[str, list[torch.Tensor]]] = {}
         self.remote_cached_shm_kv_caches_completion_flags: dict[EngineId, list[shared_memory.SharedMemory]] = {}
+        self._send_ReqId2CompletionIdx : dict[ReqId, int] = {}
         
         logger.info(
             "Registering KV_Caches. use_mla: %s, kv_buffer_device: %s, ",
@@ -846,6 +850,8 @@ class ShmConnectorWorker:
                 xpu_pin_memory_ext = shm_connector_utils.load_xpu_pin_memory_extension()
                 xpu_pin_memory_ext.pin_existing(cache_or_caches.data_ptr(), original_cache_size, torch.xpu.current_stream().sycl_queue)
 
+            logger.debug(f"Successfully pinned memory for {layer_name} on device {self.device_type}")
+
             # cache_or_caches[0, 0, 0, 0, :4] = torch.tensor([1, 2, 3, 4], dtype=cache_or_caches.dtype)
 
             cache_list = cache_or_caches if self.kv_topo.split_k_and_v else [cache_or_caches]
@@ -952,13 +958,13 @@ class ShmConnectorWorker:
         self.shm_kv_caches_completion_flags = shared_memory.SharedMemory(
             name=shm_name, 
             create=True, 
-            size=self.num_blocks + 1  # single byte for boolean flag
+            size=self.max_completion_flags_size  # single byte for boolean flag
         )
 
-        logger.debug(f"Created new shared memory for completion flags with name {shm_name} and size {self.num_blocks + 1} bytes")
+        logger.debug(f"Created new shared memory for completion flags with name {shm_name} and size {self.max_completion_flags_size} bytes")
 
         # Initialize the completion flag to False (free)
-        for i in range(self.num_blocks):
+        for i in range(self.max_completion_flags_size):
             self.shm_kv_caches_completion_flags.buf[i] = False  # False
 
         logger.debug(
@@ -1164,7 +1170,8 @@ class ShmConnectorWorker:
             )
             self._reqs_to_process.remove(req_id)
             del self._reqs_to_send[req_id]
-            del self._send_ReqId2BlockIds[req_id]
+            flag_idx = self._send_ReqId2CompletionIdx.pop(req_id)
+            self.shm_kv_caches_completion_flags.buf[flag_idx] = False  # free the flag
             self._pending_send_reqs.discard(req_id)
             done_sending.add(req_id)
 
@@ -1178,24 +1185,24 @@ class ShmConnectorWorker:
         """
         assert self.kv_topo is not None
         notified_req_ids: set[str] = set()
-        logger.debug(f"self._send_ReqId2BlockIds = {self._send_ReqId2BlockIds}")
+        logger.debug(f"self._send_ReqId2CompletionIdx = {self._send_ReqId2CompletionIdx}")
         logger.debug(f"self._pending_send_reqs = {self._pending_send_reqs}")
         for req_id in list(self._reqs_to_send.keys()):
-            assert req_id in self._send_ReqId2BlockIds
-            block_id = self._send_ReqId2BlockIds[req_id][0][-1]  # Check the last block's flag
-            logger.debug(f"self.shm_kv_caches_completion_flags.buf[{block_id}] = {self.shm_kv_caches_completion_flags.buf[block_id]}")
-            if self.shm_kv_caches_completion_flags.buf[block_id] == False:  # False means free
-                self._send_ReqId2BlockIds.pop(req_id, None)
-                self._pending_send_reqs.discard(req_id)
-                # TODO: support heterogeneous TP
-                tp_ratio = 1
-                self.consumer_notification_counts_by_req[req_id] += 1
-                # Wait all consumers (D) to be done reading before freeing.
-                if self.consumer_notification_counts_by_req[req_id] == int(tp_ratio):
-                    notified_req_ids.add(req_id)
-                    del self.consumer_notification_counts_by_req[req_id]
-                    self._reqs_to_process.remove(req_id)
-                    self._reqs_to_send.pop(req_id, None)
+            if req_id in self._send_ReqId2CompletionIdx:
+                flag_idx = self._send_ReqId2CompletionIdx[req_id]
+                logger.debug(f"self.shm_kv_caches_completion_flags.buf[{flag_idx}] = {self.shm_kv_caches_completion_flags.buf[flag_idx]}")
+                if self.shm_kv_caches_completion_flags.buf[flag_idx] == False:  # False means free
+                    self._send_ReqId2CompletionIdx.pop(req_id, None)
+                    self._pending_send_reqs.discard(req_id)
+                    # TODO: support heterogeneous TP
+                    tp_ratio = 1
+                    self.consumer_notification_counts_by_req[req_id] += 1
+                    # Wait all consumers (D) to be done reading before freeing.
+                    if self.consumer_notification_counts_by_req[req_id] == int(tp_ratio):
+                        notified_req_ids.add(req_id)
+                        del self.consumer_notification_counts_by_req[req_id]
+                        self._reqs_to_process.remove(req_id)
+                        self._reqs_to_send.pop(req_id, None)
         return notified_req_ids
 
     def _pop_done_transfers(self, transfers: dict[str, list[int]]) -> set[str]:
@@ -1230,11 +1237,14 @@ class ShmConnectorWorker:
             remote_engine_id = meta.remote.engine_id
             logger.debug(
                 "start_load_kv for request %s from remote engine %s. "
-                "Num local_block_ids: %s. Num remote_block_ids: %s. ",
+                "Num local_block_ids: %s. Num remote_block_ids: %s. "
+                "local_physical_block_ids: %s. remote_block_ids: %s.",
                 req_id,
                 remote_engine_id,
                 len(meta.local_physical_block_ids[0]),
                 len(meta.remote.block_ids[0]),
+                meta.local_physical_block_ids[0],
+                meta.remote.block_ids[0],
             )
             # always store metadata for failure recovery
             self._recving_metadata[req_id] = meta
@@ -1364,8 +1374,8 @@ class ShmConnectorWorker:
 
             if self.tp_rank == 0:
                 for remote_tp_rank, elem in enumerate(self.remote_cached_shm_kv_caches_completion_flags[remote_engine_id]):
-                    logger.debug(f"Remote block id {meta.remote.block_ids[0][-1]} for remote_tp_rank {remote_tp_rank} of engine {remote_engine_id}")
-                    assert elem.buf[meta.remote.block_ids[0][-1]] == True, (
+                    flag_idx = meta.remote.completion_flag_idx
+                    assert elem.buf[flag_idx] == True, (
                         f"Remote block id {meta.remote.block_ids[0][-1]} for remote_tp_rank {remote_tp_rank} of engine {remote_engine_id} is not marked busy as expected.")
                     
             self.tp_group.barrier()
@@ -1511,7 +1521,8 @@ class ShmConnectorWorker:
             # Mark the last remote block as free
             if self.tp_rank == 0:
                 for remote_tp_rank, elem in enumerate(self.remote_cached_shm_kv_caches_completion_flags[remote_engine_id]):
-                    elem.buf[meta.remote.block_ids[0][-1]] = False  # False means free
+                    flag_idx = meta.remote.completion_flag_idx
+                    elem.buf[flag_idx] = False  # False means free
 
 
             logger.debug(
@@ -1547,14 +1558,6 @@ class ShmConnectorWorker:
             if req_id in self._reqs_to_process:
                 self._reqs_to_send[req_id] = expiration_time
 
-        for req_id, block_ids in metadata.send_ReqId2BlockIds.items():
-            assert req_id not in self._send_ReqId2BlockIds, (
-                f"Request {req_id} already in send_ReqId2BlockIds"
-            )
-            self._send_ReqId2BlockIds[req_id] = block_ids
-
-        logger.debug(f"self._send_ReqId2BlockIds after start_load_kv: {self._send_ReqId2BlockIds}")
-
     def get_mapped_blocks(
         self, block_ids: np.ndarray, block_size_ratio: int
     ) -> np.ndarray:
@@ -1577,19 +1580,17 @@ class ShmConnectorWorker:
         return mapped_2d.flatten().astype(np.int64)
 
     def wait_for_save(self, metadata: ShmConnectorMetadata):
-        # Get the most recently added item (dictionaries maintain insertion order)
-        logger.debug(f"self._send_ReqId2BlockIds = {self._send_ReqId2BlockIds}")
-        if self._send_ReqId2BlockIds:
-            for req_id in self._send_ReqId2BlockIds.keys():
-                if req_id not in self._pending_send_reqs:
-                    self._pending_send_reqs.add(req_id)
-                    i = self._send_ReqId2BlockIds[req_id][0][-1]
-                    self.shm_kv_caches_completion_flags.buf[i] = True  # Mark as busy
-                    logger.debug(f"self.shm_kv_caches_completion_flags.buf[{i}] = {self.shm_kv_caches_completion_flags.buf[i]}")
-        # for reqId, blockIdList in self._send_ReqId2BlockIds.items():
-        #     k_cache = list(self.device_kv_caches.values())[0][0]
-        #     for blockId in blockIdList:
-        #         logger.debug(f"{reqId}, {blockId}, {k_cache[blockId].permute(1,0,2).view(-1)}")
+        self._send_ReqId2CompletionIdx = metadata.send_ReqId2CompletionIdx
+        for req_id, completion_flag_idx in metadata.send_ReqId2CompletionIdx.items():
+            if req_id not in self._pending_send_reqs:
+                self._pending_send_reqs.add(req_id)
+                i = completion_flag_idx
+                self.shm_kv_caches_completion_flags.buf[i] = True  # Mark as busy
+                logger.debug(
+                    f"Marked block {i} as busy for req {req_id} in wait_for_save"
+                )
+
+        logger.debug(f"self._send_ReqId2CompletionIdx after wait_for_save: {self._send_ReqId2CompletionIdx}")
 
     def _logical_to_kernel_block_ids(self, block_ids: BlockIds) -> BlockIds:
         """

@@ -31,54 +31,89 @@ set +xe
 ```
 ## Intel GPUs:
 ```bash
-echo '
+bash << 'SCRIPT' 2>&1 | tee build_xpu_0.19.1_$(date +%Y%m%d_%H%M%S).log
 set -xe
 # Ensure that the tag is present as it is needed for proper versioning purpose
-# git fetch origin tag v0.18.0 --no-tags
-# git reset --hard v0.18.0
-# conda create -n vllm_0.18.0_xpu python==3.12 -y
+# git fetch origin tag v0.19.1 --no-tags
+# git reset --hard v0.19.1
+# conda create -n vllm_0.19.1_xpu python==3.12 -y
 eval "$(conda shell.bash hook)"
 # Load oneAPI2025.3 and driver modules
-# mkdir -p ~/miniforge3/envs/vllm_0.18.0_xpu/etc/conda/activate.d
-# cat > ~/miniforge3/envs/vllm_0.18.0_xpu/etc/conda/activate.d/xpu-vars.activate.sh << 'EOF'
-# #!/bin/bash
+# mkdir -p ~/miniforge3/envs/vllm_0.19.1_xpu/etc/conda/activate.d
+cat > ~/miniforge3/envs/vllm_0.19.1_xpu/etc/conda/activate.d/xpu-vars.activate.sh << 'EOF'
+#!/bin/bash
 
-# set -x
+[[ "$-" != *x* ]] && _xtrace_was_off=1 && set -x
 
-# source /swtools/intel/2025.3/oneapi-vars.sh 
-# # source /swtools/intel-gpu/latest/intel_gpu_vars.sh
+source /swtools/intel/oneapi/2025.3/oneapi-vars.sh 
+# source /swtools/intel-gpu/latest/intel_gpu_vars.sh
 # source /swtools/intel-gpu/26.01.36711.4/intel_gpu_vars.sh
-# # source /swtools/intel-gpu/main_20251004/intel_gpu_vars.sh
-# # export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
+# source /swtools/intel-gpu/main_20251004/intel_gpu_vars.sh
+# export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
 
-# export FI_PROVIDER=tcp
+export FI_PROVIDER=tcp
 
-# set +x
-# EOF
-conda activate vllm_0.18.0_xpu
-# set -x
-# pip install -r requirements/xpu.txt --extra-index-url=https://download.pytorch.org/whl/xpu -v
+if [[ -n "$_xtrace_was_off" ]]; then set +x; unset _xtrace_was_off; fi
+EOF
+conda activate vllm_0.19.1_xpu
+pip install "pip<26"
+set -x
+pip install -r requirements/xpu.txt --extra-index-url=https://download.pytorch.org/whl/xpu -v
 # rm -rf .deps dist *.egg-info
 # git ls-files --others --exclude='.vscode' --exclude='example*' --exclude="build*" --exclude=".deps" | xargs rm
 VLLM_TARGET_DEVICE=xpu pip install -e . --no-build-isolation -v --extra-index-url=https://download.pytorch.org/whl/xpu --config-settings editable_mode=strict
-# pip uninstall -y triton triton-xpu
-# pip install triton-xpu==3.7.0 --extra-index-url https://download.pytorch.org/whl/xpu
+pip uninstall -y triton triton-xpu
+pip install triton-xpu==3.7.0 --extra-index-url https://download.pytorch.org/whl/xpu
 set +xe
-' | bash 2>&1 | tee build_xpu_0.18.0_$(date +%Y%m%d_%H%M%S).log
+SCRIPT
 ```
 ## CPUs:
 ```bash
-echo '
+bash << 'SCRIPT' 2>&1 | tee build_cpu_0.19.1_$(date +%Y%m%d_%H%M%S).log
 set -xe
 # Ensure that the tag is present as it is needed for proper versioning purpose
-# git fetch origin tag v0.18.0 --no-tags
-# git reset --hard v0.18.0
-# conda create -n vllm_0.18.0_cpu python==3.12 -y
+# git fetch origin tag v0.19.1 --no-tags
+# git reset --hard v0.19.1
+conda create -n vllm_0.19.1_cpu python==3.12 -y
 eval "$(conda shell.bash hook)"
-conda activate vllm_0.18.0_cpu
-# pip install -r requirements/cpu-build.txt --extra-index-url https://download.pytorch.org/whl/cpu
-# pip install -r requirements/cpu.txt --extra-index-url https://download.pytorch.org/whl/cpu
-conda install gperftools
+mkdir -p ~/miniforge3/envs/vllm_0.19.1_cpu/etc/conda/activate.d
+cat > ~/miniforge3/envs/vllm_0.19.1_cpu/etc/conda/activate.d/cpu-vars.activate.sh << 'EOF'
+#!/bin/bash
+
+[[ "$-" != *x* ]] && _xtrace_was_off=1 && set -x
+
+TC_PATH="/data/nfs_home/sundares/miniforge3/envs/vllm_0.19.1_cpu/lib/libtcmalloc_minimal.so"
+IOMP_PATH="/swtools/intel/oneapi/2025.3/lib/libiomp5.so"
+
+export LD_PRELOAD="${TC_PATH}:${IOMP_PATH}${LD_PRELOAD:+:${LD_PRELOAD}}"
+
+if [[ -n "$_xtrace_was_off" ]]; then set +x; unset _xtrace_was_off; fi
+EOF
+mkdir -p ~/miniforge3/envs/vllm_0.19.1_cpu/etc/conda/deactivate.d
+cat > ~/miniforge3/envs/vllm_0.19.1_cpu/etc/conda/deactivate.d/cpu-vars.deactivate.sh << 'EOF'
+#!/bin/bash
+
+[[ "$-" != *x* ]] && _xtrace_was_off=1 && set -x
+
+TC_PATH="/data/nfs_home/sundares/miniforge3/envs/vllm_0.19.1_cpu/lib/libtcmalloc_minimal.so"
+IOMP_PATH="/swtools/intel/oneapi/2025.3/lib/libiomp5.so"
+
+LD_PRELOAD=":${LD_PRELOAD}:"
+LD_PRELOAD="${LD_PRELOAD//:${TC_PATH}:/:}"
+LD_PRELOAD="${LD_PRELOAD//:${IOMP_PATH}:/:}"
+# Collapse any consecutive colons left by the removals
+while [[ "$LD_PRELOAD" == *::* ]]; do LD_PRELOAD="${LD_PRELOAD//::/:}"; done
+LD_PRELOAD="${LD_PRELOAD#:}"
+LD_PRELOAD="${LD_PRELOAD%:}"
+if [[ -z "$LD_PRELOAD" ]]; then unset LD_PRELOAD; else export LD_PRELOAD; fi
+
+if [[ -n "$_xtrace_was_off" ]]; then set +x; unset _xtrace_was_off; fi
+EOF
+conda activate vllm_0.19.1_cpu
+pip install "pip<26"
+pip install -r requirements/cpu-build.txt --extra-index-url https://download.pytorch.org/whl/cpu
+pip install -r requirements/cpu.txt --extra-index-url https://download.pytorch.org/whl/cpu
+conda install -y gperftools
 rm -rf .deps dist *.egg-info
 # git ls-files --others --exclude='.vscode' --exclude='example*' --exclude="build*" --exclude=".deps" | xargs rm
 # VLLM_CPU_AMXBF16=true VLLM_TARGET_DEVICE=cpu pip install . --no-build-isolation -v --extra-index-url https://download.pytorch.org/whl/cpu 
@@ -93,7 +128,7 @@ while IFS= read -r file; do \
   echo "Moved: $file"; \
 done
 set +xe
-' | bash 2>&1 | tee build_cpu_0.18.0_$(date +%Y%m%d_%H%M%S).log
+SCRIPT
 ```
 
 # Run Scripts
@@ -135,10 +170,10 @@ $(which vllm) serve $MODEL --port 9000 --max-model-len 9000     --max-num-seqs 1
 ### CPU Server side
 ```bash
 # Update the below paths accordingly
-TC_PATH="/data/nfs_home/sundares/miniforge3/envs/vllm_0.18.0_cpu/lib/libtcmalloc_minimal.so"
-IOMP_PATH="/swtools/intel/2025.3/lib/libiomp5.so"
+TC_PATH="/data/nfs_home/sundares/miniforge3/envs/vllm_0.19.1_cpu/lib/libtcmalloc_minimal.so"
+IOMP_PATH="/swtools/intel/oneapi/2025.3/lib/libiomp5.so"
 
-export LD_PRELOAD="$TC_PATH:$IOMP_PATH:$LD_PRELOAD"
+export LD_PRELOAD="${TC_PATH}:${IOMP_PATH}${LD_PRELOAD:+:${LD_PRELOAD}}"
 export MODEL="Qwen/Qwen3-30B-A3B"
 export VLLM_LOGGING_LEVEL=DEBUG 
 # Optional
