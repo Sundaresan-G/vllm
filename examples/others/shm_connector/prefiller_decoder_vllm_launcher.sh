@@ -62,6 +62,7 @@ elif [[ $1 == "decoder" ]]; then
     # OMP_NUM_THREADS=32 \
     # VLLM_CPU_OMP_THREADS_BIND="0-59|60-119" \
     # TORCH_COMPILE_DISABLE=1 \
+    VLLM_CPU_OMP_THREADS_BIND="0-30" \
     VLLM_CPU_KVCACHE_SPACE=60 \
     VLLM_CPU_SGL_KERNEL="1" \
     $(which vllm) serve $MODEL \
@@ -71,7 +72,7 @@ elif [[ $1 == "decoder" ]]; then
     --max-num-seqs 10 \
     --max-num-batched-tokens 50000 \
     --block-size $BLOCK_SIZE \
-    --no-enable-prefix-caching \
+    --enable-prefix-caching \
     -tp $VLLM_TP \
     --kv-transfer-config '{"kv_connector":"ShmConnector","kv_role":"kv_both"}' \
     # --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile_decoder", "torch_profiler_record_shapes": 1, "torch_profiler_with_flops": 1, "torch_profiler_with_stack": 1, "torch_profiler_with_memory": 1}' \

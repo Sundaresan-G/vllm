@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
+import math
 import queue
 import time
 from collections import defaultdict
@@ -79,6 +80,9 @@ class ReqMeta:
     local_physical_block_ids: BlockIds
     tp_size: int
     remote: RemoteMeta | None = None
+    # Number of tokens to load from remote (prompt tokens not yet locally cached)
+    # plus 1 for the decode token slot, as passed by the scheduler.
+    num_external_tokens: int = 0
 
 
 class ShmConnectorMetadata(KVConnectorMetadata):
@@ -106,6 +110,7 @@ class ShmConnectorMetadata(KVConnectorMetadata):
         request_id: ReqId,
         local_block_ids: BlockIds,
         kv_transfer_params: dict[str, Any],
+        num_external_tokens: int = 0,
     ):
         req = self._add_new_req(local_block_ids, kv_transfer_params)
         req.remote = RemoteMeta(
@@ -116,6 +121,7 @@ class ShmConnectorMetadata(KVConnectorMetadata):
             filename=kv_transfer_params["remote_filename"],
             completion_flag_idx=kv_transfer_params["remote_completion_flag_idx"],
         )
+        req.num_external_tokens = num_external_tokens
         self.reqs_to_recv[request_id] = req
 
 
@@ -450,6 +456,7 @@ class ShmConnectorScheduler:
                 request_id=req_id,
                 local_block_ids=block_ids,
                 kv_transfer_params=req.kv_transfer_params,
+                num_external_tokens=req.num_external_computed_tokens,
             )
 
         meta.send_ReqId2CompletionIdx = self._send_ReqId2CompletionIdx
@@ -1388,9 +1395,31 @@ class ShmConnectorWorker:
             logger.debug(f"meta.local_block_ids = {meta.local_block_ids}")
             logger.debug(f"meta.remote.block_ids = {meta.remote.block_ids}")
 
-            curr_local_block_ids = meta.local_block_ids[0][:len(meta.remote.block_ids[0])] if len(meta.remote.block_ids[0]) <= len(meta.local_block_ids[0]) else meta.local_block_ids[0]
-            # If there are more remote blocks than local blocks, we skip the initial remote blocks since likely they are from prefix caching
-            curr_remote_block_ids = meta.remote.block_ids[0] if len(meta.remote.block_ids[0]) <= len(curr_local_block_ids) else meta.remote.block_ids[0][-len(curr_local_block_ids):]
+            n_remote = len(meta.remote.block_ids[0])
+            n_local = len(meta.local_block_ids[0])
+            if n_remote <= n_local:
+                # Normal case: remote has fewer or equal blocks than local.
+                # Copy all remote blocks into the first n_remote local slots.
+                curr_local_block_ids = meta.local_block_ids[0][:n_remote]
+                curr_remote_block_ids = meta.remote.block_ids[0]
+            else:
+                # Prefix cache hit on decoder: remote has more blocks than local
+                # because some prefix blocks are already in the decoder's cache.
+                # The decoder allocated n_local blocks: (n_to_copy new prefix blocks)
+                # plus potentially 1 separate decode-only slot.
+                # num_external_tokens = (uncached prefix tokens) + 1 (decode slot),
+                # so the number of remote blocks to copy is
+                # ceil((num_external_tokens - 1) / block_size).
+                if meta.num_external_tokens > 0:
+                    n_to_copy = math.ceil(
+                        (meta.num_external_tokens - 1) / self.block_size
+                    )
+                else:
+                    # Fallback: all local blocks (may be off by one if block-aligned)
+                    n_to_copy = n_local
+                n_to_copy = min(n_to_copy, n_remote, n_local)
+                curr_local_block_ids = meta.local_block_ids[0][:n_to_copy]
+                curr_remote_block_ids = meta.remote.block_ids[0][-n_to_copy:] if n_to_copy > 0 else []
 
             logger.debug(f"curr_local_block_ids = {curr_local_block_ids}")
             logger.debug(f"curr_remote_block_ids = {curr_remote_block_ids}")
@@ -1444,11 +1473,11 @@ class ShmConnectorWorker:
                 remote_kv_cache = remote_kv_caches[0]
                 if remote_tp_size > 1:                
                     remote_kv_cache = torch.cat(
-                        [x[:, meta.remote.block_ids[0]] for x in remote_kv_caches[start_remote_rank:end_remote_rank]], 
+                        [x[:, curr_remote_block_ids] for x in remote_kv_caches[start_remote_rank:end_remote_rank]], 
                         dim=kv_head_position
                     )
                 else:
-                    remote_kv_cache = remote_kv_cache[:, meta.remote.block_ids[0]]
+                    remote_kv_cache = remote_kv_cache[:, curr_remote_block_ids]
 
                 remote_kv_cache = remote_kv_cache[:, :, start_kv_head:end_kv_head]
 
