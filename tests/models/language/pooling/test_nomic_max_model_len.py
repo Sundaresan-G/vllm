@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # ruff: noqa: SIM117
-from typing import Any
 
 import pytest
 
@@ -40,8 +39,8 @@ def test_default(model_info, vllm_runner):
             # For nomic-embed-text-v2-moe the length is set to 512
             # by sentence_bert_config.json.
             assert model_config.max_model_len == 512
-        else:
-            assert model_config.max_model_len == original_max_position_embeddings
+        if model_info.name == "nomic-ai/nomic-embed-text-v1":
+            assert model_config.max_model_len == 8192
 
 
 @pytest.mark.parametrize("model_info", MODELS)
@@ -56,10 +55,9 @@ def test_set_max_model_len_legal(model_info, vllm_runner):
         model_config = vllm_model.llm.llm_engine.model_config
         assert model_config.max_model_len == 256
 
-    # set 512 < max_model_len <= 2048
+    # For nomic-embed-text-v2-moe the length is set to 512
+    # by sentence_bert_config.json.
     if model_info.name == "nomic-ai/nomic-embed-text-v2-moe":
-        # For nomic-embed-text-v2-moe the length is set to 512
-        # by sentence_bert_config.json.
         with pytest.raises(ValueError):
             with vllm_runner(
                 model_info.name,
@@ -68,6 +66,7 @@ def test_set_max_model_len_legal(model_info, vllm_runner):
                 max_model_len=1024,
             ):
                 pass
+<<<<<<< HEAD
     else:
         with vllm_runner(
             model_info.name,
@@ -77,11 +76,22 @@ def test_set_max_model_len_legal(model_info, vllm_runner):
         ) as vllm_model:
             model_config = vllm_model.llm.llm_engine.model_config
             assert model_config.max_model_len == 1024
+=======
+        return
+>>>>>>> main
 
+    # set 512 < max_model_len <= 2048
+    with vllm_runner(
+        model_info.name,
+        revision=model_info.revision,
+        runner="pooling",
+        max_model_len=1024,
+    ) as vllm_model:
+        model_config = vllm_model.llm.llm_engine.model_config
+        assert model_config.max_model_len == 1024
 
-@pytest.mark.parametrize("model_info", MODELS)
-def test_set_max_model_len_illegal(model_info, vllm_runner):
     # set max_model_len > 2048
+<<<<<<< HEAD
     with pytest.raises(ValueError):
         with vllm_runner(
             model_info.name,
@@ -102,6 +112,16 @@ def test_set_max_model_len_illegal(model_info, vllm_runner):
             hf_overrides=hf_overrides,
         ):
             pass
+=======
+    with vllm_runner(
+        model_info.name,
+        revision=model_info.revision,
+        runner="pooling",
+        max_model_len=4096,
+    ) as vllm_model:
+        model_config = vllm_model.llm.llm_engine.model_config
+        assert model_config.max_model_len == 4096
+>>>>>>> main
 
 
 @pytest.mark.parametrize("model_info", MODELS)
@@ -124,6 +144,7 @@ def test_use_rope_scaling_legal(model_info, vllm_runner):
         hf_overrides=hf_overrides,
     ):
         pass
+<<<<<<< HEAD
 
 
 @pytest.mark.parametrize("model_info", MODELS)
@@ -166,3 +187,5 @@ def test_use_rope_scaling_illegal(model_info, vllm_runner):
             hf_overrides=hf_overrides,
         ):
             pass
+=======
+>>>>>>> main

@@ -20,11 +20,15 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.model_executor.layers.attention import Attention
-from vllm.model_executor.layers.fused_moe import FusedMoE, GateLinear
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoE,
+    fused_moe_make_expert_params_mapping,
+)
 from vllm.model_executor.layers.fused_moe.config import FusedMoEParallelConfig
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
+    ReplicatedLinear,
     RowParallelLinear,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -174,11 +178,13 @@ class MLPBlock(torch.nn.Module):
         self.hidden_size = config.hidden_size
         self.experts_per_token = config.num_experts_per_tok
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
-        self.router = GateLinear(
+        self.router = ReplicatedLinear(
             config.hidden_size,
             config.num_local_experts,
             bias=True,
+            quant_config=None,
             prefix=f"{prefix}.router",
+            return_bias=False,
         )
         assert config.intermediate_size % self.world_size == 0
         self.experts = FusedMoE(
@@ -186,7 +192,6 @@ class MLPBlock(torch.nn.Module):
             top_k=config.num_experts_per_tok,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
-            reduce_results=True,
             renormalize=True,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
@@ -206,7 +211,7 @@ class MLPBlock(torch.nn.Module):
                 self, x[:, : self.hidden_size], self.router.weight, self.router.bias
             )
         else:
-            g, _ = self.router(x)
+            g = self.router(x)
         x = self.experts(hidden_states=x, router_logits=g)[:, : self.hidden_size]
 
         if self.is_sequence_parallel:
@@ -329,7 +334,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
         # Params for weights, weight scales, activation scales
         # (param_name, weight_name, expert_id, shard_id)
         # NOTE: this is only used for quark.
-        return FusedMoE.make_expert_params_mapping(
+        return fused_moe_make_expert_params_mapping(
             self,
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
@@ -557,6 +562,14 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 pcp_rank=get_pcp_group().rank_in_group,
             )
 
+        def _is_mxfp4(weight_dtype: str | None) -> bool:
+            """Return True for any MXFP4 weight-dtype variant.
+
+            Covers "gpt_oss_mxfp4" (GptOssMxfp4MoEMethod) and "mxfp4"
+            (QuarkMoEMethod with fp4 weights) and any future variants.
+            """
+            return weight_dtype is not None and "mxfp4" in weight_dtype
+
         def _get_moe_weight_dtype(layer_id: int = 0) -> str | None:
             """Helper function to get MoE quantization weight dtype.
 
@@ -575,7 +588,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
 
         moe_weight_dtype = _get_moe_weight_dtype(layer_id=0)
 
-        if moe_weight_dtype == "mxfp4":
+        if _is_mxfp4(moe_weight_dtype):
             # MXFP4 requires OCP_MX_BLOCK_SIZE alignment
             intermediate_size_block = intermediate_size // OCP_MX_BLOCK_SIZE
             per_rank_intermediate_size_block = cdiv(intermediate_size_block, tp_size)
@@ -622,52 +635,6 @@ class GptOssModel(nn.Module, EagleModelMixin):
 
                 moe_quant_method = _get_moe_weight_dtype(layer_id=layer_id)
 
-            def kv_cache_scale_loader(
-                quant_config: QuantizationConfig,
-                name: str,
-                params_dict: dict[str, typing.Any],
-                weight: torch.Tensor,
-                default_weight_loader: Callable[..., None],
-                loaded_params: set[str],
-            ) -> tuple[bool, set[str]]:
-                """
-                Load KV cache output scales.
-                Returns:
-                    Tuple of (bool, set):
-                    - bool: True if KV-cache scale was loaded into loaded_params
-                    - set: Updated set of loaded_params if True else the original set
-                """
-                # load explicit cached KV output scale from quant_config
-                if quant_config is not None and (
-                    scale_name := quant_config.get_cache_scale(name)
-                ):
-                    param = params_dict[scale_name]
-                    weight_loader = getattr(
-                        param, "weight_loader", default_weight_loader
-                    )
-                    if weight.numel() != 1:
-                        raise ValueError(
-                            f"KV cache scale '{scale_name}' is expected to be a "
-                            f"scalar, but got a tensor of shape {weight.shape}."
-                        )
-                    # Ensure weight is a scalar before passing to loader.
-                    weight_loader(param, weight.flatten()[0])
-                    loaded_params.add(scale_name)
-                    return True, loaded_params
-
-                return False, loaded_params
-
-            load_kv_cache_scale_completed, loaded_params = kv_cache_scale_loader(
-                self.quant_config,
-                name,
-                params_dict,
-                loaded_weight,
-                default_weight_loader,
-                loaded_params,
-            )
-            if load_kv_cache_scale_completed:
-                continue
-
             if (
                 all(key in name for key in ["input_scale", "mlp.experts"])
                 and expert_id is not None
@@ -679,7 +646,7 @@ class GptOssModel(nn.Module, EagleModelMixin):
                 continue
 
             # Unified handler for mxfp4 weights and scales
-            elif moe_quant_method == "mxfp4" and any(
+            elif _is_mxfp4(moe_quant_method) and any(
                 name.endswith(suffix)
                 for suffix in [
                     ".w13_weight_scale",
@@ -1113,8 +1080,22 @@ class GptOssModel(nn.Module, EagleModelMixin):
             if hasattr(self.config, "quantization_config")
             else None
         )
-
+        # Normalize the checkpoint's quant_method to the internal name.
+        # Note: there are three places where "mxfp4" -> "gpt_oss_mxfp4"
+        # normalization occurs, each serving a different data path:
+        #   1. GptOssMxfp4Config.override_quantization_method() — sets
+        #      ModelConfig.quantization (used to select the QuantizationConfig
+        #      class at model init time), reading from model_arch_config which
+        #      is a snapshot taken before verify_and_update_model_config runs.
+        #   2. GptOssForCausalLMConfig.verify_and_update_model_config() —
+        #      patches hf_config.quantization_config in-place (a separate copy
+        #      of the dict from model_arch_config) for later hf_config lookups.
+        #   3. Here — reads directly from self.config (the raw HF config) which
+        #      may still carry the original "mxfp4" string from the checkpoint.
         if quant_method == "mxfp4":
+            quant_method = "gpt_oss_mxfp4"
+
+        if quant_method == "gpt_oss_mxfp4":
             return self._load_weights_mxfp4(
                 ep_rank_end,
                 ep_rank_start,

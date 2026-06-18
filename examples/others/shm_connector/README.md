@@ -24,29 +24,31 @@ grep -E "\.so$" | \
 while IFS= read -r file; do \
   mkdir -p "$TARGET_DIR/$(dirname "$file")" && \
   mv "$file" "$TARGET_DIR/$file" && \
-  echo "Moved: $file"; \
+  echo "Moved: $file to $TARGET_DIR/$file"; \
 done
 set +xe
 ' | bash 2>&1 | tee build_cuda_0.18.0_$(date +%Y%m%d_%H%M%S).log
 ```
 ## Intel GPUs:
 ```bash
-bash << 'SCRIPT' 2>&1 | tee build_xpu_0.19.1_$(date +%Y%m%d_%H%M%S).log
+bash << 'SCRIPT' 2>&1 | tee build_xpu_0.23.0_$(date +%Y%m%d_%H%M%S).log
 set -xe
 # Ensure that the tag is present as it is needed for proper versioning purpose
-# git fetch origin tag v0.19.1 --no-tags
-# git reset --hard v0.19.1
-# conda create -n vllm_0.19.1_xpu python==3.12 -y
-eval "$(conda shell.bash hook)"
+# git fetch origin tag v0.23.0 --no-tags
+# git reset --hard v0.23.0
+CONDA_BASE="/data/nfs_home/sundares/miniforge3"
+source $CONDA_BASE/etc/profile.d/conda.sh
+conda create -n vllm_0.23.0_xpu python==3.12 -y
 # Load oneAPI2025.3 and driver modules
-# mkdir -p ~/miniforge3/envs/vllm_0.19.1_xpu/etc/conda/activate.d
-cat > ~/miniforge3/envs/vllm_0.19.1_xpu/etc/conda/activate.d/xpu-vars.activate.sh << 'EOF'
+mkdir -p $CONDA_BASE/envs/vllm_0.23.0_xpu/etc/conda/activate.d
+cat > $CONDA_BASE/envs/vllm_0.23.0_xpu/etc/conda/activate.d/xpu-vars.activate.sh << 'EOF'
 #!/bin/bash
 
 [[ "$-" != *x* ]] && _xtrace_was_off=1 && set -x
 
-source /swtools/intel/oneapi/2025.3/oneapi-vars.sh 
-# source /swtools/intel-gpu/latest/intel_gpu_vars.sh
+# source /swtools/intel/2026.0/oneapi-vars.sh
+source /swtools/intel/2025.3/oneapi-vars.sh
+source /swtools/intel-gpu/latest/intel_gpu_vars.sh
 # source /swtools/intel-gpu/26.01.36711.4/intel_gpu_vars.sh
 # source /swtools/intel-gpu/main_20251004/intel_gpu_vars.sh
 # export ONEAPI_DEVICE_SELECTOR=level_zero:gpu
@@ -55,69 +57,15 @@ export FI_PROVIDER=tcp
 
 if [[ -n "$_xtrace_was_off" ]]; then set +x; unset _xtrace_was_off; fi
 EOF
-conda activate vllm_0.19.1_xpu
+conda activate vllm_0.23.0_xpu
 pip install "pip<26"
 set -x
 pip install -r requirements/xpu.txt --extra-index-url=https://download.pytorch.org/whl/xpu -v
 # rm -rf .deps dist *.egg-info
 # git ls-files --others --exclude='.vscode' --exclude='example*' --exclude="build*" --exclude=".deps" | xargs rm
-VLLM_TARGET_DEVICE=xpu pip install -e . --no-build-isolation -v --extra-index-url=https://download.pytorch.org/whl/xpu --config-settings editable_mode=strict
+VLLM_VERSION_OVERRIDE="v0.23.0" VLLM_TARGET_DEVICE=xpu pip install -e . --no-build-isolation -v --extra-index-url=https://download.pytorch.org/whl/xpu --config-settings editable_mode=strict
 pip uninstall -y triton triton-xpu
 pip install triton-xpu==3.7.0 --extra-index-url https://download.pytorch.org/whl/xpu
-set +xe
-SCRIPT
-```
-## CPUs:
-```bash
-bash << 'SCRIPT' 2>&1 | tee build_cpu_0.19.1_$(date +%Y%m%d_%H%M%S).log
-set -xe
-# Ensure that the tag is present as it is needed for proper versioning purpose
-# git fetch origin tag v0.19.1 --no-tags
-# git reset --hard v0.19.1
-conda create -n vllm_0.19.1_cpu python==3.12 -y
-eval "$(conda shell.bash hook)"
-mkdir -p ~/miniforge3/envs/vllm_0.19.1_cpu/etc/conda/activate.d
-cat > ~/miniforge3/envs/vllm_0.19.1_cpu/etc/conda/activate.d/cpu-vars.activate.sh << 'EOF'
-#!/bin/bash
-
-[[ "$-" != *x* ]] && _xtrace_was_off=1 && set -x
-
-TC_PATH="/data/nfs_home/sundares/miniforge3/envs/vllm_0.19.1_cpu/lib/libtcmalloc_minimal.so"
-IOMP_PATH="/swtools/intel/oneapi/2025.3/lib/libiomp5.so"
-
-export LD_PRELOAD="${TC_PATH}:${IOMP_PATH}${LD_PRELOAD:+:${LD_PRELOAD}}"
-
-if [[ -n "$_xtrace_was_off" ]]; then set +x; unset _xtrace_was_off; fi
-EOF
-mkdir -p ~/miniforge3/envs/vllm_0.19.1_cpu/etc/conda/deactivate.d
-cat > ~/miniforge3/envs/vllm_0.19.1_cpu/etc/conda/deactivate.d/cpu-vars.deactivate.sh << 'EOF'
-#!/bin/bash
-
-[[ "$-" != *x* ]] && _xtrace_was_off=1 && set -x
-
-TC_PATH="/data/nfs_home/sundares/miniforge3/envs/vllm_0.19.1_cpu/lib/libtcmalloc_minimal.so"
-IOMP_PATH="/swtools/intel/oneapi/2025.3/lib/libiomp5.so"
-
-LD_PRELOAD=":${LD_PRELOAD}:"
-LD_PRELOAD="${LD_PRELOAD//:${TC_PATH}:/:}"
-LD_PRELOAD="${LD_PRELOAD//:${IOMP_PATH}:/:}"
-# Collapse any consecutive colons left by the removals
-while [[ "$LD_PRELOAD" == *::* ]]; do LD_PRELOAD="${LD_PRELOAD//::/:}"; done
-LD_PRELOAD="${LD_PRELOAD#:}"
-LD_PRELOAD="${LD_PRELOAD%:}"
-if [[ -z "$LD_PRELOAD" ]]; then unset LD_PRELOAD; else export LD_PRELOAD; fi
-
-if [[ -n "$_xtrace_was_off" ]]; then set +x; unset _xtrace_was_off; fi
-EOF
-conda activate vllm_0.19.1_cpu
-pip install "pip<26"
-pip install -r requirements/cpu-build.txt --extra-index-url https://download.pytorch.org/whl/cpu
-pip install -r requirements/cpu.txt --extra-index-url https://download.pytorch.org/whl/cpu
-conda install -y gperftools
-rm -rf .deps dist *.egg-info
-# git ls-files --others --exclude='.vscode' --exclude='example*' --exclude="build*" --exclude=".deps" | xargs rm
-# VLLM_CPU_AMXBF16=true VLLM_TARGET_DEVICE=cpu pip install . --no-build-isolation -v --extra-index-url https://download.pytorch.org/whl/cpu 
-VLLM_CPU_AMXBF16=true VLLM_TARGET_DEVICE=cpu pip install -e . --no-build-isolation -v --extra-index-url https://download.pytorch.org/whl/cpu --config-settings editable_mode=strict
 TARGET_DIR=$(ls -dt build/__editable__.vllm-* 2>/dev/null | head -1) && \
 [ -n "$TARGET_DIR" ] || { echo "Error: No editable build directory found"; exit 1; } && \
 git ls-files --others --exclude='.vscode' --exclude='example*' --exclude="build*" --exclude=".deps" | \
@@ -125,8 +73,87 @@ grep -E "\.so$" | \
 while IFS= read -r file; do \
   mkdir -p "$TARGET_DIR/$(dirname "$file")" && \
   mv "$file" "$TARGET_DIR/$file" && \
-  echo "Moved: $file"; \
+  echo "Moved: $file to $TARGET_DIR/$file"; \
 done
+
+# Now for installing vllm-xpu-kernels
+pip uninstall vllm-xpu-kernels
+cd ..
+git clone --single-branch --branch copy_cache_flash https://github.com/Sundaresan-G/vllm-xpu-kernels.git
+cd vllm-xpu-kernels
+git checkout f86cd8ac855b61ac4839d9fe2fe3f390a9baae2f
+
+git submodule update --init --recursive
+pip install -r requirements.txt
+VLLM_CHUNK_PREFILL_CONFIG=chunk_prefill_default.conf VLLM_PAGED_DECODE_CONFIG=paged_decode_default.conf pip install --no-build-isolation . -v
+
+set +xe
+SCRIPT
+```
+## CPUs:
+```bash
+bash << 'SCRIPT' 2>&1 | tee build_cpu_0.23.0_$(date +%Y%m%d_%H%M%S).log
+set -xe
+# Ensure that the tag is present as it is needed for proper versioning purpose
+# git fetch origin tag v0.23.0 --no-tags
+# git reset --hard v0.23.0
+CONDA_BASE="/data/nfs_home/sundares/miniforge3"
+source $CONDA_BASE/etc/profile.d/conda.sh
+source /swtools/intel/2026.0/oneapi-vars.sh
+conda create -n vllm_0.23.0_cpu python==3.12 -y
+conda activate vllm_0.23.0_cpu
+pip install "pip<26"
+pip install -r requirements/cpu.txt --extra-index-url https://download.pytorch.org/whl/cpu
+pip install setuptools_rust
+pip install setuptools_scm
+conda install -y gperftools
+rm -rf .deps dist *.egg-info
+# git ls-files --others --exclude='.vscode' --exclude='example*' --exclude="build*" --exclude=".deps" | xargs rm
+# VLLM_CPU_AMXBF16=true VLLM_TARGET_DEVICE=cpu pip install . --no-build-isolation -v --extra-index-url https://download.pytorch.org/whl/cpu 
+VLLM_VERSION_OVERRIDE="v0.23.0" VLLM_CPU_AMXBF16=true VLLM_TARGET_DEVICE=cpu pip install -e . --no-build-isolation -v --extra-index-url https://download.pytorch.org/whl/cpu --config-settings editable_mode=strict
+TARGET_DIR=$(ls -dt build/__editable__.vllm-* 2>/dev/null | head -1) && \
+[ -n "$TARGET_DIR" ] || { echo "Error: No editable build directory found"; exit 1; } && \
+git ls-files --others --exclude='.vscode' --exclude='example*' --exclude="build*" --exclude=".deps" | \
+grep -E "\.so$" | \
+while IFS= read -r file; do \
+  mkdir -p "$TARGET_DIR/$(dirname "$file")" && \
+  mv "$file" "$TARGET_DIR/$file" && \
+  echo "Moved: $file to $TARGET_DIR/$file"; \
+done
+mkdir -p $CONDA_BASE/envs/vllm_0.23.0_cpu/etc/conda/activate.d
+cat > $CONDA_BASE/envs/vllm_0.23.0_cpu/etc/conda/activate.d/cpu-vars.activate.sh << EOF
+#!/bin/bash
+
+[[ "\$-" != *x* ]] && _xtrace_was_off=1 && set -x
+
+export LD_PRELOAD="\${TC_PATH}:\${IOMP_PATH}\${LD_PRELOAD:+:\${LD_PRELOAD}}"
+
+if [[ -n "\$_xtrace_was_off" ]]; then set +x; unset _xtrace_was_off; fi
+EOF
+mkdir -p $CONDA_BASE/envs/vllm_0.23.0_cpu/etc/conda/deactivate.d
+cat > $CONDA_BASE/envs/vllm_0.23.0_cpu/etc/conda/deactivate.d/cpu-vars.deactivate.sh << EOF
+#!/bin/bash
+
+[[ "\$-" != *x* ]] && _xtrace_was_off=1 && set -x
+
+TC_PATH="$CONDA_BASE/envs/vllm_0.23.0_cpu/lib/libtcmalloc_minimal.so"
+IOMP_PATH="/swtools/intel/2026.0/lib/libiomp5.so"
+
+LD_PRELOAD=":\${LD_PRELOAD}:"
+LD_PRELOAD="\${LD_PRELOAD//:\${TC_PATH}:/:}"
+LD_PRELOAD="\${LD_PRELOAD//:\${IOMP_PATH}:/:}"
+
+unset TC_PATH
+unset IOMP_PATH
+
+# Collapse any consecutive colons left by the removals
+while [[ "\$LD_PRELOAD" == *::* ]]; do LD_PRELOAD="\${LD_PRELOAD//::/:}"; done
+LD_PRELOAD="\${LD_PRELOAD#:}"
+LD_PRELOAD="\${LD_PRELOAD%:}"
+if [[ -z "\$LD_PRELOAD" ]]; then unset LD_PRELOAD; else export LD_PRELOAD; fi
+
+if [[ -n "\$_xtrace_was_off" ]]; then set +x; unset _xtrace_was_off; fi
+EOF
 set +xe
 SCRIPT
 ```
@@ -156,35 +183,12 @@ $(which vllm) serve $MODEL --port 9000 --max-model-len 9000     --max-num-seqs 1
 
 ### Intel GPU Server side
 ```bash
-export MODEL="Qwen/Qwen2.5-7B"
-export VLLM_LOGGING_LEVEL=DEBUG 
-# Optional
-export VLLM_KV_CACHE_LAYOUT="NHD"
-# Has effect for GPU only. For offloading KV cache to CPU
-export VLLM_OFFLOAD_KV_CACHE_TO_CPU=1 
-# TORCH_COMPILE_DISABLE=1
-# Remove profiler config if profiling not required
-$(which vllm) serve $MODEL --port 9000 --max-model-len 9000     --max-num-seqs 10     --max-num-batched-tokens 70000 --enforce-eager --no-enable-prefix-caching --block-size 64 --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile", "torch_profiler_record_shapes": 1, "torch_profiler_with_flops": 1, "torch_profiler_with_stack": 1, "torch_profiler_with_memory": 1}'
+sbatch pure_gpu_trial.sh
 ```
 
 ### CPU Server side
 ```bash
-# Update the below paths accordingly
-TC_PATH="/data/nfs_home/sundares/miniforge3/envs/vllm_0.19.1_cpu/lib/libtcmalloc_minimal.so"
-IOMP_PATH="/swtools/intel/oneapi/2025.3/lib/libiomp5.so"
-
-export LD_PRELOAD="${TC_PATH}:${IOMP_PATH}${LD_PRELOAD:+:${LD_PRELOAD}}"
-export MODEL="Qwen/Qwen3-30B-A3B"
-export VLLM_LOGGING_LEVEL=DEBUG 
-# Optional
-export VLLM_KV_CACHE_LAYOUT="NHD"
-# Has effect for CPU only
-export VLLM_CPU_SGL_KERNEL="1" 
-export VLLM_CPU_OMP_THREADS_BIND="0-63|64-127"
-export VLLM_CPU_KVCACHE_SPACE=40 
-# TORCH_COMPILE_DISABLE=1
-# Remove profiler config if profiling not required
-$(which vllm) serve $MODEL --port 9000 --max-model-len 9000     --max-num-seqs 10     --max-num-batched-tokens 70000 --enforce-eager --no-enable-prefix-caching --block-size 64 --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile", "torch_profiler_record_shapes": 1, "torch_profiler_with_flops": 1, "torch_profiler_with_stack": 1, "torch_profiler_with_memory": 1}'
+sbatch pure_cpu_trial.sh
 ```
 
 ## Evaluation Scripts - Client side:

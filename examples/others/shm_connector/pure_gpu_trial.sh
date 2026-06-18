@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --partition=b70x1
+#SBATCH --partition=bmtxg31
 #SBATCH --job-name=vllm_b70
 #SBATCH --output=slurm-b70-runs-%j.out
 #SBATCH --nodes=1
@@ -8,16 +8,24 @@
 
 set -x
 
+hostname
+lscpu
+numactl -H | grep -E 'node [0-9]+ (size|free)'
+
+# sudo /etc/pcl_cleanup_memory.sh
+# numactl -H | grep -E 'node [0-9]+ (size|free)'
+# ps aux --sort=-%mem | head -6
+
 PIDS=()
 # MODEL="sarvamai/sarvam-30b"
-# MODEL="Qwen/Qwen3-30B-A3B"
-MODEL="Qwen/Qwen2.5-1.5B"
+MODEL="Qwen/Qwen3-30B-A3B"
+# MODEL="Qwen/Qwen2.5-1.5B"
 INPUT_LEN=2048
 OUTPUT_LEN=8
-NUM_PROMPTS=32
+NUM_PROMPTS=8
 
 # GPU_ENV="vllm_0.19.1_cuda"
-GPU_ENV="vllm_0.19.1_xpu"
+GPU_ENV="vllm_0.23.0_xpu"
 
 CONDA_BASE="/data/nfs_home/sundares/miniforge3"
 SCRIPT_DIR="/data/nfs_home/sundares/vllm/vllm/examples/others/shm_connector"
@@ -85,6 +93,9 @@ wait_for_server() {
   log "Waiting for server on port $port..."
 
   while true; do
+
+    numactl -H | grep -E 'node [0-9]+ (size|free)'
+
     # Check if the process is still running before attempting curl
     if ! kill -0 "$pid" 2>/dev/null; then
         log "Process with PID $pid and port $port has terminated unexpectedly."
@@ -119,6 +130,7 @@ main() {
     source $CONDA_BASE/etc/profile.d/conda.sh
     conda activate $GPU_ENV
 
+    # python -m debugpy --listen 0.0.0.0:5678 --wait-for-client \
     # --offload-group-size 1 --offload-num-in-group 1 --offload-prefetch-step 2 \
     # --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile", "torch_profiler_record_shapes": 1, "torch_profiler_with_flops": 1, "torch_profiler_with_stack": 1, "torch_profiler_with_memory": 1}'
 
@@ -128,9 +140,9 @@ main() {
         # NEOReadDebugKeys=1 \
         # EnableSharedSystemUsmSupport=1 \
         VLLM_KV_CACHE_LAYOUT="NHD" \
-        VLLM_OFFLOAD_KV_CACHE_TO_CPU=0 \
+        VLLM_OFFLOAD_KV_CACHE_TO_CPU=1 \
         VLLM_XPU_ENABLE_XPU_GRAPH=0 \
-        $(which vllm) serve $MODEL --trust-remote-code --port 9000 --max-model-len 9000 --max-num-seqs 1  --enforce-eager   --max-num-batched-tokens 9000 --no-enable-prefix-caching --block-size 64 --num-gpu-blocks-override 150
+        $(which vllm) serve $MODEL --trust-remote-code --port 9000 --max-model-len 9000 --max-num-seqs 1  --enforce-eager   --max-num-batched-tokens 9000 --no-enable-prefix-caching --block-size 64 --num-gpu-blocks-override 150 --offload-group-size 1 --offload-num-in-group 1 --offload-prefetch-step 2 \
     ) &
 
     server_pid=$!
@@ -155,8 +167,8 @@ main() {
     $(which vllm) bench serve --port 9000 --seed $(date +%s) \
         --model $MODEL \
         --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN \
-        --num-prompts $NUM_PROMPTS --max-concurrency 8 \
-        2>&1 | tee benchmark.log
+        --num-prompts $NUM_PROMPTS --max-concurrency 1 \
+        2>&1 | tee benchmark_gpu.log
 
     # curl -X POST http://localhost:9000/v1/completions -H "Content-Type: application/json" -d '{    "model": "'"$MODEL"'",    "prompt": "Write a detailed, vivid, and slightly humorous free-verse poem about the craft of software engineering and coding. Touch on long nights spent debugging, collaborating with teammates, wrestling with legacy code, and the relief when all the tests finally pass. Use clear imagery, a hopeful tone.", "max_tokens": 10,    "temperature": 0.7  }' |& tee -a benchmark.log
 
@@ -206,10 +218,11 @@ main() {
       "prompt": [
         "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, and tensor parallelism to serve large language models efficiently. Requests are scheduled by a central scheduler that tracks per-request KV cache block allocations. The KV cache is divided into fixed-size blocks, and a block table maps logical blocks to physical GPU memory. Prefix caching reuses KV blocks for identical prompt prefixes across requests, avoiding redundant computation. Now answer the following question: What are the main benefits of prefix caching in LLM serving?"
       ],
+      "min_tokens": 32,
       "max_tokens": 200,
       "temperature": 0.7
     }' \
-    2>&1 | python3 -m json.tool --no-ensure-ascii 2>&1 | tee accuracy_test.log
+    2>&1 | tee accuracy_test_gpu.log
 
     curl --fail-with-body -X POST http://localhost:9000/v1/completions \
     -H "Content-Type: application/json" \
@@ -223,7 +236,7 @@ main() {
       "max_tokens": 200,
       "temperature": 0.7
     }' \
-    2>&1 | python3 -m json.tool --no-ensure-ascii 2>&1 | tee -a accuracy_test.log
+    2>&1 | tee -a accuracy_test_gpu.log
 
     cleanup success
 
