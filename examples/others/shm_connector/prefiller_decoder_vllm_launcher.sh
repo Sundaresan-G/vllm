@@ -62,15 +62,15 @@ elif [[ $1 == "decoder" ]]; then
     # OMP_NUM_THREADS=32 \
     # VLLM_CPU_OMP_THREADS_BIND="0-59|60-119" \
     # TORCH_COMPILE_DISABLE=1 \
-    VLLM_CPU_OMP_THREADS_BIND="0-30" \
-    VLLM_CPU_KVCACHE_SPACE=60 \
+    VLLM_CPU_KVCACHE_SPACE=6 \
+    VLLM_CPU_OMP_THREADS_BIND="0-59|60-119" \
     VLLM_CPU_SGL_KERNEL="1" \
     $(which vllm) serve $MODEL \
     --port 8200 \
     --trust-remote-code \
     --max-model-len 30000 \
     --max-num-seqs 10 \
-    --max-num-batched-tokens 50000 \
+    --max-num-batched-tokens 1000 \
     --block-size $BLOCK_SIZE \
     --enable-prefix-caching \
     -tp $VLLM_TP \

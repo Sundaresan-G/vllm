@@ -17,7 +17,7 @@ from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import (
     BlockIds,
     EngineId,
-    TpKVTopology,
+    TransferTopology,
     get_current_attn_backend,
     get_current_attn_backends,
     kv_postprocess_blksize_and_layout_on_receive,
@@ -296,6 +296,7 @@ class ShmConnectorScheduler:
         # New requests are added by update_state_after_alloc in
         # the scheduler. Used to make metadata passed to Worker.
         self._reqs_need_recv: dict[ReqId, tuple[Request, BlockIds]] = {}
+        self._reqs_need_recv_num_ext_tokens: dict[ReqId, int] = {}
         # Reqs to send and their expiration time
         self._reqs_need_send: dict[ReqId, float] = {}
         self._reqs_in_batch: set[ReqId] = set()
@@ -431,6 +432,7 @@ class ShmConnectorScheduler:
                         request,
                         local_block_ids,
                     )
+                    self._reqs_need_recv_num_ext_tokens[request.request_id] = num_external_tokens
 
                 else:
                     logger.warning(
@@ -456,7 +458,7 @@ class ShmConnectorScheduler:
                 request_id=req_id,
                 local_block_ids=block_ids,
                 kv_transfer_params=req.kv_transfer_params,
-                num_external_tokens=req.num_external_computed_tokens,
+                num_external_tokens=self._reqs_need_recv_num_ext_tokens.get(req_id, 0),
             )
 
         meta.send_ReqId2CompletionIdx = self._send_ReqId2CompletionIdx
@@ -467,6 +469,7 @@ class ShmConnectorScheduler:
 
         # Clear the list once workers start the transfers
         self._reqs_need_recv.clear()
+        self._reqs_need_recv_num_ext_tokens.clear()
         self._reqs_in_batch = set()
         self._reqs_not_processed = set()
         self._reqs_need_send = {}
@@ -675,7 +678,7 @@ class ShmConnectorWorker:
 
         # lazy initialized in register_kv_caches
         self.compat_hash: str | None = None
-        self.kv_topo: TpKVTopology | None = None
+        self.kv_topo: TransferTopology | None = None
 
         self._tp_size: dict[EngineId, int] = {self.engine_id: self.world_size}
         self._block_size: dict[EngineId, int] = {self.engine_id: self.block_size}
@@ -720,11 +723,11 @@ class ShmConnectorWorker:
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in nixl."""
-        self.kv_topo = TpKVTopology(
+        self.kv_topo = TransferTopology(
             tp_rank=self.tp_rank,
             engine_id=self.engine_id,
-            remote_tp_size=self._tp_size,  # shared state
-            remote_block_size=self._block_size,  # shared state
+            tp_size=self.world_size,
+            block_size=self.block_size,
             is_mla=self.use_mla,
             total_num_kv_heads=self.model_config.get_total_num_kv_heads(),
             attn_backends=self.attn_backends,
@@ -934,11 +937,11 @@ class ShmConnectorWorker:
 
             # Create a numpy int64 view over the shared buffer and store shape/stride
             meta_array = np.frombuffer(self.shm_kv_caches_metadata[layer_name].buf, dtype=np.int64, count=10)
-            for i in range(10):
-                if i < len(original_cache_shape):
-                    meta_array[i] = int(original_cache_shape[i])
-                else:
-                    meta_array[i] = int(original_cache_stride[i - len(original_cache_shape)])
+            meta_array[:] = 0  # zero all slots first
+            for i, v in enumerate(original_cache_shape):
+                meta_array[i] = int(v)
+            for i, v in enumerate(original_cache_stride):
+                meta_array[5 + i] = int(v)
 
             logger.debug(
                 "Created new shared memory for metadata with name %s (10 int64s) for layer %s and stored shape %s and stride %s",
@@ -1248,10 +1251,10 @@ class ShmConnectorWorker:
                 "local_physical_block_ids: %s. remote_block_ids: %s.",
                 req_id,
                 remote_engine_id,
-                len(meta.local_physical_block_ids[0]),
-                len(meta.remote.block_ids[0]),
-                meta.local_physical_block_ids[0],
-                meta.remote.block_ids[0],
+                len(meta.local_physical_block_ids),
+                len(meta.remote.block_ids),
+                meta.local_physical_block_ids,
+                meta.remote.block_ids,
             )
             # always store metadata for failure recovery
             self._recving_metadata[req_id] = meta
@@ -1351,8 +1354,9 @@ class ShmConnectorWorker:
                             dtype=np.int64,
                             count=10,
                         )
-                        remote_shape = tuple(int(meta_array[i]) for i in range(5))
-                        remote_stride = tuple(int(meta_array[i]) for i in range(5, 10))   
+                        ndim = sum(1 for i in range(5) if meta_array[i] != 0)
+                        remote_shape = tuple(int(meta_array[i]) for i in range(ndim))
+                        remote_stride = tuple(int(meta_array[i]) for i in range(5, 5 + ndim))   
 
                         # Now release the meta_array and remote_meta_shm_buffer references
                         del meta_array
@@ -1369,9 +1373,6 @@ class ShmConnectorWorker:
                             )
                         )
 
-                        # For difference in the block size position between GPU and CPU layouts
-                        self.remote_cached_kv_caches[remote_engine_id][layer_name][-1].transpose_(-2, -3)
-
                         logger.debug(f"Recreated remote KV cache tensor for engine {remote_engine_id} and layer {layer_name} and remote_tp_rank {remote_tp_rank} with shape {self.remote_cached_kv_caches[remote_engine_id][layer_name][-1].shape} and stride {self.remote_cached_kv_caches[remote_engine_id][layer_name][-1].stride()}")
 
                         # logger.debug(f"Remote cached KV cache[{layer_name}][0, 0, 0, 0, :4] = {self.remote_cached_kv_caches[remote_engine_id][layer_name][0, 0, 0, 0, :4]}")
@@ -1383,7 +1384,7 @@ class ShmConnectorWorker:
                 for remote_tp_rank, elem in enumerate(self.remote_cached_shm_kv_caches_completion_flags[remote_engine_id]):
                     flag_idx = meta.remote.completion_flag_idx
                     assert elem.buf[flag_idx] == True, (
-                        f"Remote block id {meta.remote.block_ids[0][-1]} for remote_tp_rank {remote_tp_rank} of engine {remote_engine_id} is not marked busy as expected.")
+                        f"Remote completion_flag_idx {flag_idx} for remote_tp_rank {remote_tp_rank} of engine {remote_engine_id} is not marked busy as expected.")
                     
             self.tp_group.barrier()
             
@@ -1432,11 +1433,15 @@ class ShmConnectorWorker:
                 f"Block size mismatch: local block size {self.block_size} vs remote block size {meta.remote.block_size}"
             )
 
+            # GPU layout is [num_blocks, 2, block_size, num_kv_heads, head_size] 
+            # CPU layout is [num_blocks, num_kv_heads, block_size, 2 * head_size]. 
+            # Since we only copy kv cache from GPU to CPU currently, we just need a view change for the last two dimensions. If we want to support CPU to GPU in the future, we may need to make this more general.
+
             # TODO: handle self.use_mla case
-            if self.device_type == "cpu":
-                kv_head_position = -3
-            else:
-                kv_head_position = -2
+            # local for CPU
+            local_num_kv_heads_position = -3
+            # remote for GPU
+            remote_num_kv_heads_position = -2
             
             copy_start_time = time.perf_counter()
 
@@ -1447,8 +1452,8 @@ class ShmConnectorWorker:
             for layer_name, remote_kv_caches in self.remote_cached_kv_caches[remote_engine_id].items():
 
                 # TODO: assuming all the tp ranks have the same number of kv heads. Need to generalize for heterogeneous TP.
-                remote_num_kv_heads = remote_kv_caches[0].shape[kv_head_position]
-                local_num_kv_heads = self.device_kv_caches[layer_name][0].shape[kv_head_position] 
+                remote_num_kv_heads = remote_kv_caches[0].shape[remote_num_kv_heads_position]
+                local_num_kv_heads = self.device_kv_caches[layer_name][0].shape[local_num_kv_heads_position] 
 
                 assert remote_num_kv_heads * remote_tp_size == local_num_kv_heads * self.world_size, (
                     f"Total number of kv heads mismatch between remote and local: "
@@ -1473,74 +1478,35 @@ class ShmConnectorWorker:
                 remote_kv_cache = remote_kv_caches[0]
                 if remote_tp_size > 1:                
                     remote_kv_cache = torch.cat(
-                        [x[:, curr_remote_block_ids] for x in remote_kv_caches[start_remote_rank:end_remote_rank]], 
-                        dim=kv_head_position
+                        [x[curr_remote_block_ids] for x in remote_kv_caches[start_remote_rank:end_remote_rank]], 
+                        dim=remote_num_kv_heads_position
                     )
                 else:
-                    remote_kv_cache = remote_kv_cache[:, curr_remote_block_ids]
+                    remote_kv_cache = remote_kv_cache[curr_remote_block_ids]
 
-                remote_kv_cache = remote_kv_cache[:, :, start_kv_head:end_kv_head]
+                remote_kv_cache = remote_kv_cache[:, :, :, start_kv_head:end_kv_head]
+
+                # For decoder and cross-attention, use KV cache, size are
+                # [num_blocks, num_kv_heads, block_size, 2 * head_size]
+                # Make a view [num_blocks, num_kv_heads, block_size * 2, head_size]
+                # Then slice KV at dim 2
+                kv_cache = self.device_kv_caches[layer_name]
+                num_blocks, num_kv_heads, block_size, _ = kv_cache.size()
+                kv_cache = kv_cache.view((num_blocks, num_kv_heads, block_size * 2, -1))
+                key_cache, value_cache = kv_cache.chunk(2, dim=2)
 
                 if slot_mapping.numel() > 0:
-                    keys, values = remote_kv_cache.unbind(0)
-                    key = keys.transpose(-2, -3)
-                    key = key.reshape(-1, key.shape[-2], key.shape[-1])
-                    value = values.transpose(-2, -3)
-                    value = value.reshape(-1, value.shape[-2], value.shape[-1])
+                    keys, values = remote_kv_cache.unbind(1)
+                    key = keys.flatten(0, -3)
+                    value = values.flatten(0, -3)
                     cpu_attn_reshape_and_cache(
                         key,
                         value,
-                        self.device_kv_caches[layer_name][0],
-                        self.device_kv_caches[layer_name][1],
+                        key_cache,
+                        value_cache,
                         slot_mapping,
                         isa
                     )
-
-                # keys, values = remote_kv_cache.unbind(0)
-                # for i in range(len(curr_remote_block_ids)):
-                #     remote_block_id = curr_remote_block_ids[i]
-                #     key = keys[remote_block_id].transpose(0, 1)
-                #     value = values[remote_block_id].transpose(0, 1)
-                #     cpu_attn_reshape_and_cache(
-                #         key,
-                #         value,
-                #         self.device_kv_caches[layer_name][0],
-                #         self.device_kv_caches[layer_name][1],
-                #         slot_mapping[i * self.block_size : (i + 1) * self.block_size],
-                #         isa
-                #     )
-
-                
-                # for i in range(len(meta.remote.block_ids)):
-                #     remote_block_id = meta.remote.block_ids[i]
-                #     local_block_id = meta.local_block_ids[i]
-                #     # Copy data from remote shared memory to local device cache
-                #     for j in range(2):  # For K and V
-                #         # assert self.device_kv_caches[layer_name][j][local_block_id].is_contiguous()
-                #         self.device_kv_caches[layer_name][j][local_block_id].copy_(
-                #             remote_kv_cache[j][remote_block_id]
-                #         )   
-                # 
-
-                    
-                # logger.debug(f"Remote cache[{layer_name}] data_ptr() = {remote_kv_cache.data_ptr()}")
-                # remote_k_cache = remote_kv_cache[0]
-                # # for remote_block_id in meta.remote.block_ids[:1]:
-                # #     logger.debug(f"{req_id}, {remote_block_id}, {remote_k_cache[remote_block_id][0][1][:20]}")
-                # for slot in [0, self.block_size, 55, 56, 57, 58]:
-                #     block_id = slot // self.block_size
-                #     offset = slot % self.block_size
-                #     logger.debug(f"Remote cache slot key_cache[{block_id} , 1, {offset}, :20] {slot}: {remote_k_cache[block_id, 1, offset, :20]}")
-
-
-                # logger.debug(f"local cache[{layer_name}] data_ptr() = {self.device_kv_caches[layer_name].data_ptr()}")
-                # local_k_cache = self.device_kv_caches[layer_name][0]
-                # # for local_block_id in meta.local_block_ids[:1]:
-                # #     logger.debug(f"{req_id}, {local_block_id}, {local_k_cache[local_block_id][0][1][:20]}")
-                # for slot in [self.block_size, 55, 56, 57, 58]:
-                #     block_id = slot // self.block_size
-                #     offset = slot % self.block_size
-                #     logger.debug(f"Local cache slot key_cache[{block_id} , 1, {offset}, :20] {slot}: {local_k_cache[block_id, 1, offset, :20]}") 
 
             self.tp_group.barrier()
             copy_end_time = time.perf_counter()

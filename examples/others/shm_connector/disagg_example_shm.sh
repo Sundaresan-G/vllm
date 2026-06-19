@@ -1,11 +1,11 @@
 #!/bin/bash
 ##SBATCH --partition=b70
 ##SBATCH -w pcl-zen4
-##SBATCH --partition=bmtxg31
+#SBATCH --partition=bmtxg31
 ##SBATCH --partition=rtx5070
 ##SBATCH --partition=h100
 ##SBATCH --cpus-per-task=60
-#SBATCH --partition=b70
+##SBATCH --partition=b70
 #SBATCH --job-name=vllm_b70
 #SBATCH --output=slurm-b70-runs-%j.out
 #SBATCH --nodes=1
@@ -13,6 +13,11 @@
 #SBATCH --time=02:59:00
 
 # echo "Warning: LMCache disaggregated prefill support for vLLM v1 is experimental and subject to change."
+
+set -x
+
+hostname
+numactl -H
 
 PIDS=()
 
@@ -32,54 +37,10 @@ INPUT_LEN=16384
 OUTPUT_LEN=32
 NUM_PROMPTS=8
 
-GPU_ENV="vllm_0.19.1_xpu"
-CPU_ENV="vllm_0.19.1_cpu"
+GPU_ENV="vllm_0.23.0_xpu"
+CPU_ENV="vllm_0.23.0_cpu"
 CONDA_BASE="/data/nfs_home/sundares/miniforge3"
 SHM_CONNECTOR_DIR="/data/nfs_home/sundares/vllm/vllm/examples/others/shm_connector"
-
-check_hf_token() {
-    if [ -z "$HF_TOKEN" ]; then
-        echo "HF_TOKEN is not set. Please set it to your Hugging Face token."
-        exit 1
-    fi
-    if [[ "$HF_TOKEN" != hf_* ]]; then
-        echo "HF_TOKEN is not a valid Hugging Face token. Please set it to your Hugging Face token."
-        exit 1
-    fi
-    echo "HF_TOKEN is set and valid."
-}
-
-check_num_gpus() {
-    # can you check if the number of GPUs are >=2 via nvidia-smi/rocm-smi?
-    which rocm-smi > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-	num_gpus=$(nvidia-smi --query-gpu=name --format=csv,noheader | wc -l)
-    else
-	num_gpus=$(rocm-smi --showid | grep Instinct | wc -l)
-    fi
-
-    if [ "$num_gpus" -lt 2 ]; then
-        echo "You need at least 2 GPUs to run disaggregated prefill."
-        exit 1
-    else
-        echo "Found $num_gpus GPUs."
-    fi
-}
-
-ensure_python_library_installed() {
-    echo "Checking if $1 is installed..."
-    python3 -c "import $1" > /dev/null 2>&1
-    if [ $? -ne 0 ]; then
-        if [ "$1" == "nixl" ]; then
-            echo "$1 is not installed. Please refer to https://github.com/ai-dynamo/nixl for installation."
-        else
-            echo "$1 is not installed. Please install it via pip install $1."
-        fi
-        exit 1
-    else
-        echo "$1 is installed."
-    fi
-}
 
 # Kill a PID and all its descendants at any depth (BFS collect, reverse kill)
 kill_tree() {
@@ -140,6 +101,9 @@ wait_for_server() {
   for (( k=0; k<${#ports[@]}; k++ )); do done_flags+=(0); done
 
   while true; do
+
+    numactl -H | grep -E 'node [0-9]+ (size|free)'
+
     local all_done=1
     for (( k=0; k<${#ports[@]}; k++ )); do
       [[ "${done_flags[$k]}" == "1" ]] && continue
@@ -175,16 +139,6 @@ wait_for_server() {
 
 main() {
 
-    set -x
-
-    # check_hf_token
-    # check_num_gpus
-    # ensure_python_library_installed lmcache
-    # ensure_python_library_installed nixl
-    # ensure_python_library_installed pandas
-    # ensure_python_library_installed datasets
-    # ensure_python_library_installed vllm
-
     trap cleanup INT
     trap cleanup TERM
 
@@ -195,7 +149,7 @@ main() {
         exec > >(tee decoder.log) 2>&1
         source $CONDA_BASE/etc/profile.d/conda.sh
         conda activate $CPU_ENV
-        VLLM_TP=1 \
+        VLLM_TP=2 \
         VLLM_LOGGING_PREFIX="DECODER " \
         bash prefiller_decoder_vllm_launcher.sh decoder $MODEL
     ) &
@@ -208,7 +162,7 @@ main() {
         conda activate $GPU_ENV
         # If VLLM_OFFLOAD_KV_CACHE_TO_CPU=1, then KV_BUFFER_DEVICE does not matter and it will be ignored.
         # ONEAPI_DEVICE_SELECTOR="level_zero:0,4;opencl:0,4" \
-        VLLM_TP=1 \
+        VLLM_TP=4 \
         VLLM_LOGGING_PREFIX="PREFILLER " \
         bash prefiller_decoder_vllm_launcher.sh prefiller $MODEL
     ) &

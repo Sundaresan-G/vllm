@@ -99,7 +99,7 @@ set -xe
 # git reset --hard v0.23.0
 CONDA_BASE="/data/nfs_home/sundares/miniforge3"
 source $CONDA_BASE/etc/profile.d/conda.sh
-source /swtools/intel/2026.0/oneapi-vars.sh
+source /swtools/intel/2025.3/oneapi-vars.sh
 conda create -n vllm_0.23.0_cpu python==3.12 -y
 conda activate vllm_0.23.0_cpu
 pip install "pip<26"
@@ -126,6 +126,9 @@ cat > $CONDA_BASE/envs/vllm_0.23.0_cpu/etc/conda/activate.d/cpu-vars.activate.sh
 
 [[ "\$-" != *x* ]] && _xtrace_was_off=1 && set -x
 
+TC_PATH="$CONDA_BASE/envs/vllm_0.23.0_cpu/lib/libtcmalloc_minimal.so"
+IOMP_PATH="/swtools/intel/2025.3/lib/libiomp5.so"
+
 export LD_PRELOAD="\${TC_PATH}:\${IOMP_PATH}\${LD_PRELOAD:+:\${LD_PRELOAD}}"
 
 if [[ -n "\$_xtrace_was_off" ]]; then set +x; unset _xtrace_was_off; fi
@@ -135,9 +138,6 @@ cat > $CONDA_BASE/envs/vllm_0.23.0_cpu/etc/conda/deactivate.d/cpu-vars.deactivat
 #!/bin/bash
 
 [[ "\$-" != *x* ]] && _xtrace_was_off=1 && set -x
-
-TC_PATH="$CONDA_BASE/envs/vllm_0.23.0_cpu/lib/libtcmalloc_minimal.so"
-IOMP_PATH="/swtools/intel/2026.0/lib/libiomp5.so"
 
 LD_PRELOAD=":\${LD_PRELOAD}:"
 LD_PRELOAD="\${LD_PRELOAD//:\${TC_PATH}:/:}"
