@@ -77,14 +77,18 @@ while IFS= read -r file; do \
 done
 
 # Now for installing vllm-xpu-kernels
-pip uninstall vllm-xpu-kernels
+pip uninstall -y vllm-xpu-kernels
 cd ..
 git clone --single-branch --branch copy_cache_flash https://github.com/Sundaresan-G/vllm-xpu-kernels.git
 cd vllm-xpu-kernels
+git fetch origin tag v0.1.10 --no-tags
 git checkout f86cd8ac855b61ac4839d9fe2fe3f390a9baae2f
 
 git submodule update --init --recursive
 pip install -r requirements.txt
+# Remove torch 2.12
+pip uninstall -y torch
+pip install torch==2.11+xpu --extra-index-url=https://download.pytorch.org/whl/xpu
 VLLM_CHUNK_PREFILL_CONFIG=chunk_prefill_default.conf VLLM_PAGED_DECODE_CONFIG=paged_decode_default.conf pip install --no-build-isolation . -v
 
 set +xe
