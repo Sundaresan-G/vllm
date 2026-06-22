@@ -864,7 +864,7 @@ class ShmConnectorWorker:
 
             # cache_or_caches[0, 0, 0, 0, :4] = torch.tensor([1, 2, 3, 4], dtype=cache_or_caches.dtype)
 
-            cache_list = cache_or_caches if self.kv_topo.split_k_and_v else [cache_or_caches]
+            cache_list = [cache_or_caches]
 
             for cache in cache_list:
                 base_addr = cache.data_ptr()
