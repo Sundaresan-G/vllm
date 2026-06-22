@@ -60,11 +60,10 @@ elif [[ $1 == "decoder" ]]; then
 
     # 2nd GPU as decoder
     # OMP_NUM_THREADS=32 \
-    # VLLM_CPU_OMP_THREADS_BIND="0-59|60-119" \
-    # TORCH_COMPILE_DISABLE=1 \
+    # VLLM_CPU_OMP_THREADS_BIND="0-15|16-31" \
     VLLM_CPU_KVCACHE_SPACE=6 \
-    VLLM_CPU_OMP_THREADS_BIND="0-59|60-119" \
     VLLM_CPU_SGL_KERNEL="1" \
+    numactl --cpunodebind=0,1 --membind=0,1 \
     $(which vllm) serve $MODEL \
     --port 8200 \
     --trust-remote-code \

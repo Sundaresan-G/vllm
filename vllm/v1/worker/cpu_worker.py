@@ -55,7 +55,7 @@ class CPUWorker(Worker):
                 allowed_memory_nodes,
             )
 
-        torch.ops._C.init_cpu_memory_env([cpu_core.numa_node])
+        # torch.ops._C.init_cpu_memory_env([cpu_core.numa_node])
 
         memory_status = get_memory_node_info(cpu_core.numa_node)
         memory_fraction = vllm_config.cache_config.gpu_memory_utilization
