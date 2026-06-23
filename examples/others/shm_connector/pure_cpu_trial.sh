@@ -12,11 +12,16 @@ set -x
 hostname
 lscpu
 numactl -H | grep -E 'node [0-9]+ (size|free)'
+for node in /sys/devices/system/node/node[0-9]*; do
+    nid=$(basename $node | tr -d 'node')
+    awk -v n=$nid '/MemTotal/{t=$4} /MemFree/{f=$4} /FilePages/{c=$4} /Slab/{s=$4} END{printf "node%s: total=%dGB free=%dGB actual_used=%dGB page_cache=%dGB\n", n, t/1024/1024, f/1024/1024, (t-f-c-s)/1024/1024, (c+s)/1024/1024}' $node/meminfo
+done
 
 PIDS=()
 # MODEL="sarvamai/sarvam-30b"
 # MODEL="Qwen/Qwen3-30B-A3B"
-MODEL="Qwen/Qwen2.5-1.5B"
+# MODEL="Qwen/Qwen2.5-1.5B"
+MODEL="Qwen/Qwen3-235B-A22B"
 INPUT_LEN=2048
 OUTPUT_LEN=8
 NUM_PROMPTS=8
@@ -91,6 +96,10 @@ wait_for_server() {
   while true; do
     
     numactl -H | grep -E 'node [0-9]+ (size|free)'
+    for node in /sys/devices/system/node/node[0-9]*; do
+        nid=$(basename $node | tr -d 'node')
+        awk -v n=$nid '/MemTotal/{t=$4} /MemFree/{f=$4} /FilePages/{c=$4} /Slab/{s=$4} END{printf "node%s: total=%dGB free=%dGB actual_used=%dGB page_cache=%dGB\n", n, t/1024/1024, f/1024/1024, (t-f-c-s)/1024/1024, (c+s)/1024/1024}' $node/meminfo
+    done
     
     # Check if the process is still running before attempting curl
     if ! kill -0 "$pid" 2>/dev/null; then
@@ -132,12 +141,13 @@ main() {
 
     # If VLLM_OFFLOAD_KV_CACHE_TO_CPU=1, then KV_BUFFER_DEVICE does not matter and it will be ignored.
     (
-        # VLLM_CPU_KVCACHE_SPACE=4 \
+        VLLM_CPU_KVCACHE_SPACE=10 \
         VLLM_CPU_SGL_KERNEL="1" \
         VLLM_CPU_OMP_THREADS_BIND="0-63|64-127" \
         VLLM_KV_CACHE_LAYOUT="NHD" \
         VLLM_XPU_ENABLE_XPU_GRAPH=0 \
-        $(which vllm) serve $MODEL --trust-remote-code --port 9000 --max-model-len 9000 --max-num-seqs 1  --enforce-eager   --max-num-batched-tokens 9000 --no-enable-prefix-caching --block-size 64 --num-gpu-blocks-override 150
+        numactl -N 0-1 -m 0-1 \
+        $(which vllm) serve $MODEL --trust-remote-code --port 9000 --max-model-len 9000 --max-num-seqs 1  --enforce-eager   --max-num-batched-tokens 9000 -tp 2 --no-enable-prefix-caching --block-size 64 --num-gpu-blocks-override 150
     ) &
 
     server_pid=$!

@@ -11,6 +11,11 @@ set -x
 hostname
 lscpu
 numactl -H | grep -E 'node [0-9]+ (size|free)'
+for node in /sys/devices/system/node/node[0-9]*; do
+    nid=$(basename $node | tr -d 'node')
+    awk -v n=$nid '/MemTotal/{t=$4} /MemFree/{f=$4} /FilePages/{c=$4} /Slab/{s=$4} END{printf "node%s: total=%dGB free=%dGB actual_used=%dGB page_cache=%dGB\n", n, t/1024/1024, f/1024/1024, (t-f-c-s)/1024/1024, (c+s)/1024/1024}' $node/meminfo
+done
+sudo nvtop -s | grep mem_util | awk '{print "GPU " NR-1 ":", $0}'
 
 # sudo /etc/pcl_cleanup_memory.sh
 # numactl -H | grep -E 'node [0-9]+ (size|free)'
@@ -18,7 +23,8 @@ numactl -H | grep -E 'node [0-9]+ (size|free)'
 
 PIDS=()
 # MODEL="sarvamai/sarvam-30b"
-MODEL="Qwen/Qwen3-30B-A3B"
+# MODEL="Qwen/Qwen3-30B-A3B"
+MODEL="Qwen/Qwen3-235B-A22B"
 # MODEL="Qwen/Qwen2.5-1.5B"
 INPUT_LEN=2048
 OUTPUT_LEN=8
@@ -95,6 +101,11 @@ wait_for_server() {
   while true; do
 
     numactl -H | grep -E 'node [0-9]+ (size|free)'
+    for node in /sys/devices/system/node/node[0-9]*; do
+        nid=$(basename $node | tr -d 'node')
+        awk -v n=$nid '/MemTotal/{t=$4} /MemFree/{f=$4} /FilePages/{c=$4} /Slab/{s=$4} END{printf "node%s: total=%dGB free=%dGB actual_used=%dGB page_cache=%dGB\n", n, t/1024/1024, f/1024/1024, (t-f-c-s)/1024/1024, (c+s)/1024/1024}' $node/meminfo
+    done
+    sudo nvtop -s | grep mem_util | awk '{print "GPU " NR-1 ":", $0}'
 
     # Check if the process is still running before attempting curl
     if ! kill -0 "$pid" 2>/dev/null; then
@@ -136,13 +147,17 @@ main() {
 
     # If VLLM_OFFLOAD_KV_CACHE_TO_CPU=1, then KV_BUFFER_DEVICE does not matter and it will be ignored.
     (
-        # ONEAPI_DEVICE_SELECTOR="level_zero:0,4;opencl:0,4" \
+        export ONEAPI_DEVICE_SELECTOR="level_zero:0,4;"
+
+        sycl-ls --verbose 
+
         # NEOReadDebugKeys=1 \
         # EnableSharedSystemUsmSupport=1 \
         VLLM_KV_CACHE_LAYOUT="NHD" \
         VLLM_OFFLOAD_KV_CACHE_TO_CPU=1 \
         VLLM_XPU_ENABLE_XPU_GRAPH=0 \
-        $(which vllm) serve $MODEL --trust-remote-code --port 9000 --max-model-len 9000 --max-num-seqs 1  --enforce-eager   --max-num-batched-tokens 9000 --no-enable-prefix-caching --block-size 64 --num-gpu-blocks-override 150 --offload-group-size 1 --offload-num-in-group 1 --offload-prefetch-step 2 \
+        $(which vllm) serve $MODEL --trust-remote-code \
+        --port 9000 --max-model-len 9000 --max-num-seqs 1  --enforce-eager -tp 2  --max-num-batched-tokens 9000 --no-enable-prefix-caching --block-size 64 --num-gpu-blocks-override 150 --offload-group-size 1 --offload-num-in-group 1 --offload-prefetch-step 2 \
     ) &
 
     server_pid=$!

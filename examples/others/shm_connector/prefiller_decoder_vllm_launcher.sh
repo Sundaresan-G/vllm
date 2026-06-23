@@ -61,9 +61,10 @@ elif [[ $1 == "decoder" ]]; then
     # 2nd GPU as decoder
     # OMP_NUM_THREADS=32 \
     # VLLM_CPU_OMP_THREADS_BIND="0-15|16-31" \
+    NUMA_NODES=$(numactl -H | grep "^node [0-9]* cpus:" | awk '{print $2}' | tr '\n' ',' | sed 's/,$//') \
     VLLM_CPU_KVCACHE_SPACE=6 \
     VLLM_CPU_SGL_KERNEL="1" \
-    numactl --cpunodebind=0,1 --membind=0,1 \
+    numactl --cpunodebind=${NUMA_NODES} --membind=${NUMA_NODES} \
     $(which vllm) serve $MODEL \
     --port 8200 \
     --trust-remote-code \
