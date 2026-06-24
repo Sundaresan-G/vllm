@@ -1091,6 +1091,53 @@ async def benchmark(
         process_one_metric("itl", "ITL", "Inter-token Latency")
     process_one_metric("e2el", "E2EL", "End-to-end Latency")
 
+    if task_type == TaskType.GENERATION and tokenizer:
+        successful_outputs = [o for o in outputs if o.success]
+        if successful_outputs:
+            print("{s:{c}^{n}}".format(s=" Per-Request Metrics ", n=50, c="-"))
+            print(
+                "{:<6} {:>12} {:>12} {:>8} {:>13} {:>8} {:>12} {:>13} {:>12} {:>8} {:>26} {:>26}".format(
+                    "Req", "TTFT(ms)", "MaxITL(ms)", "MaxIdx",
+                    "2ndMaxITL(ms)", "2ndIdx",
+                    "MeanITL(ms)", "MedianITL(ms)", "MinITL(ms)", "MinIdx",
+                    "StartTime", "EndTime"
+                )
+            )
+            for i, o in enumerate(successful_outputs):
+                nan = float("nan")
+                if o.itl:
+                    itl_ms_orig = [x * 1000 for x in o.itl]
+                    itl_ms = sorted(itl_ms_orig, reverse=True)
+                    max_itl   = itl_ms[0]
+                    max2_itl  = itl_ms[1] if len(itl_ms) > 1 else nan
+                    mean_itl  = float(np.mean(itl_ms))
+                    med_itl   = float(np.median(itl_ms))
+                    min_itl   = itl_ms[-1]
+                    sorted_idx = np.argsort(itl_ms_orig)[::-1]
+                    max_pos   = int(sorted_idx[0])
+                    max2_pos  = int(sorted_idx[1]) if len(itl_ms_orig) > 1 else nan
+                    min_pos   = int(sorted_idx[-1])
+                else:
+                    max_itl = max2_itl = mean_itl = med_itl = min_itl = nan
+                    max_pos = max2_pos = min_pos = nan
+                start_dt = datetime.fromtimestamp(o.start_time).strftime(
+                    "%Y-%m-%d %H:%M:%S.%f"
+                )
+                end_dt = datetime.fromtimestamp(o.start_time + o.latency).strftime(
+                    "%Y-%m-%d %H:%M:%S.%f"
+                )
+                print(
+                    "{:<6} {:>12.2f} {:>12.2f} {:>8} {:>13.2f} {:>8} {:>12.2f} {:>13.2f} {:>12.2f} {:>8} {:>26} {:>26}".format(
+                        i,
+                        o.ttft * 1000,
+                        max_itl, max_pos,
+                        max2_itl, max2_pos,
+                        mean_itl, med_itl,
+                        min_itl, min_pos,
+                        start_dt, end_dt,
+                    )
+                )
+
     if spec_decode_stats is not None:
         print("{s:{c}^{n}}".format(s="Speculative Decoding", n=50, c="-"))
         print(
