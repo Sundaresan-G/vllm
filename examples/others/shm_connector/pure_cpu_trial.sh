@@ -19,11 +19,11 @@ done
 
 PIDS=()
 # MODEL="sarvamai/sarvam-30b"
-# MODEL="Qwen/Qwen3-30B-A3B"
+MODEL="Qwen/Qwen3-30B-A3B"
 # MODEL="Qwen/Qwen2.5-1.5B"
-MODEL="Qwen/Qwen3-235B-A22B"
-INPUT_LEN=2048
-OUTPUT_LEN=8
+# MODEL="Qwen/Qwen3-235B-A22B"
+INPUT_LEN=16384
+OUTPUT_LEN=32
 NUM_PROMPTS=8
 
 CPU_ENV="vllm_0.23.0_cpu"
@@ -146,8 +146,7 @@ main() {
         VLLM_CPU_OMP_THREADS_BIND="0-63|64-127" \
         VLLM_KV_CACHE_LAYOUT="NHD" \
         VLLM_XPU_ENABLE_XPU_GRAPH=0 \
-        numactl -N 0-1 -m 0-1 \
-        $(which vllm) serve $MODEL --trust-remote-code --port 9000 --max-model-len 9000 --max-num-seqs 1  --enforce-eager   --max-num-batched-tokens 9000 -tp 2 --no-enable-prefix-caching --block-size 64 --num-gpu-blocks-override 150
+        $(which vllm) serve $MODEL --trust-remote-code --port 9000 --max-model-len 20000 --max-num-seqs 1  --max-num-batched-tokens 20000 -tp 2 --no-enable-prefix-caching --block-size 64
     ) &
 
     server_pid=$!

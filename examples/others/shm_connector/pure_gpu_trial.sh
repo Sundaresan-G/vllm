@@ -4,7 +4,7 @@
 #SBATCH --output=slurm-b70-runs-%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --time=01:59:00
+#SBATCH --time=00:59:00
 
 set -x
 
@@ -23,11 +23,11 @@ sudo nvtop -s | grep mem_util | awk '{print "GPU " NR-1 ":", $0}'
 
 PIDS=()
 # MODEL="sarvamai/sarvam-30b"
-# MODEL="Qwen/Qwen3-30B-A3B"
-MODEL="Qwen/Qwen3-235B-A22B"
+MODEL="Qwen/Qwen3-30B-A3B"
+# MODEL="Qwen/Qwen3-235B-A22B"
 # MODEL="Qwen/Qwen2.5-1.5B"
-INPUT_LEN=2048
-OUTPUT_LEN=8
+INPUT_LEN=16384
+OUTPUT_LEN=4
 NUM_PROMPTS=8
 
 # GPU_ENV="vllm_0.19.1_cuda"
@@ -35,6 +35,11 @@ GPU_ENV="vllm_0.23.0_xpu"
 
 CONDA_BASE="/data/nfs_home/sundares/miniforge3"
 SCRIPT_DIR="/data/nfs_home/sundares/vllm/vllm/examples/others/shm_connector"
+
+# export SYCL_UR_USE_LEVEL_ZERO_V2=0
+# export LD_PRELOAD=/scratch/ddkalamk/mtrace/mDevTrace.so
+# export MDEVTRACE_BT_SIZE=$((10*1024*1024)) 
+# export MDEVTRACE_BT_FRAMES=24
 
 export VLLM_LOGGING_LEVEL=DEBUG
 
@@ -147,7 +152,10 @@ main() {
 
     # If VLLM_OFFLOAD_KV_CACHE_TO_CPU=1, then KV_BUFFER_DEVICE does not matter and it will be ignored.
     (
-        export ONEAPI_DEVICE_SELECTOR="level_zero:0,4;"
+        # export ONEAPI_DEVICE_SELECTOR="level_zero:0,4;"
+        # export ONEAPI_DEVICE_SELECTOR="level_zero:0,1;"
+        # export ONEAPI_DEVICE_SELECTOR="level_zero:0,1,2,3;"
+        export ONEAPI_DEVICE_SELECTOR="level_zero:0,1,4,5;"
 
         sycl-ls --verbose 
 
@@ -157,7 +165,7 @@ main() {
         VLLM_OFFLOAD_KV_CACHE_TO_CPU=1 \
         VLLM_XPU_ENABLE_XPU_GRAPH=0 \
         $(which vllm) serve $MODEL --trust-remote-code \
-        --port 9000 --max-model-len 9000 --max-num-seqs 1  --enforce-eager -tp 2  --max-num-batched-tokens 9000 --no-enable-prefix-caching --block-size 64 --num-gpu-blocks-override 150 --offload-group-size 1 --offload-num-in-group 1 --offload-prefetch-step 2 \
+        --port 9000 --max-model-len 20000 --max-num-seqs 10  --enforce-eager -tp 4  --max-num-batched-tokens 20000 --no-enable-prefix-caching --block-size 64 --num-gpu-blocks-override 350 --offload-group-size 1 --offload-num-in-group 1 --offload-prefetch-step 2 \
     ) &
 
     server_pid=$!
@@ -239,19 +247,19 @@ main() {
     }' \
     2>&1 | tee accuracy_test_gpu.log
 
-    curl --fail-with-body -X POST http://localhost:9000/v1/completions \
-    -H "Content-Type: application/json" \
-    -d '{
-      "model": "'"$MODEL"'",
-      "prompt": [
-        "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, and tensor parallelism to serve large language models efficiently. Requests are scheduled by a central scheduler that tracks per-request KV cache block allocations. The KV cache is divided into fixed-size blocks, and a block table maps logical blocks to physical GPU memory. Prefix caching reuses KV blocks for identical prompt prefixes across requests, avoiding redundant computation. Now answer the following question: What are the main benefits of prefix caching in LLM serving?",
-        "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, and tensor parallelism to serve large language models efficiently. Requests are scheduled by a central scheduler that tracks per-request KV cache block allocations. The KV cache is divided into fixed-size blocks, and a block table maps logical blocks to physical GPU memory. Prefix caching reuses KV blocks for identical prompt prefixes across requests, avoiding redundant computation. Now answer the following question: How does block-level prefix caching differ from token-level caching?",
-        "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, and tensor parallelism to serve large language models efficiently. Requests are scheduled by a central scheduler that tracks per-request KV cache block allocations. The KV cache is divided into fixed-size blocks, and a block table maps logical blocks to physical GPU memory. Prefix caching reuses KV blocks for identical prompt prefixes across requests, avoiding redundant computation. Now answer the following question: What workloads benefit most from prefix caching and why?"
-      ],
-      "max_tokens": 200,
-      "temperature": 0.7
-    }' \
-    2>&1 | tee -a accuracy_test_gpu.log
+    # curl --fail-with-body -X POST http://localhost:9000/v1/completions \
+    # -H "Content-Type: application/json" \
+    # -d '{
+    #   "model": "'"$MODEL"'",
+    #   "prompt": [
+    #     "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, and tensor parallelism to serve large language models efficiently. Requests are scheduled by a central scheduler that tracks per-request KV cache block allocations. The KV cache is divided into fixed-size blocks, and a block table maps logical blocks to physical GPU memory. Prefix caching reuses KV blocks for identical prompt prefixes across requests, avoiding redundant computation. Now answer the following question: What are the main benefits of prefix caching in LLM serving?",
+    #     "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, and tensor parallelism to serve large language models efficiently. Requests are scheduled by a central scheduler that tracks per-request KV cache block allocations. The KV cache is divided into fixed-size blocks, and a block table maps logical blocks to physical GPU memory. Prefix caching reuses KV blocks for identical prompt prefixes across requests, avoiding redundant computation. Now answer the following question: How does block-level prefix caching differ from token-level caching?",
+    #     "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, and tensor parallelism to serve large language models efficiently. Requests are scheduled by a central scheduler that tracks per-request KV cache block allocations. The KV cache is divided into fixed-size blocks, and a block table maps logical blocks to physical GPU memory. Prefix caching reuses KV blocks for identical prompt prefixes across requests, avoiding redundant computation. Now answer the following question: What workloads benefit most from prefix caching and why?"
+    #   ],
+    #   "max_tokens": 200,
+    #   "temperature": 0.7
+    # }' \
+    # 2>&1 | tee -a accuracy_test_gpu.log
 
     cleanup success
 

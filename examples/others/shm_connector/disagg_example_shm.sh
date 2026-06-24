@@ -6,8 +6,8 @@
 ##SBATCH --partition=h100
 ##SBATCH --cpus-per-task=60
 ##SBATCH --partition=b70
-#SBATCH --job-name=vllm_b70
-#SBATCH --output=slurm-b70-runs-%j.out
+#SBATCH --job-name=vllm_b70_disagg
+#SBATCH --output=slurm-b70-disagg-%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time=02:59:00
@@ -17,7 +17,13 @@
 set -x
 
 hostname
+lscpu
 numactl -H
+for node in /sys/devices/system/node/node[0-9]*; do
+    nid=$(basename $node | tr -d 'node')
+    awk -v n=$nid '/MemTotal/{t=$4} /MemFree/{f=$4} /FilePages/{c=$4} /Slab/{s=$4} END{printf "node%s: total=%dGB free=%dGB actual_used=%dGB page_cache=%dGB\n", n, t/1024/1024, f/1024/1024, (t-f-c-s)/1024/1024, (c+s)/1024/1024}' $node/meminfo
+done
+sudo nvtop -s | grep mem_util | awk '{print "GPU " NR-1 ":", $0}'
 
 PIDS=()
 
@@ -103,6 +109,11 @@ wait_for_server() {
   while true; do
 
     numactl -H | grep -E 'node [0-9]+ (size|free)'
+    for node in /sys/devices/system/node/node[0-9]*; do
+        nid=$(basename $node | tr -d 'node')
+        awk -v n=$nid '/MemTotal/{t=$4} /MemFree/{f=$4} /FilePages/{c=$4} /Slab/{s=$4} END{printf "node%s: total=%dGB free=%dGB actual_used=%dGB page_cache=%dGB\n", n, t/1024/1024, f/1024/1024, (t-f-c-s)/1024/1024, (c+s)/1024/1024}' $node/meminfo
+    done
+    sudo nvtop -s | grep mem_util | awk '{print "GPU " NR-1 ":", $0}'
 
     local all_done=1
     for (( k=0; k<${#ports[@]}; k++ )); do
@@ -216,14 +227,20 @@ main() {
         conda activate $GPU_ENV
         $(which vllm) bench serve --port 9000 --seed $(date +%s) \
             --model $MODEL \
-            --dataset-name prefix_repetition \
-            --prefix-repetition-prefix-len $((INPUT_LEN/2)) \
-            --prefix-repetition-suffix-len $((INPUT_LEN/2)) \
-            --prefix-repetition-num-prefixes 2 \
-            --prefix-repetition-output-len $OUTPUT_LEN \
-            --num-prompts $NUM_PROMPTS \
-            --max-concurrency 1 \
-            2>&1 | tee benchmark_prefix_caching.log
+            --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN \
+            --num-prompts $NUM_PROMPTS --max-concurrency 1 \
+            2>&1 | tee benchmark.log
+
+        # $(which vllm) bench serve --port 9000 --seed $(date +%s) \
+        #     --model $MODEL \
+        #     --dataset-name prefix_repetition \
+        #     --prefix-repetition-prefix-len $((INPUT_LEN/2)) \
+        #     --prefix-repetition-suffix-len $((INPUT_LEN/2)) \
+        #     --prefix-repetition-num-prefixes 2 \
+        #     --prefix-repetition-output-len $OUTPUT_LEN \
+        #     --num-prompts $NUM_PROMPTS \
+        #     --max-concurrency 1 \
+        #     2>&1 | tee benchmark_prefix_caching.log
 
         curl --fail-with-body -X POST http://localhost:9000/v1/completions \
         -H "Content-Type: application/json" \

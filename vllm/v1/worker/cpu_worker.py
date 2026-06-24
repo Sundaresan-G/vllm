@@ -43,21 +43,20 @@ class CPUWorker(Worker):
         # TODO: optimize for `interleaved` policy
         # Bind memory node
         allowed_memory_nodes = get_visible_memory_node()
-        allowed_cpu_list = get_allowed_cpu_list()
-        cpu_core = allowed_cpu_list[0]
+        current_numa_node = allowed_memory_nodes[rank % len(allowed_memory_nodes)]
 
         # TODO: some CI hosts are not correctly set, change to assertion
         # after fix
-        if cpu_core.numa_node not in allowed_memory_nodes:
+        if current_numa_node not in allowed_memory_nodes:
             logger.warning(
                 "Node %s is not in available memory nodes %s.",
-                cpu_core.numa_node,
+                current_numa_node,
                 allowed_memory_nodes,
             )
 
-        # torch.ops._C.init_cpu_memory_env([cpu_core.numa_node])
+        torch.ops._C.init_cpu_memory_env([current_numa_node])
 
-        memory_status = get_memory_node_info(cpu_core.numa_node)
+        memory_status = get_memory_node_info(current_numa_node)
         memory_fraction = vllm_config.cache_config.gpu_memory_utilization
         self.requested_cpu_memory = math.ceil(
             memory_status.total_memory * memory_fraction
@@ -69,7 +68,7 @@ class CPUWorker(Worker):
             and self.requested_cpu_memory > available_memory
         ):
             raise ValueError(
-                f"Available memory on node {cpu_core.numa_node} "
+                f"Available memory on node {current_numa_node} "
                 f"({format_gib(available_memory)}/"
                 f"{format_gib(memory_status.total_memory)} GiB) on startup "
                 f"is less than desired CPU memory utilization "
