@@ -1396,14 +1396,28 @@ class ShmConnectorWorker:
             logger.debug(f"meta.local_block_ids = {meta.local_block_ids}")
             logger.debug(f"meta.remote.block_ids = {meta.remote.block_ids}")
 
-            n_remote = len(meta.remote.block_ids[0])
-            n_local = len(meta.local_block_ids[0])
-            if n_remote <= n_local:
+            # Full prefix cache hit on decoder: local_block_ids is empty because
+            # num_external_tokens == 0 and no new blocks were allocated.
+            # Nothing to copy — skip straight to the completion-flag cleanup below
+            # so the prefiller's SHM is freed correctly.
+            if not meta.local_block_ids:
+                curr_local_block_ids = []
+                curr_remote_block_ids = []
+                logger.debug(
+                    "Full prefix cache hit on decoder for request %s: "
+                    "local_block_ids is empty, skipping KV copy.",
+                    req_id,
+                )
+            else:
+                n_remote = len(meta.remote.block_ids[0])
+                n_local = len(meta.local_block_ids[0])
+
+            if meta.local_block_ids and n_remote <= n_local:
                 # Normal case: remote has fewer or equal blocks than local.
                 # Copy all remote blocks into the first n_remote local slots.
                 curr_local_block_ids = meta.local_block_ids[0][:n_remote]
                 curr_remote_block_ids = meta.remote.block_ids[0]
-            else:
+            elif meta.local_block_ids:
                 # Prefix cache hit on decoder: remote has more blocks than local
                 # because some prefix blocks are already in the decoder's cache.
                 # The decoder allocated n_local blocks: (n_to_copy new prefix blocks)
