@@ -16,14 +16,39 @@
 
 set -x
 
+# MODEL="Qwen/Qwen2.5-1.5B-Instruct"
+# MODEL="Qwen/Qwen2.5-7B"
+MODEL="Qwen/Qwen3-30B-A3B"
+# MODEL="sarvamai/sarvam-30b"
+INPUT_LEN=2048
+OUTPUT_LEN=32
+NUM_PROMPTS=8
+
+GPU_ENV="vllm_0.23.0_xpu"
+CPU_ENV="vllm_0.23.0_cpu"
+CONDA_BASE="/data/nfs_home/sundares/miniforge3"
+SHM_CONNECTOR_DIR="/data/nfs_home/sundares/vllm/vllm/examples/others/shm_connector"
+
+print_mem_stats() {
+    numactl -H
+    for node in /sys/devices/system/node/node[0-9]*; do
+        nid=$(basename $node | tr -d 'node')
+        awk -v n=$nid '/MemTotal/{t=$4} /MemFree/{f=$4} /FilePages/{c=$4} /Slab/{s=$4} END{printf "node%s: total=%dGB free=%dGB actual_used=%dGB page_cache=%dGB\n", n, t/1024/1024, f/1024/1024, (t-f-c-s)/1024/1024, (c+s)/1024/1024}' $node/meminfo
+    done
+    sudo nvtop -s | grep mem_util | awk '{print "GPU " NR-1 ":", $0}'
+}
+
+# Print per-node stats as "nodeN=free:actual_used:page_cache" lines (stdout, all in kB)
+snapshot_stats_per_node() {
+    for node in /sys/devices/system/node/node[0-9]*; do
+        nid=$(basename $node | tr -d 'node')
+        awk -v n=$nid '/MemTotal/{t=$4} /MemFree/{f=$4} /FilePages/{c=$4} /Slab/{s=$4} END{printf "node%s=%d:%d:%d\n", n, f, t-f-c-s, c+s}' $node/meminfo
+    done
+}
+
 hostname
 lscpu
-numactl -H
-for node in /sys/devices/system/node/node[0-9]*; do
-    nid=$(basename $node | tr -d 'node')
-    awk -v n=$nid '/MemTotal/{t=$4} /MemFree/{f=$4} /FilePages/{c=$4} /Slab/{s=$4} END{printf "node%s: total=%dGB free=%dGB actual_used=%dGB page_cache=%dGB\n", n, t/1024/1024, f/1024/1024, (t-f-c-s)/1024/1024, (c+s)/1024/1024}' $node/meminfo
-done
-sudo nvtop -s | grep mem_util | awk '{print "GPU " NR-1 ":", $0}'
+print_mem_stats
 
 PIDS=()
 
@@ -35,53 +60,33 @@ log() {
     echo "[${file}:${line} ${func}()] $*" >&2
 }
 
-# MODEL="Qwen/Qwen2.5-1.5B-Instruct"
-# MODEL="Qwen/Qwen2.5-7B"
-MODEL="Qwen/Qwen3-30B-A3B"
-# MODEL="sarvamai/sarvam-30b"
-INPUT_LEN=16384
-OUTPUT_LEN=32
-NUM_PROMPTS=8
-
-GPU_ENV="vllm_0.23.0_xpu"
-CPU_ENV="vllm_0.23.0_cpu"
-CONDA_BASE="/data/nfs_home/sundares/miniforge3"
-SHM_CONNECTOR_DIR="/data/nfs_home/sundares/vllm/vllm/examples/others/shm_connector"
-
-# Kill a PID and all its descendants at any depth (BFS collect, reverse kill)
-kill_tree() {
-    local root=$1
+# Kill all processes in a session (setsid makes the launched PID the SID leader,
+# so SID == PID. Session membership survives os.setsid() in children unlike PGID.)
+kill_session() {
+    local sid=$1
     local signal=${2:-TERM}
-    [[ -z "$root" ]] && return 0
-    local -a all=("$root")
-    local i=0
-    while (( i < ${#all[@]} )); do
-        local children
-        children=$(pgrep -P "${all[$i]}" 2>/dev/null) || true
-        for c in $children; do all+=("$c"); done
-        (( i++ ))
-    done
-    # Kill in reverse so leaves die before their parents
-    for (( j=${#all[@]}-1; j>=0; j-- )); do
-        kill -"$signal" "${all[$j]}" 2>/dev/null || true
-    done
+    [[ -z "$sid" ]] && return 0
+    pkill -"$signal" -s "$sid" 2>/dev/null || true
 }
 
 stop_server() {
     log "Stopping server…"
-    # Graceful SIGTERM to each tracked PID tree
-    for pid in "${PIDS[@]}"; do
-        kill_tree "$pid" TERM
+    ps -u $USER -o pid,ppid,pgid,sid,cmd || true
+    # Graceful SIGTERM to each tracked session
+    for sid in "${PIDS[@]}"; do
+        kill_session "$sid" TERM
     done
-    sleep 5
+    sleep 30
+    ps -u $USER -o pid,ppid,pgid,sid,cmd || true
     # Force SIGKILL any survivors
-    for pid in "${PIDS[@]}"; do
-        kill_tree "$pid" KILL
+    for sid in "${PIDS[@]}"; do
+        kill_session "$sid" KILL
     done
     wait -- "${PIDS[@]}" 2>/dev/null || true
     PIDS=()
     log "Cleaning up shared memory..."
     find /dev/shm -maxdepth 1 -user $USER -type f -exec rm -f {} +
+    print_mem_stats
 }
 
 cleanup() {
@@ -89,6 +94,16 @@ cleanup() {
     log "Stopping everything… (reason: ${reason})"
     trap '' INT TERM  # ignore signals during cleanup to prevent re-entrancy
     stop_server
+    # Per-node memory diff
+    while IFS='=:' read -r node free_kb actual_kb cache_kb; do
+        local vfree="MEM_BASELINE_${node^^}_FREE"
+        local vactual="MEM_BASELINE_${node^^}_ACTUAL"
+        local vcache="MEM_BASELINE_${node^^}_CACHE"
+        local b_free=${!vfree} b_actual=${!vactual} b_cache=${!vcache}
+        [[ -z "$b_free" ]] && continue
+        local lost_free_gb=$(echo "scale=2; ($b_free - $free_kb) / 1048576" | bc)
+        log "${node}: free: $(( b_free/1048576 ))GB -> $(( free_kb/1048576 ))GB (lost ${lost_free_gb}GB)  |  actual_used: $(( b_actual/1048576 ))GB -> $(( actual_kb/1048576 ))GB  |  page_cache: $(( b_cache/1048576 ))GB -> $(( cache_kb/1048576 ))GB"
+    done < <(snapshot_stats_per_node)
     exit 0
 }
 
@@ -108,12 +123,7 @@ wait_for_server() {
 
   while true; do
 
-    numactl -H | grep -E 'node [0-9]+ (size|free)'
-    for node in /sys/devices/system/node/node[0-9]*; do
-        nid=$(basename $node | tr -d 'node')
-        awk -v n=$nid '/MemTotal/{t=$4} /MemFree/{f=$4} /FilePages/{c=$4} /Slab/{s=$4} END{printf "node%s: total=%dGB free=%dGB actual_used=%dGB page_cache=%dGB\n", n, t/1024/1024, f/1024/1024, (t-f-c-s)/1024/1024, (c+s)/1024/1024}' $node/meminfo
-    done
-    sudo nvtop -s | grep mem_util | awk '{print "GPU " NR-1 ":", $0}'
+    print_mem_stats
 
     local all_done=1
     for (( k=0; k<${#ports[@]}; k++ )); do
@@ -153,47 +163,48 @@ main() {
     trap cleanup INT
     trap cleanup TERM
 
-    log "Launching prefiller, decoder and proxy..."
+    # Capture per-node baseline
+    while IFS='=:' read -r node free_kb actual_kb cache_kb; do
+        declare -g "MEM_BASELINE_${node^^}_FREE=$free_kb"
+        declare -g "MEM_BASELINE_${node^^}_ACTUAL=$actual_kb"
+        declare -g "MEM_BASELINE_${node^^}_CACHE=$cache_kb"
+        log "Memory baseline ${node}: free=$(( free_kb/1048576 ))GB  actual_used=$(( actual_kb/1048576 ))GB  page_cache=$(( cache_kb/1048576 ))GB"
+    done < <(snapshot_stats_per_node)
     log "Please check prefiller.log, decoder.log and proxy.log for logs."
 
-    (
+    setsid bash -c "
         exec > >(tee decoder.log) 2>&1
-        source $CONDA_BASE/etc/profile.d/conda.sh
-        conda activate $CPU_ENV
-        VLLM_TP=2 \
-        VLLM_LOGGING_PREFIX="DECODER " \
-        bash prefiller_decoder_vllm_launcher.sh decoder $MODEL
-    ) &
+        source '${CONDA_BASE}/etc/profile.d/conda.sh'
+        conda activate '${CPU_ENV}'
+        VLLM_TP=2 VLLM_LOGGING_PREFIX='DECODER ' \
+        bash prefiller_decoder_vllm_launcher.sh decoder '${MODEL}'
+    " &
     decoder_pid=$!
     PIDS+=($decoder_pid)
 
-    (
+    setsid bash -c "
         exec > >(tee prefiller.log) 2>&1
-        source $CONDA_BASE/etc/profile.d/conda.sh
-        conda activate $GPU_ENV
-        # If VLLM_OFFLOAD_KV_CACHE_TO_CPU=1, then KV_BUFFER_DEVICE does not matter and it will be ignored.
-        # ONEAPI_DEVICE_SELECTOR="level_zero:0,4;opencl:0,4" \
-        VLLM_TP=4 \
-        VLLM_LOGGING_PREFIX="PREFILLER " \
-        bash prefiller_decoder_vllm_launcher.sh prefiller $MODEL
-    ) &
+        source '${CONDA_BASE}/etc/profile.d/conda.sh'
+        conda activate '${GPU_ENV}'
+        # ONEAPI_DEVICE_SELECTOR='level_zero:0,4;opencl:0,4'
+        VLLM_TP=4 VLLM_LOGGING_PREFIX='PREFILLER ' \
+        bash prefiller_decoder_vllm_launcher.sh prefiller '${MODEL}'
+    " &
     prefiller_pid=$!
     PIDS+=($prefiller_pid)
 
-    (
+    setsid bash -c "
         exec > >(tee proxy.log) 2>&1
-        source $CONDA_BASE/etc/profile.d/conda.sh
-        conda activate $GPU_ENV
-        # Use proxy_server.py or toy_proxy_server.py
-        # python -m debugpy --listen 0.0.0.0:5678 --wait-for-client \
-        python "$SHM_CONNECTOR_DIR/toy_proxy_server.py" \
+        source '${CONDA_BASE}/etc/profile.d/conda.sh'
+        conda activate '${GPU_ENV}'
+        python '${SHM_CONNECTOR_DIR}/toy_proxy_server.py' \
             --host 0.0.0.0 \
             --port 9000 \
             --prefiller-host localhost \
             --prefiller-port 8100 \
             --decoder-host localhost \
             --decoder-port 8200
-    ) &
+    " &
     proxy_pid=$!
     PIDS+=($proxy_pid)
 
@@ -242,33 +253,33 @@ main() {
         #     --max-concurrency 1 \
         #     2>&1 | tee benchmark_prefix_caching.log
 
-        curl --fail-with-body -X POST http://localhost:9000/v1/completions \
-        -H "Content-Type: application/json" \
-        -d '{
-            "model": "'"$MODEL"'",
-            "prompt": [
-            "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, and tensor parallelism to serve large language models efficiently. Requests are scheduled by a central scheduler that tracks per-request KV cache block allocations. The KV cache is divided into fixed-size blocks, and a block table maps logical blocks to physical GPU memory. Prefix caching reuses KV blocks for identical prompt prefixes across requests, avoiding redundant computation. Now answer the following question: What are the main benefits of prefix caching in LLM serving?"
-            ],
-            "max_tokens": 200,
-            "temperature": 0.7
-        }' \
-        2>&1 | tee "accuracy_test.log"
+        # curl --fail-with-body -X POST http://localhost:9000/v1/completions \
+        # -H "Content-Type: application/json" \
+        # -d '{
+        #     "model": "'"$MODEL"'",
+        #     "prompt": [
+        #     "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, and tensor parallelism to serve large language models efficiently. Requests are scheduled by a central scheduler that tracks per-request KV cache block allocations. The KV cache is divided into fixed-size blocks, and a block table maps logical blocks to physical GPU memory. Prefix caching reuses KV blocks for identical prompt prefixes across requests, avoiding redundant computation. Now answer the following question: What are the main benefits of prefix caching in LLM serving?"
+        #     ],
+        #     "max_tokens": 200,
+        #     "temperature": 0.7
+        # }' \
+        # 2>&1 | tee "accuracy_test.log"
 
-        echo -e "\n\n" | tee -a "accuracy_test.log"
+        # echo -e "\n\n" | tee -a "accuracy_test.log"
 
-        curl --fail-with-body -X POST http://localhost:9000/v1/completions \
-        -H "Content-Type: application/json" \
-        -d '{
-            "model": "'"$MODEL"'",
-            "prompt": [
-            "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, and tensor parallelism to serve large language models efficiently. Requests are scheduled by a central scheduler that tracks per-request KV cache block allocations. The KV cache is divided into fixed-size blocks, and a block table maps logical blocks to physical GPU memory. Prefix caching reuses KV blocks for identical prompt prefixes across requests, avoiding redundant computation. Now answer the following question: What are the main benefits of prefix caching in LLM serving?",
-            "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, and tensor parallelism to serve large language models efficiently. Requests are scheduled by a central scheduler that tracks per-request KV cache block allocations. The KV cache is divided into fixed-size blocks, and a block table maps logical blocks to physical GPU memory. Prefix caching reuses KV blocks for identical prompt prefixes across requests, avoiding redundant computation. Now answer the following question: How does block-level prefix caching differ from token-level caching?",
-            "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, and tensor parallelism to serve large language models efficiently. Requests are scheduled by a central scheduler that tracks per-request KV cache block allocations. The KV cache is divided into fixed-size blocks, and a block table maps logical blocks to physical GPU memory. Prefix caching reuses KV blocks for identical prompt prefixes across requests, avoiding redundant computation. Now answer the following question: What workloads benefit most from prefix caching and why?"
-            ],
-            "max_tokens": 200,
-            "temperature": 0.7
-        }' \
-        2>&1 | tee -a "accuracy_test.log"
+        # curl --fail-with-body -X POST http://localhost:9000/v1/completions \
+        # -H "Content-Type: application/json" \
+        # -d '{
+        #     "model": "'"$MODEL"'",
+        #     "prompt": [
+        #     "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, and tensor parallelism to serve large language models efficiently. Requests are scheduled by a central scheduler that tracks per-request KV cache block allocations. The KV cache is divided into fixed-size blocks, and a block table maps logical blocks to physical GPU memory. Prefix caching reuses KV blocks for identical prompt prefixes across requests, avoiding redundant computation. Now answer the following question: What are the main benefits of prefix caching in LLM serving?",
+        #     "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, and tensor parallelism to serve large language models efficiently. Requests are scheduled by a central scheduler that tracks per-request KV cache block allocations. The KV cache is divided into fixed-size blocks, and a block table maps logical blocks to physical GPU memory. Prefix caching reuses KV blocks for identical prompt prefixes across requests, avoiding redundant computation. Now answer the following question: How does block-level prefix caching differ from token-level caching?",
+        #     "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, and tensor parallelism to serve large language models efficiently. Requests are scheduled by a central scheduler that tracks per-request KV cache block allocations. The KV cache is divided into fixed-size blocks, and a block table maps logical blocks to physical GPU memory. Prefix caching reuses KV blocks for identical prompt prefixes across requests, avoiding redundant computation. Now answer the following question: What workloads benefit most from prefix caching and why?"
+        #     ],
+        #     "max_tokens": 200,
+        #     "temperature": 0.7
+        # }' \
+        # 2>&1 | tee -a "accuracy_test.log"
     )
 
     # while true; do
