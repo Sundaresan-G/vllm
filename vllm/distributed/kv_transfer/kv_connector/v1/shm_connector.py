@@ -55,6 +55,7 @@ from vllm.v1.worker.utils import select_common_block_size
 if TYPE_CHECKING:
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
     from vllm.v1.kv_cache_interface import KVCacheConfig
+    from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
 
 Transfer = tuple[int, float]  # (xfer_handle, start_time)
@@ -214,6 +215,10 @@ class ShmConnector(KVConnectorBase_V1):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
 
+    def update_connector_output(self, connector_output: "KVConnectorOutput"):
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.update_connector_output(connector_output)
+
     ############################################################
     # Worker Side Methods
     ############################################################
@@ -279,7 +284,15 @@ class ShmConnectorScheduler:
         self.side_channel_filename = engine_id
         self.max_completion_flags_size = vllm_config.scheduler_config.max_num_seqs * 10
         self.current_completion_flag_idx = 0
+        # Persistent map of in-flight sends -> reserved completion flag index.
+        # An entry lives from update_state_after_alloc until the send is
+        # confirmed finished (update_connector_output) or the request is
+        # aborted (request_finished), at which point the index is freed.
         self._send_ReqId2CompletionIdx: dict[ReqId, int] = {}
+        # Per-step delta of newly assigned mappings forwarded to the worker.
+        # Cleared in build_connector_meta so the serialized metadata stays
+        # small and each (req_id, flag_idx) is delivered to the worker once.
+        self._new_send_ReqId2CompletionIdx: dict[ReqId, int] = {}
 
         self._is_hma_required = (
             not vllm_config.scheduler_config.disable_hybrid_kv_cache_manager
@@ -405,6 +418,10 @@ class ShmConnectorScheduler:
                 while self.current_completion_flag_idx in self._send_ReqId2CompletionIdx.values():
                     self.current_completion_flag_idx = (self.current_completion_flag_idx + 1) % self.max_completion_flags_size
                 self._send_ReqId2CompletionIdx[request.request_id] = self.current_completion_flag_idx
+                # Forward only the new assignment to the worker this step.
+                self._new_send_ReqId2CompletionIdx[request.request_id] = (
+                    self.current_completion_flag_idx
+                )
         elif params.get("do_remote_prefill"):
             if params.get("remote_block_ids"):
                 if all(
@@ -461,7 +478,7 @@ class ShmConnectorScheduler:
                 num_external_tokens=self._reqs_need_recv_num_ext_tokens.get(req_id, 0),
             )
 
-        meta.send_ReqId2CompletionIdx = self._send_ReqId2CompletionIdx
+        meta.send_ReqId2CompletionIdx = self._new_send_ReqId2CompletionIdx
 
         meta.reqs_to_send = self._reqs_need_send
         meta.reqs_in_batch = self._reqs_in_batch
@@ -473,6 +490,8 @@ class ShmConnectorScheduler:
         self._reqs_in_batch = set()
         self._reqs_not_processed = set()
         self._reqs_need_send = {}
+        # The delta has been handed to the worker; reset for the next step.
+        self._new_send_ReqId2CompletionIdx = {}
 
         return meta
 
@@ -507,7 +526,7 @@ class ShmConnectorScheduler:
             # worker side will notify and free blocks in the prefill instance.
             self._reqs_need_recv[request.request_id] = (request, [])
             params["do_remote_prefill"] = False
-            return False, None
+            return True, None
 
         if not params.get("do_remote_decode"):
             return False, None
@@ -515,6 +534,9 @@ class ShmConnectorScheduler:
             # Also include the case of a P/D Prefill request with immediate
             # block free (eg abort). Stop tracking this request.
             self._reqs_not_processed.add(request.request_id)
+            # The send will never happen, so release the reserved completion
+            # flag index (the worker frees the flag via reqs_not_processed).
+            self._send_ReqId2CompletionIdx.pop(request.request_id, None)
             return False, None
 
         # TODO: check whether block_ids actually ever be 0. If not we could
@@ -551,6 +573,17 @@ class ShmConnectorScheduler:
             remote_block_size=self.block_size,
             remote_completion_flag_idx=self._send_ReqId2CompletionIdx[request.request_id],
         )
+
+    def update_connector_output(self, connector_output: "KVConnectorOutput"):
+        """Release completion flag indices for sends that have finished.
+
+        The worker reports finished sends (decoder done reading or send
+        timed out) via ``get_finished``; those ids arrive here as
+        ``finished_sending``. Removing the entry frees the reserved flag
+        index so it can be safely reassigned to a future request.
+        """
+        for req_id in connector_output.finished_sending or ():
+            self._send_ReqId2CompletionIdx.pop(req_id, None)
 
 
 class ShmConnectorWorker:
@@ -1561,6 +1594,13 @@ class ShmConnectorWorker:
             self._reqs_to_process.discard(req_id)
             # We should never get an abort after setting an expiry timer
             assert req_id not in self._reqs_to_send
+            # Release the completion flag reserved in wait_for_save: an aborted
+            # request will never be read by the decoder, so free it here to
+            # avoid stranding a permanently-busy flag and a leaked entry.
+            flag_idx = self._send_ReqId2CompletionIdx.pop(req_id, None)
+            if flag_idx is not None:
+                self.shm_kv_caches_completion_flags.buf[flag_idx] = False
+            self._pending_send_reqs.discard(req_id)
 
         # Add to requests that are waiting to be read and track expiration.
         for req_id, expiration_time in metadata.reqs_to_send.items():
@@ -1589,14 +1629,23 @@ class ShmConnectorWorker:
         return mapped_2d.flatten().astype(np.int64)
 
     def wait_for_save(self, metadata: ShmConnectorMetadata):
-        self._send_ReqId2CompletionIdx = metadata.send_ReqId2CompletionIdx
+        # The scheduler forwards only newly assigned (req_id -> flag_idx)
+        # mappings each step. Merge them into our own persistent dict instead
+        # of rebinding to the scheduler's copy; otherwise entries we pop here
+        # (in `_get_new_notifs`/`get_finished`) would be resurrected and the
+        # dict would grow without bound.
         for req_id, completion_flag_idx in metadata.send_ReqId2CompletionIdx.items():
-            if req_id not in self._pending_send_reqs:
+            if req_id in metadata.reqs_not_processed:
+                # Aborted in the same step it was assigned; do not mark the
+                # flag busy (start_load_kv frees it).
+                continue
+            if req_id not in self._send_ReqId2CompletionIdx:
+                self._send_ReqId2CompletionIdx[req_id] = completion_flag_idx
                 self._pending_send_reqs.add(req_id)
-                i = completion_flag_idx
-                self.shm_kv_caches_completion_flags.buf[i] = True  # Mark as busy
+                self.shm_kv_caches_completion_flags.buf[completion_flag_idx] = True
                 logger.debug(
-                    f"Marked block {i} as busy for req {req_id} in wait_for_save"
+                    f"Marked block {completion_flag_idx} as busy for req "
+                    f"{req_id} in wait_for_save"
                 )
 
         logger.debug(f"self._send_ReqId2CompletionIdx after wait_for_save: {self._send_ReqId2CompletionIdx}")
