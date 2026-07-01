@@ -65,7 +65,6 @@ elif [[ $1 == "decoder" ]]; then
     # VLLM_CPU_OMP_THREADS_BIND="0-15|16-31" \
     VLLM_CPU_KVCACHE_SPACE=10 \
     VLLM_CPU_SGL_KERNEL="1" \
-    numactl --cpunodebind=${NUMA_NODES} --membind=${NUMA_NODES} \
     $(which vllm) serve $MODEL \
     --port 8200 \
     --trust-remote-code \

@@ -20,9 +20,9 @@ set -x
 # MODEL="Qwen/Qwen2.5-7B"
 MODEL="Qwen/Qwen3-30B-A3B"
 # MODEL="sarvamai/sarvam-30b"
-INPUT_LEN=2048
-OUTPUT_LEN=32
-NUM_PROMPTS=8
+INPUT_LEN=16384
+OUTPUT_LEN=8
+NUM_PROMPTS=3
 
 GPU_ENV="vllm_0.23.0_xpu"
 CPU_ENV="vllm_0.23.0_cpu"
@@ -177,6 +177,7 @@ main() {
         source '${CONDA_BASE}/etc/profile.d/conda.sh'
         conda activate '${CPU_ENV}'
         VLLM_TP=2 VLLM_LOGGING_PREFIX='DECODER ' \
+        numactl -C 8-59,68-119 \
         bash prefiller_decoder_vllm_launcher.sh decoder '${MODEL}'
     " &
     decoder_pid=$!
@@ -188,6 +189,7 @@ main() {
         conda activate '${GPU_ENV}'
         # ONEAPI_DEVICE_SELECTOR='level_zero:0,4;opencl:0,4'
         VLLM_TP=4 VLLM_LOGGING_PREFIX='PREFILLER ' \
+        numactl -C 0-7 \
         bash prefiller_decoder_vllm_launcher.sh prefiller '${MODEL}'
     " &
     prefiller_pid=$!
@@ -197,6 +199,7 @@ main() {
         exec > >(tee proxy.log) 2>&1
         source '${CONDA_BASE}/etc/profile.d/conda.sh'
         conda activate '${GPU_ENV}'
+        numactl -C 60-67 \
         python '${SHM_CONNECTOR_DIR}/toy_proxy_server.py' \
             --host 0.0.0.0 \
             --port 9000 \
@@ -236,22 +239,22 @@ main() {
     (
         source $CONDA_BASE/etc/profile.d/conda.sh
         conda activate $GPU_ENV
-        $(which vllm) bench serve --port 9000 --seed $(date +%s) \
-            --model $MODEL \
-            --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN \
-            --num-prompts $NUM_PROMPTS --max-concurrency 1 \
-            2>&1 | tee benchmark.log
-
         # $(which vllm) bench serve --port 9000 --seed $(date +%s) \
         #     --model $MODEL \
-        #     --dataset-name prefix_repetition \
-        #     --prefix-repetition-prefix-len $((INPUT_LEN/2)) \
-        #     --prefix-repetition-suffix-len $((INPUT_LEN/2)) \
-        #     --prefix-repetition-num-prefixes 2 \
-        #     --prefix-repetition-output-len $OUTPUT_LEN \
-        #     --num-prompts $NUM_PROMPTS \
-        #     --max-concurrency 1 \
-        #     2>&1 | tee benchmark_prefix_caching.log
+        #     --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN \
+        #     --num-prompts $NUM_PROMPTS --max-concurrency 1 --profile \
+        #     2>&1 | tee benchmark.log
+
+        $(which vllm) bench serve --port 9000 --seed $(date +%s) \
+            --model $MODEL \
+            --dataset-name prefix_repetition \
+            --prefix-repetition-prefix-len $((INPUT_LEN/2)) \
+            --prefix-repetition-suffix-len $((INPUT_LEN/2)) \
+            --prefix-repetition-num-prefixes 1 \
+            --prefix-repetition-output-len $OUTPUT_LEN \
+            --num-prompts $NUM_PROMPTS \
+            --max-concurrency 1 \
+            2>&1 | tee benchmark_prefix_caching.log
 
         # curl --fail-with-body -X POST http://localhost:9000/v1/completions \
         # -H "Content-Type: application/json" \
