@@ -817,6 +817,7 @@ async def benchmark(
             )
 
     benchmark_start_time = time.perf_counter()
+    benchmark_start_wall_time = time.time()
     tasks: list[asyncio.Task] = []
 
     rps_change_events = []
@@ -1120,12 +1121,12 @@ async def benchmark(
                 else:
                     max_itl = max2_itl = mean_itl = med_itl = min_itl = nan
                     max_pos = max2_pos = min_pos = nan
-                start_dt = datetime.fromtimestamp(o.start_time).strftime(
-                    "%Y-%m-%d %H:%M:%S.%f"
-                )
-                end_dt = datetime.fromtimestamp(o.start_time + o.latency).strftime(
-                    "%Y-%m-%d %H:%M:%S.%f"
-                )
+                start_dt = datetime.fromtimestamp(
+                    benchmark_start_wall_time + (o.start_time - benchmark_start_time)
+                ).strftime("%m-%d %H:%M:%S.%f")
+                end_dt = datetime.fromtimestamp(
+                    benchmark_start_wall_time + (o.start_time + o.latency - benchmark_start_time)
+                ).strftime("%m-%d %H:%M:%S.%f")
                 print(
                     "{:<6} {:>12.2f} {:>12.2f} {:>8} {:>13.2f} {:>8} {:>12.2f} {:>13.2f} {:>12.2f} {:>8} {:>26} {:>26}".format(
                         i,
