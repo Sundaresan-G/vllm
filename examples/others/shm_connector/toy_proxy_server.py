@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import time
 
 from vllm.logger import init_logger
@@ -168,6 +168,10 @@ async def send_request_to_service(
         req_data["max_completion_tokens"] = 1
     if "stream_options" in req_data:
         del req_data["stream_options"]
+    # Ask the prefiller to return the tokenized prompt and the sampled token
+    # ids so the decoder can be fed pre-tokenized input and skip re-tokenizing
+    # the (potentially very large) prompt on its critical path.
+    req_data["return_token_ids"] = True
     headers = {
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         "X-Request-Id": request_id,
@@ -234,14 +238,32 @@ async def _handle_single_prompt_completions(
     if kv_transfer_params:
         decode_req_data["kv_transfer_params"] = kv_transfer_params
 
-    # Append the one prefilled token so the decoder continues from there
-    decode_req_data["prompt"] = (
-        decode_req_data["prompt"] + response_json["choices"][0]["text"]
-    )
+    choice = response_json["choices"][0]
+    prompt_token_ids = choice.get("prompt_token_ids")
+    output_token_ids = choice.get("token_ids")
+
+    if prompt_token_ids is not None and output_token_ids is not None:
+        # Fast path: feed the decoder pre-tokenized ids (full prompt plus the
+        # one token already sampled by the prefiller). This avoids re-tokenizing
+        # the whole prompt on the decoder, which otherwise dominates TTFT for
+        # long prompts.
+        decode_req_data["prompt"] = list(prompt_token_ids) + list(output_token_ids)
+    else:
+        # Fallback: append the one prefilled token as text so the decoder
+        # continues from there (requires re-tokenization on the decoder).
+        decode_req_data["prompt"] = decode_req_data["prompt"] + choice["text"]
+
+    # The decoder does not need to echo token ids back.
+    decode_req_data.pop("return_token_ids", None)
 
     # Prefill generated one token already; decrement remaining budget
     if "max_tokens" in decode_req_data:
         decode_req_data["max_tokens"] -= 1
+
+    # Avoid forwarding the large token-id arrays back to the client; restore the
+    # original (null) shape of the prefill response chunk.
+    choice["prompt_token_ids"] = None
+    choice["token_ids"] = None
 
     return response_json, decode_req_data
 
@@ -304,7 +326,7 @@ async def _handle_completions(api: str, request: Request):
                 )
                 for chunks, (prefill_response_json, _), rid in zip(decode_chunk_lists, prefill_results, request_ids):
                     for chunk in chunks:
-                        logger.info("[%s] Forwarding decode chunk to client (%d bytes)", rid, len(chunk))
+                        logger.info("[%s] Forwarding decode chunk to client (%d bytes): %s", rid, len(chunk), chunk)
                         yield chunk
 
             return StreamingResponse(generate_stream_multi(), media_type="application/json")
@@ -376,17 +398,50 @@ async def profile(api: str, request: Request):
     return {"status": "ok"}
 
 @app.post("/start_profile")
-async def handle_completions(request: Request):
+async def handle_start_profile(request: Request):
     return await profile("/start_profile", request)
 
 @app.post("/stop_profile")
-async def handle_completions(request: Request):
+async def handle_stop_profile(request: Request):
     return await profile("/stop_profile", request)
 
 
+@app.get("/health")
 @app.get("/healthcheck")
 async def healthcheck():
-    """Simple endpoint to check if the server is running."""
+    """Check proxy is running and all backends are reachable."""
+    unhealthy = []
+
+    for client_info in app.state.prefill_clients:
+        label = f"prefill:{client_info['host']}:{client_info['port']}"
+        try:
+            resp = await client_info["client"].get("/health", timeout=5.0)
+            if resp.status_code != 200:
+                unhealthy.append(f"{label} status={resp.status_code}")
+        except Exception as e:
+            unhealthy.append(f"{label} error={e}")
+
+    for client_info in app.state.decode_clients:
+        label = f"decode:{client_info['host']}:{client_info['port']}"
+        try:
+            resp = await client_info["client"].get("/health", timeout=5.0)
+            if resp.status_code != 200:
+                unhealthy.append(f"{label} status={resp.status_code}")
+        except Exception as e:
+            unhealthy.append(f"{label} error={e}")
+
+    if unhealthy:
+        logger.warning("Health check failed: %s", unhealthy)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "unhealthy",
+                "unhealthy_backends": unhealthy,
+                "prefill_instances": len(app.state.prefill_clients),
+                "decode_instances": len(app.state.decode_clients),
+            },
+        )
+
     return {
         "status": "ok",
         "prefill_instances": len(app.state.prefill_clients),
