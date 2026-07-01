@@ -343,8 +343,6 @@ class TestGemma4ChatTemplate:
         assert '<|"|>Alice<|"|>' in result
         assert "active:true" in result
         assert "count:42" in result
-<<<<<<< HEAD
-=======
 
     def test_tool_response_with_multimodal_content(self, gemma4_template):
         """Multimodal placeholders in tool messages are emitted after the
@@ -414,4 +412,3 @@ class TestGemma4ChatTemplate:
         assert "<|image|>" in result
         assert "<|audio|>" in result
         assert "<|video|>" in result
->>>>>>> main

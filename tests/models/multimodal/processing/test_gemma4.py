@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-<<<<<<< HEAD
-import pytest
-
-from vllm.multimodal import MULTIMODAL_REGISTRY
-=======
 from collections.abc import Mapping
 
 import pytest
@@ -19,7 +14,6 @@ from vllm.model_executor.models.gemma4_mm import (
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalFieldConfig
 from vllm.utils.mem_constants import GiB_bytes
->>>>>>> main
 
 from ....conftest import ImageTestAssets
 from ...utils import build_model_context
@@ -28,8 +22,6 @@ from ...utils import build_model_context
 GEMMA4_MODEL_ID = "google/gemma-4-E2B-it"
 
 
-<<<<<<< HEAD
-=======
 def test_gemma4_image_schema_accepts_variable_patch_counts():
     Gemma4ImagePixelInputs(
         pixel_values=[
@@ -206,7 +198,6 @@ def test_get_prompt_updates_respects_nested_max_soft_tokens(model_id: str):
     assert replacement == expected
 
 
->>>>>>> main
 @pytest.mark.parametrize("model_id", [GEMMA4_MODEL_ID])
 def test_limit_mm_per_prompt(
     image_assets: ImageTestAssets,
@@ -237,8 +228,6 @@ def test_limit_mm_per_prompt(
             mm_items=processor.info.parse_mm_data(mm_data),
             hf_processor_mm_kwargs={},
         )
-<<<<<<< HEAD
-=======
 
 
 # Regression guard for PR #43169 follow-up: the batched Gemma4 vision encoder
@@ -296,4 +285,3 @@ def test_encoder_chunk_no_free_memory_falls_back_to_one():
         )
         == 1
     )
->>>>>>> main

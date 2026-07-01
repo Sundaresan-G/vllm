@@ -104,10 +104,7 @@ class MockReasoningConfig:
 
     reasoning_start_token_ids = [THINK_START_TOKEN_ID]
     reasoning_end_token_ids = [THINK_END_TOKEN_ID]
-<<<<<<< HEAD
-=======
     enabled = True
->>>>>>> main
 
 
 def _generate_fake_sampling_metadata(
@@ -501,11 +498,6 @@ def _thinking_budget_validate(
         output_tokens = request_params.out_tokens
         start_tokens = holder.think_start_token_ids
         thinking_started = False
-<<<<<<< HEAD
-        start_tokens = tb_processor.reasoning_start_token_ids
-
-=======
->>>>>>> main
         if len(start_tokens) > 0:
             for i in range(len(output_tokens) - len(start_tokens) + 1):
                 if output_tokens[i : i + len(start_tokens)] == start_tokens:
@@ -549,47 +541,6 @@ def _thinking_budget_validate(
                         step_idx=step_idx,
                     )
 
-<<<<<<< HEAD
-                # Validate that only end tokens are allowed
-                end_tokens = tb_processor.reasoning_end_token_ids
-                if len(end_tokens) > 0:
-                    expected_end_token_id = end_tokens[
-                        min(state["end_count"], len(end_tokens) - 1)
-                    ]
-
-                    # Check logits masking
-                    batch_logits = logits_new[batch_index]
-                    for token_id in range(len(batch_logits)):
-                        logit_value = batch_logits[token_id]
-
-                        if token_id == expected_end_token_id:
-                            # End token should not be masked
-                            if logit_value == -float("inf"):
-                                _raise_error_invalid(
-                                    msg_suffix=(
-                                        f"End token {token_id} should not be "
-                                        "masked but is"
-                                    ),
-                                    batch_index=batch_index,
-                                    request_params=request_params,
-                                    step_idx=step_idx,
-                                )
-                        else:
-                            # All other tokens should be masked when forcing end
-                            if logit_value != -float("inf"):
-                                _raise_error_invalid(
-                                    msg_suffix=(
-                                        f"Token {token_id} should be masked "
-                                        f"when forcing end tokens, but "
-                                        f"logit={logit_value}"
-                                    ),
-                                    batch_index=batch_index,
-                                    request_params=request_params,
-                                    step_idx=step_idx,
-                                )
-
-=======
->>>>>>> main
 
 def _none_validate(
     test_fakes: LogitsprocsTestFakes,

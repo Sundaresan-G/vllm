@@ -30,12 +30,9 @@ from vllm.v1.core.sched.output import (
     NewRequestData,
     SchedulerOutput,
 )
-<<<<<<< HEAD
-=======
 from vllm.v1.core.single_type_kv_cache_manager import (
     register_all_kvcache_specs,
 )
->>>>>>> main
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -74,12 +71,9 @@ def _make_kv_cache_config(
     """Build a KVCacheConfig with non-empty kv_cache_tensors."""
     groups = []
     tensors = []
-<<<<<<< HEAD
-=======
     register_all_kvcache_specs(
         vllm_config=None
     )  # Ensure specs are registered for tests
->>>>>>> main
     for g in range(num_groups):
         layer_names = [f"layer_{g}"]
         groups.append(
@@ -165,11 +159,8 @@ def make_scheduler(
         vllm_config=vllm_config,
         kv_cache_config=kv_cache_config,
         cpu_capacity_bytes=cpu_capacity_bytes,
-<<<<<<< HEAD
-=======
         scheduler_block_size=BLOCK_SIZE,
         hash_block_size=BLOCK_SIZE,
->>>>>>> main
         lazy_offload=lazy,
     )
 
@@ -196,10 +187,7 @@ _req_counter = 0
 def make_request(
     num_blocks: int = 2,
     request_id: str | None = None,
-<<<<<<< HEAD
-=======
     extra_tokens: int = 1,
->>>>>>> main
 ) -> Request:
     """Create a Request with deterministic block hashes."""
     global _req_counter
@@ -207,11 +195,7 @@ def make_request(
     if request_id is None:
         request_id = f"req-{_req_counter}"
 
-<<<<<<< HEAD
-    num_tokens = num_blocks * BLOCK_SIZE
-=======
     num_tokens = num_blocks * BLOCK_SIZE + extra_tokens
->>>>>>> main
     start = _req_counter * 10000
     prompt_token_ids = list(range(start, start + num_tokens))
     sampling_params = SamplingParams(max_tokens=1)
@@ -405,11 +389,8 @@ def test_eager_store_and_load_roundtrip() -> None:
         block_hasher=req._block_hasher,
     )
     hit_tokens, is_async = sched.get_num_new_matched_tokens(req2, num_computed_tokens=0)
-<<<<<<< HEAD
-=======
     # make_request pads num_tokens by +1 beyond the last full block, so the
     # manager's max_hit_len = num_tokens - 1 cap leaves all full blocks intact.
->>>>>>> main
     assert hit_tokens == num_blocks * BLOCK_SIZE
     assert is_async is True
 
@@ -429,9 +410,6 @@ def test_eager_store_and_load_roundtrip() -> None:
 
 
 # ---------------------------------------------------------------------------
-<<<<<<< HEAD
-# Test 1b: Lazy store-and-load roundtrip
-=======
 # Test 1b: Boundary — max_hit_len cap drops the last full block when the
 # prompt is an exact multiple of BLOCK_SIZE.
 # ---------------------------------------------------------------------------
@@ -470,7 +448,6 @@ def test_max_hit_len_cap_drops_last_full_block() -> None:
 
 # ---------------------------------------------------------------------------
 # Test 1c: Lazy store-and-load roundtrip
->>>>>>> main
 # ---------------------------------------------------------------------------
 def _flush_old_blocks_to_lru_head(
     gpu_pool: BlockPool,
@@ -534,16 +511,11 @@ def test_lazy_store_and_load_roundtrip() -> None:
     hit_tokens, is_async = sched.get_num_new_matched_tokens(
         req_old2, num_computed_tokens=0
     )
-<<<<<<< HEAD
-    assert hit_tokens == num_blocks * BLOCK_SIZE, (
-        f"Expected {num_blocks * BLOCK_SIZE} hit tokens, got {hit_tokens}"
-=======
     # make_request pads num_tokens by +1 beyond the last full block, so the
     # manager's max_hit_len = num_tokens - 1 cap leaves all full blocks intact.
     expected_hit = num_blocks * BLOCK_SIZE
     assert hit_tokens == expected_hit, (
         f"Expected {expected_hit} hit tokens, got {hit_tokens}"
->>>>>>> main
     )
     assert is_async is True
 
@@ -610,9 +582,6 @@ def test_eager_duplicate_store_skipped() -> None:
 
 
 # ---------------------------------------------------------------------------
-<<<<<<< HEAD
-# Test 2b: Lazy duplicate store is skipped
-=======
 # Test 2b: Eager dedup of in-flight stores across consecutive steps
 # ---------------------------------------------------------------------------
 def test_eager_in_flight_store_dedup_across_steps() -> None:
@@ -679,7 +648,6 @@ def test_eager_in_flight_store_dedup_across_steps() -> None:
 
 # ---------------------------------------------------------------------------
 # Test 2c: Lazy duplicate store is skipped
->>>>>>> main
 # ---------------------------------------------------------------------------
 def test_lazy_duplicate_store_skipped() -> None:
     """Lazy: blocks already offloaded to CPU should not be offloaded again.
@@ -1234,17 +1202,9 @@ def test_partial_gpu_prefix_plus_cpu_load() -> None:
     hit_tokens, is_async = sched.get_num_new_matched_tokens(
         req2, num_computed_tokens=gpu_local_computed
     )
-<<<<<<< HEAD
-    # CPU should hit blocks 2,3 (not 4,5 — those are beyond the CPU range).
-    num_cpu_hit_blocks = 2
-    # Actually CPU has all 6 stored; it returns hits starting from position 2.
-    # The number of CPU hit blocks = min(remaining request blocks, CPU cached).
-    # Here remaining = 6 - 2 = 4 blocks are in CPU, so hit = 4 * BLOCK_SIZE.
-=======
     # CPU has all 6 blocks stored. make_request pads num_tokens by +1, so
     # the manager's num_tokens - 1 cap leaves all full blocks intact:
     # remaining hashable range = 6 - 2 = 4 blocks, all hit.
->>>>>>> main
     num_cpu_hit_blocks = 4
     assert hit_tokens == num_cpu_hit_blocks * BLOCK_SIZE, (
         f"Expected {num_cpu_hit_blocks * BLOCK_SIZE} CPU hit tokens, got {hit_tokens}"
@@ -1289,8 +1249,6 @@ def test_partial_gpu_prefix_plus_cpu_load() -> None:
         assert bid in ext_block_ids, (
             f"Load GPU block {bid} should be an ext_comp block, not a comp or new block"
         )
-<<<<<<< HEAD
-=======
 
 
 # ---------------------------------------------------------------------------
@@ -1396,4 +1354,3 @@ def test_toctou_cpu_hit_evicted_between_phases_no_crash() -> None:
     )
     assert len(meta_b.load_gpu_blocks) == 2
     assert len(meta_b.load_cpu_blocks) == 2
->>>>>>> main

@@ -66,19 +66,7 @@ def test_set_max_model_len_legal(model_info, vllm_runner):
                 max_model_len=1024,
             ):
                 pass
-<<<<<<< HEAD
-    else:
-        with vllm_runner(
-            model_info.name,
-            revision=model_info.revision,
-            runner="pooling",
-            max_model_len=1024,
-        ) as vllm_model:
-            model_config = vllm_model.llm.llm_engine.model_config
-            assert model_config.max_model_len == 1024
-=======
         return
->>>>>>> main
 
     # set 512 < max_model_len <= 2048
     with vllm_runner(
@@ -91,28 +79,6 @@ def test_set_max_model_len_legal(model_info, vllm_runner):
         assert model_config.max_model_len == 1024
 
     # set max_model_len > 2048
-<<<<<<< HEAD
-    with pytest.raises(ValueError):
-        with vllm_runner(
-            model_info.name,
-            revision=model_info.revision,
-            runner="pooling",
-            max_model_len=4096,
-        ):
-            pass
-
-    # set max_model_len > 2048 by hf_overrides
-    hf_overrides = {"max_model_len": 4096}
-    with pytest.raises(ValueError):
-        with vllm_runner(
-            model_info.name,
-            revision=model_info.revision,
-            runner="pooling",
-            max_model_len=None,
-            hf_overrides=hf_overrides,
-        ):
-            pass
-=======
     with vllm_runner(
         model_info.name,
         revision=model_info.revision,
@@ -121,7 +87,6 @@ def test_set_max_model_len_legal(model_info, vllm_runner):
     ) as vllm_model:
         model_config = vllm_model.llm.llm_engine.model_config
         assert model_config.max_model_len == 4096
->>>>>>> main
 
 
 @pytest.mark.parametrize("model_info", MODELS)
@@ -144,48 +109,3 @@ def test_use_rope_scaling_legal(model_info, vllm_runner):
         hf_overrides=hf_overrides,
     ):
         pass
-<<<<<<< HEAD
-
-
-@pytest.mark.parametrize("model_info", MODELS)
-def test_use_rope_scaling_illegal(model_info, vllm_runner):
-    hf_overrides: dict[str, Any] = {
-        "rope_parameters": {
-            "rope_theta": rope_theta,
-            "rope_type": "yarn",
-            "factor": factor,
-            "original_max_position_embeddings": original_max_position_embeddings,
-        },
-    }
-    # illegal max_model_len
-    with pytest.raises(ValueError):
-        with vllm_runner(
-            model_info.name,
-            revision=model_info.revision,
-            runner="pooling",
-            max_model_len=max_model_len + 1,
-            hf_overrides=hf_overrides,
-        ):
-            pass
-
-    hf_overrides = {
-        "rope_parameters": {
-            "rope_theta": rope_theta,
-            "rope_type": "yarn",
-            "factor": factor,
-            "original_max_position_embeddings": original_max_position_embeddings,
-        },
-        "max_model_len": max_model_len + 1,
-    }
-    # illegal max_model_len by hf_overrides
-    with pytest.raises(ValueError):
-        with vllm_runner(
-            model_info.name,
-            revision=model_info.revision,
-            runner="pooling",
-            max_model_len=None,
-            hf_overrides=hf_overrides,
-        ):
-            pass
-=======
->>>>>>> main

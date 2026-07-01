@@ -1,4 +1,4 @@
 measure_runs**
-vllm_profile/
+vllm_profile*/
 *.out
 *.log

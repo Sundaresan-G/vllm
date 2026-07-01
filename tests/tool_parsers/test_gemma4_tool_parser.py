@@ -135,8 +135,6 @@ class TestParseGemma4Args:
         result = _parse_gemma4_args('name:<|"|>test<|"|>,flag:', partial=True)
         assert result == {"name": "test"}
 
-<<<<<<< HEAD
-=======
     def test_trailing_dot_float_partial_withheld(self):
         """Bare float ending with '.' is withheld in partial mode.
 
@@ -162,7 +160,6 @@ class TestParseGemma4Args:
         result = _parse_gemma4_args(":[t:[]")
         assert isinstance(result, dict)
 
->>>>>>> main
 
 class TestParseGemma4Array:
     def test_string_array(self):
@@ -177,8 +174,6 @@ class TestParseGemma4Array:
         result = _parse_gemma4_array("42,true,3.14")
         assert result == [42, True, 3.14]
 
-<<<<<<< HEAD
-=======
     @pytest.mark.timeout(5)
     def test_string_element_with_closing_bracket(self):
         result = _parse_gemma4_array('[<|"|>a]b<|"|>,<|"|>c<|"|>],<|"|>tail<|"|>')
@@ -198,7 +193,6 @@ class TestParseGemma4Array:
         result = _parse_gemma4_array("42,108.,3", partial=True)
         assert result == [42]
 
->>>>>>> main
 
 # ---------------------------------------------------------------------------
 # Non-streaming extraction tests

@@ -143,12 +143,6 @@ def test_models(
         # in parts of the operators
         pytest.skip(f"Skipping '{model}' model test with AITER kernel.")
 
-<<<<<<< HEAD
-    if current_platform.is_cpu() and model == "TitanML/tiny-mixtral":
-        # This untrained model is sensitive to the rounding error
-        # Fuse ops to reduce bfloat16 rounding
-        monkeypatch.setenv("VLLM_CPU_CI_ENV", "0")
-=======
     if model == "bigcode/starcoder2-3b":
         # Replace example.txt's Test1 (an NL prompt) with a code prompt:
         # starcoder2-3b is a code model, so NL prompts give near-uniform
@@ -157,7 +151,6 @@ def test_models(
         example_prompts[1] = (
             "def add(a, b):\n    return a + b\n\ndef sub(a, b):\n    return a - "
         )
->>>>>>> main
 
     with hf_runner(model) as hf_model:
         hf_outputs = hf_model.generate_greedy_logprobs_limit(

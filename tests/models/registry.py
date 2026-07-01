@@ -699,7 +699,6 @@ _LATE_INTERACTION_EXAMPLE_MODELS = {
     # [Multimodal]
     "ColModernVBertForRetrieval": _HfExamplesInfo(
         "ModernVBERT/colmodernvbert-merged",
-        revision="4a0a9f3ac7a7992fec410bfa8e3d080ac9a5bcee",
     ),
     "ColPaliForRetrieval": _HfExamplesInfo("vidore/colpali-v1.3-hf"),
     "ColQwen3": _HfExamplesInfo(
@@ -921,8 +920,6 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         "google/gemma-4-E2B-it",
         min_transformers_version="5.5.0",
     ),
-<<<<<<< HEAD
-=======
     # TODO: update min_transformers_version when Gemma4 Unified lands in
     # a stable transformers release.
     "Gemma4UnifiedForConditionalGeneration": _HfExamplesInfo(
@@ -930,7 +927,6 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         min_transformers_version="5.8.0",
         is_available_online=False,
     ),
->>>>>>> main
     "Gemma3nForConditionalGeneration": _HfExamplesInfo("google/gemma-3n-E2B-it"),
     "GlmAsrForConditionalGeneration": _HfExamplesInfo(
         "zai-org/GLM-ASR-Nano-2512",
@@ -973,13 +969,6 @@ _MULTIMODAL_EXAMPLE_MODELS = {
     "HCXVisionForCausalLM": _HfExamplesInfo(
         "naver-hyperclovax/HyperCLOVAX-SEED-Vision-Instruct-3B",
         trust_remote_code=True,
-        max_transformers_version="4.57",
-        transformers_version_reason={
-            "vllm": (
-                "Custom config cannot be loaded with Transformers "
-                "v5 because `text_config` is not always set"
-            )
-        },
     ),
     "HCXVisionV2ForCausalLM": _HfExamplesInfo(
         "naver-hyperclovax/HyperCLOVAX-SEED-Think-32B",
@@ -1110,12 +1099,9 @@ _MULTIMODAL_EXAMPLE_MODELS = {
     "MiDashengLMModel": _HfExamplesInfo(
         "mispeech/midashenglm-7b", trust_remote_code=True
     ),
-<<<<<<< HEAD
-=======
     "MiMoV2OmniForCausalLM": _HfExamplesInfo(
         "XiaomiMiMo/MiMo-V2.5-Omni", trust_remote_code=True, is_available_online=False
     ),
->>>>>>> main
     "MiniCPMO": _HfExamplesInfo(
         "openbmb/MiniCPM-o-2_6",
         trust_remote_code=True,
@@ -1239,13 +1225,10 @@ _MULTIMODAL_EXAMPLE_MODELS = {
                 "making all kwargs required. See https://huggingface.co/FreedomIntelligence/openPangu-VL-7B/discussions/2"
             )
         },
-<<<<<<< HEAD
-=======
     ),
     "OpenVLAForActionPrediction": _HfExamplesInfo(
         "openvla/openvla-7b",
         trust_remote_code=True,
->>>>>>> main
     ),
     "Ovis": _HfExamplesInfo(
         "AIDC-AI/Ovis2-1B",

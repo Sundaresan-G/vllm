@@ -16,7 +16,6 @@
 # limitations under the License.
 """Transformers modeling backend base class."""
 
-import sys
 from collections.abc import Callable, Iterable
 from itertools import chain
 from operator import attrgetter
