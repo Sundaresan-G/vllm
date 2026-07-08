@@ -31,7 +31,7 @@ OUTPUT_LEN=4
 NUM_PROMPTS=2
 
 # GPU_ENV="vllm_0.19.1_cuda"
-GPU_ENV="vllm_0.23.0_xpu"
+GPU_ENV="vllm_0.24.0_xpu"
 
 CONDA_BASE="/data/nfs_home/sundares/miniforge3"
 SCRIPT_DIR="/data/nfs_home/sundares/vllm/vllm/examples/others/shm_connector"
