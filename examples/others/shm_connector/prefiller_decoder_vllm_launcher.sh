@@ -43,6 +43,7 @@ if [[ $1 == "prefiller" ]]; then
     $(which vllm) serve $MODEL \
     --port 8100 \
     --trust-remote-code \
+    --shutdown-timeout 20 \
     --max-model-len 20000 \
     --max-num-seqs 10 \
     --max-num-batched-tokens 20000 \
@@ -68,6 +69,7 @@ elif [[ $1 == "decoder" ]]; then
     $(which vllm) serve $MODEL \
     --port 8200 \
     --trust-remote-code \
+    --shutdown-timeout 20 \
     --max-model-len 30000 \
     --max-num-seqs 10 \
     --max-num-batched-tokens 1000 \

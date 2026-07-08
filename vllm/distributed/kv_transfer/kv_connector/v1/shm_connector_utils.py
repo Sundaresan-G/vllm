@@ -14,10 +14,12 @@ source = """
 #include <map>
 
 #include <pybind11/pybind11.h>
+#include <torch/extension.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <functional>
 
 #if defined(_MSVC_LANG)
 #define XPU_CPP_STANDARD _MSVC_LANG
@@ -104,30 +106,54 @@ inline int xpu_unpin_host_memory(void *ptr) {
 
 namespace {
 
-    void pin_existing(uintptr_t ptr, size_t size, const uintptr_t syclQueueAddr) {
-        if (ptr == 0) {
-            throw std::invalid_argument("ptr must be non-zero");
+    // Pin the memory backing `source`, then return a new tensor that shares the
+    // same storage.  When the returned tensor's storage is released, the custom
+    // deleter (1) unpins the memory, then (2) drops the captured reference to
+    // `source`, allowing PyTorch to free the original storage if no other
+    // references remain.
+    torch::Tensor pin_and_wrap(torch::Tensor source, uintptr_t syclQueueAddr) {
+        if (!source.device().is_cpu()) {
+            throw std::invalid_argument("source tensor must be a CPU tensor");
+        }
+
+        // Use the storage base pointer and full storage size so that stride gaps
+        // in non-contiguous tensors are also pinned, preventing partial pinning.
+        void* ptr   = const_cast<void*>(source.storage().data());
+        size_t size = static_cast<size_t>(source.storage().nbytes());
+
+        if (ptr == nullptr) {
+            throw std::invalid_argument("source tensor has a null data pointer");
         }
         if (size == 0) {
-            throw std::invalid_argument("size must be > 0");
+            throw std::invalid_argument("source tensor has zero bytes");
+        }
+        if (syclQueueAddr == 0) {
+            throw std::invalid_argument("syclQueueAddr must be non-zero");
         }
 
-        void* raw_ptr = reinterpret_cast<void*>(ptr);
-        const sycl::queue* syclQueuePtr = reinterpret_cast<const sycl::queue*>(syclQueueAddr);
-        if (xpu_pin_host_memory(raw_ptr, size, syclQueuePtr) != 0) {
+        const sycl::queue* syclQueuePtr =
+            reinterpret_cast<const sycl::queue*>(syclQueueAddr);
+
+        if (xpu_pin_host_memory(ptr, size, syclQueuePtr) != 0) {
             throw std::runtime_error("xpu_pin_host_memory failed");
         }
-    }
 
-    void unpin_existing(uintptr_t ptr) {
-        if (ptr == 0) {
-            return;
-        }
-
-        void* raw_ptr = reinterpret_cast<void*>(ptr);
-        if (xpu_unpin_host_memory(raw_ptr) != 0) {
-            throw std::runtime_error("xpu_unpin_host_memory failed");
-        }
+        // Capture `source` by value to keep the storage alive for at least as
+        // long as the returned tensor is alive.  Unpin before releasing the
+        // reference so the pointer is still valid during zeMemFree.
+        return torch::from_blob(
+            source.data_ptr(),
+            source.sizes(),
+            source.strides(),
+            [source](void* p) {
+                // Unpin the storage base (not the tensor's data_ptr which may
+                // be offset into the storage for non-contiguous tensors).
+                xpu_unpin_host_memory(const_cast<void*>(source.storage().data()));
+                // `source` goes out of scope here; if this was the last
+                // reference its storage is freed by PyTorch normally.
+            },
+            source.options()
+        );
     }
 
 } // namespace
@@ -137,14 +163,11 @@ namespace py = pybind11;
 PYBIND11_MODULE(xpu_pin_memory_ext, m) {
     m.doc() = "pybind wrapper for xpu_pin_memory.hpp";
 
-    // Pin/unpin functions that accept sycl::queue address
-    m.def("pin_existing", &pin_existing,
-          py::arg("ptr_addr"), py::arg("size"), py::arg("queue_addr"),
-          "Pin existing page-aligned host memory by address and queue address");
-
-    m.def("unpin_existing", &unpin_existing,
-          py::arg("ptr_addr"),
-          "Unpin previously pinned memory by address");
+    m.def("pin_and_wrap", &pin_and_wrap,
+          py::arg("source"), py::arg("queue_addr"),
+          "Pin a contiguous CPU tensor and return a new tensor backed by the "
+          "same memory; the returned tensor's destructor unpins the memory and "
+          "releases the reference to the original tensor");
 }
 
 // End of CPP file for pybind11 bindings

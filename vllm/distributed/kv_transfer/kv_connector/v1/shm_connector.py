@@ -6,6 +6,7 @@ import queue
 import time
 from collections import defaultdict
 from dataclasses import dataclass
+from multiprocessing import resource_tracker as _resource_tracker
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -136,6 +137,9 @@ class ShmConnector(KVConnectorBase_V1):
         super().__init__(vllm_config, role, kv_cache_config)
         assert vllm_config.kv_transfer_config is not None
         assert vllm_config.kv_transfer_config.engine_id is not None
+        assert current_platform.device_type == "cpu" or envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU, (
+            "ShmConnector requires VLLM_OFFLOAD_KV_CACHE_TO_CPU=1 for non-CPU devices"
+        )
         self.kv_cache_config = kv_cache_config
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
         self.kv_transfer_config = vllm_config.kv_transfer_config
@@ -781,6 +785,7 @@ class ShmConnectorWorker:
         self.remote_cached_kv_caches: dict[EngineId, dict[str, list[torch.Tensor]]] = {}
         self.remote_cached_shm_kv_caches_completion_flags: dict[EngineId, list[shared_memory.SharedMemory]] = {}
         self._send_ReqId2CompletionIdx : dict[ReqId, int] = {}
+        self._shutdown_called: bool = False
         
         logger.info(
             "Registering KV_Caches. use_mla: %s, kv_buffer_device: %s, ",
@@ -891,7 +896,8 @@ class ShmConnectorWorker:
                 from vllm.distributed.kv_transfer.kv_connector.v1 import shm_connector_utils
 
                 xpu_pin_memory_ext = shm_connector_utils.load_xpu_pin_memory_extension()
-                xpu_pin_memory_ext.pin_existing(cache_or_caches.data_ptr(), original_cache_size, torch.xpu.current_stream().sycl_queue)
+                cache_or_caches = xpu_pin_memory_ext.pin_and_wrap(
+                    cache_or_caches, torch.xpu.current_stream().sycl_queue)
 
             logger.debug(f"Successfully pinned memory for {layer_name} on device {self.device_type}")
 
@@ -1309,6 +1315,11 @@ class ShmConnectorWorker:
                             create=False,
                         )
                         )
+                        # This is a remote-owned object; don't let resource_tracker unlink it
+                        try:
+                            _resource_tracker.unregister(f"/{meta.remote.filename}_tp{remote_tp_rank}_flags", "shared_memory")
+                        except Exception as e:
+                            logger.warning("Failed to unregister completion flags shm from resource_tracker for engine %s tp_rank %s: %s", remote_engine_id, remote_tp_rank, e)
                     except FileNotFoundError:
                         logger.error(
                             "Shared memory for remote engine %s completion flags "
@@ -1335,6 +1346,11 @@ class ShmConnectorWorker:
                                 name=remote_shm_name,
                                 create=False,
                             )
+                            # This is a remote-owned object; don't let resource_tracker unlink it
+                            try:
+                                _resource_tracker.unregister(f"/{remote_shm_name}", "shared_memory")
+                            except Exception as e:
+                                logger.warning("Failed to unregister kv cache shm from resource_tracker for engine %s layer %s tp_rank %s: %s", remote_engine_id, layer_name, remote_tp_rank, e)
                             # Store it to prevent cleanup
                             self.remote_shm_objects[remote_engine_id][layer_name].append(remote_shm_buffer)
                         except FileNotFoundError:
@@ -1368,6 +1384,11 @@ class ShmConnectorWorker:
                                 name=remote_meta_shm_name,
                                 create=False,
                             )
+                            # This is a remote-owned object; don't let resource_tracker unlink it
+                            try:
+                                _resource_tracker.unregister(f"/{remote_meta_shm_name}", "shared_memory")
+                            except Exception as e:
+                                logger.warning("Failed to unregister metadata shm from resource_tracker for engine %s layer %s tp_rank %s: %s", remote_engine_id, layer_name, remote_tp_rank, e)
                         except FileNotFoundError:
                             logger.error(
                                 "Metadata shared memory for remote engine %s and layer %s "
@@ -1737,6 +1758,9 @@ class ShmConnectorWorker:
 
     def shutdown(self):
         """Shutdown the connector worker."""
+        if self._shutdown_called:
+            return
+        self._shutdown_called = True
         # First clear tensor references to shared memory
         if hasattr(self, 'device_kv_caches'):
             for layer_name, tensor in self.device_kv_caches.items():

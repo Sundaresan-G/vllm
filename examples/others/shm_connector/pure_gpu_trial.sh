@@ -4,7 +4,7 @@
 #SBATCH --output=slurm-b70-runs-%j.out
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --time=00:59:00
+#SBATCH --time=02:59:00
 
 set -x
 
@@ -13,7 +13,7 @@ lscpu
 numactl -H | grep -E 'node [0-9]+ (size|free)'
 for node in /sys/devices/system/node/node[0-9]*; do
     nid=$(basename $node | tr -d 'node')
-    awk -v n=$nid '/MemTotal/{t=$4} /MemFree/{f=$4} /FilePages/{c=$4} /Slab/{s=$4} END{printf "node%s: total=%dGB free=%dGB actual_used=%dGB page_cache=%dGB\n", n, t/1024/1024, f/1024/1024, (t-f-c-s)/1024/1024, (c+s)/1024/1024}' $node/meminfo
+    awk -v n=$nid '/MemTotal/{t=$4} /MemFree/{f=$4} /FilePages/{c=$4} /Slab/{s=$4} END{printf "node%s: total=%.2fGB free=%.2fGB actual_used=%.2fGB page_cache=%.2fGB\n", n, t/1024/1024, f/1024/1024, (t-f-c-s)/1024/1024, (c+s)/1024/1024}' $node/meminfo
 done
 sudo nvtop -s | grep mem_util | awk '{print "GPU " NR-1 ":", $0}'
 
@@ -26,9 +26,9 @@ PIDS=()
 MODEL="Qwen/Qwen3-30B-A3B"
 # MODEL="Qwen/Qwen3-235B-A22B"
 # MODEL="Qwen/Qwen2.5-1.5B"
-INPUT_LEN=16384
+INPUT_LEN=8192
 OUTPUT_LEN=4
-NUM_PROMPTS=8
+NUM_PROMPTS=2
 
 # GPU_ENV="vllm_0.19.1_cuda"
 GPU_ENV="vllm_0.23.0_xpu"
@@ -51,40 +51,49 @@ log() {
     echo "[${file}:${line} ${func}()] $*" >&2
 }
 
-# Kill a PID and all its descendants at any depth (BFS collect, reverse kill)
-kill_tree() {
-    local root=$1
+# Kill all processes in a session (setsid makes the launched PID the SID leader,
+# so SID == PID. Session membership survives os.setsid() in children unlike PGID.)
+kill_session() {
+    local sid=$1
     local signal=${2:-TERM}
-    [[ -z "$root" ]] && return 0
-    local -a all=("$root")
-    local i=0
-    while (( i < ${#all[@]} )); do
-        local children
-        children=$(pgrep -P "${all[$i]}" 2>/dev/null) || true
-        for c in $children; do all+=("$c"); done
-        (( i++ ))
-    done
-    # Kill in reverse so leaves die before their parents
-    for (( j=${#all[@]}-1; j>=0; j-- )); do
-        kill -"$signal" "${all[$j]}" 2>/dev/null || true
-    done
+    [[ -z "$sid" ]] && return 0
+    pkill -"$signal" -s "$sid" 2>/dev/null || true
 }
 
 stop_server() {
     log "Stopping server…"
-    # Graceful SIGTERM to each tracked PID tree
-    for pid in "${PIDS[@]}"; do
-        kill_tree "$pid" TERM
+    ps -u $USER -o pid,ppid,pgid,sid,cmd || true
+    # Graceful SIGTERM to each tracked session
+    for sid in "${PIDS[@]}"; do
+        kill_session "$sid" TERM
     done
-    sleep 5
+    sleep 30
+    ps -u $USER -o pid,ppid,pgid,sid,cmd || true
     # Force SIGKILL any survivors
-    for pid in "${PIDS[@]}"; do
-        kill_tree "$pid" KILL
+    for sid in "${PIDS[@]}"; do
+        kill_session "$sid" KILL
     done
     wait -- "${PIDS[@]}" 2>/dev/null || true
     PIDS=()
     log "Cleaning up shared memory..."
     find /dev/shm -maxdepth 1 -user $USER -type f -exec rm -f {} +
+
+    # Per-node memory diff
+    while IFS='=:' read -r node free_kb actual_kb cache_kb; do
+        local vfree="BASELINE_${node^^}_FREE"
+        local vactual="BASELINE_${node^^}_ACTUAL"
+        local vcache="BASELINE_${node^^}_CACHE"
+        local b_free=${!vfree} b_actual=${!vactual} b_cache=${!vcache}
+        [[ -z "$b_free" ]] && continue
+        local lost_gb=$(echo "scale=2; ($b_free - $free_kb) / 1048576" | bc)
+        local b_free_gb=$(echo "scale=2; $b_free / 1048576" | bc)
+        local free_gb=$(echo "scale=2; $free_kb / 1048576" | bc)
+        local b_actual_gb=$(echo "scale=2; $b_actual / 1048576" | bc)
+        local actual_gb=$(echo "scale=2; $actual_kb / 1048576" | bc)
+        local b_cache_gb=$(echo "scale=2; $b_cache / 1048576" | bc)
+        local cache_gb=$(echo "scale=2; $cache_kb / 1048576" | bc)
+        log "${node}: free: ${b_free_gb}GB -> ${free_gb}GB (lost ${lost_gb}GB)  |  actual_used: ${b_actual_gb}GB -> ${actual_gb}GB  |  page_cache: ${b_cache_gb}GB -> ${cache_gb}GB"
+    done < <(snapshot_stats_per_node)
 }
 
 cleanup() {
@@ -108,7 +117,7 @@ wait_for_server() {
     numactl -H | grep -E 'node [0-9]+ (size|free)'
     for node in /sys/devices/system/node/node[0-9]*; do
         nid=$(basename $node | tr -d 'node')
-        awk -v n=$nid '/MemTotal/{t=$4} /MemFree/{f=$4} /FilePages/{c=$4} /Slab/{s=$4} END{printf "node%s: total=%dGB free=%dGB actual_used=%dGB page_cache=%dGB\n", n, t/1024/1024, f/1024/1024, (t-f-c-s)/1024/1024, (c+s)/1024/1024}' $node/meminfo
+        awk -v n=$nid '/MemTotal/{t=$4} /MemFree/{f=$4} /FilePages/{c=$4} /Slab/{s=$4} END{printf "node%s: total=%.2fGB free=%.2fGB actual_used=%.2fGB page_cache=%.2fGB\n", n, t/1024/1024, f/1024/1024, (t-f-c-s)/1024/1024, (c+s)/1024/1024}' $node/meminfo
     done
     sudo nvtop -s | grep mem_util | awk '{print "GPU " NR-1 ":", $0}'
 
@@ -137,6 +146,14 @@ wait_for_server() {
   done
 }
 
+# Print per-node stats as "nodeN=free:actual_used:page_cache" lines (stdout, all in kB)
+snapshot_stats_per_node() {
+    for node in /sys/devices/system/node/node[0-9]*; do
+        nid=$(basename $node | tr -d 'node')
+        awk -v n=$nid '/MemTotal/{t=$4} /MemFree/{f=$4} /FilePages/{c=$4} /Slab/{s=$4} END{printf "node%s=%d:%d:%d\n", n, f, t-f-c-s, c+s}' $node/meminfo
+    done
+}
+
 main() {
 
     trap cleanup INT
@@ -146,27 +163,33 @@ main() {
     source $CONDA_BASE/etc/profile.d/conda.sh
     conda activate $GPU_ENV
 
+    # Capture memory baseline before server starts
+    while IFS='=:' read -r node free_kb actual_kb cache_kb; do
+        declare -g "BASELINE_${node^^}_FREE=$free_kb"
+        declare -g "BASELINE_${node^^}_ACTUAL=$actual_kb"
+        declare -g "BASELINE_${node^^}_CACHE=$cache_kb"
+    done < <(snapshot_stats_per_node)
+    log "Memory baseline: $(snapshot_stats_per_node | tr '\n' ' ')"
+
     # python -m debugpy --listen 0.0.0.0:5678 --wait-for-client \
     # --offload-group-size 1 --offload-num-in-group 1 --offload-prefetch-step 2 \
     # --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile", "torch_profiler_record_shapes": 1, "torch_profiler_with_flops": 1, "torch_profiler_with_stack": 1, "torch_profiler_with_memory": 1}'
 
-    # If VLLM_OFFLOAD_KV_CACHE_TO_CPU=1, then KV_BUFFER_DEVICE does not matter and it will be ignored.
-    (
-        # export ONEAPI_DEVICE_SELECTOR="level_zero:0,4;"
-        # export ONEAPI_DEVICE_SELECTOR="level_zero:0,1;"
-        # export ONEAPI_DEVICE_SELECTOR="level_zero:0,1,2,3;"
-        export ONEAPI_DEVICE_SELECTOR="level_zero:0,1,4,5;"
+    setsid bash -c "
+        # export ONEAPI_DEVICE_SELECTOR='level_zero:0,1,4,5;'
 
-        sycl-ls --verbose 
+        sycl-ls --verbose
 
-        # NEOReadDebugKeys=1 \
-        # EnableSharedSystemUsmSupport=1 \
-        VLLM_KV_CACHE_LAYOUT="NHD" \
-        VLLM_OFFLOAD_KV_CACHE_TO_CPU=1 \
-        VLLM_XPU_ENABLE_XPU_GRAPH=0 \
-        $(which vllm) serve $MODEL --trust-remote-code \
-        --port 9000 --max-model-len 20000 --max-num-seqs 10  --enforce-eager -tp 4  --max-num-batched-tokens 20000 --no-enable-prefix-caching --block-size 64 --num-gpu-blocks-override 350 --offload-group-size 1 --offload-num-in-group 1 --offload-prefetch-step 2 \
-    ) &
+        # NEOReadDebugKeys=1 \\
+        # EnableSharedSystemUsmSupport=1 \\
+        VLLM_KV_CACHE_LAYOUT='NHD' \\
+        VLLM_OFFLOAD_KV_CACHE_TO_CPU=1 \\
+        VLLM_XPU_ENABLE_XPU_GRAPH=0 \\
+        \$(which vllm) serve ${MODEL} --trust-remote-code \\
+        --port 9000 --max-model-len 20000 --max-num-seqs 10 --enforce-eager -tp 1 --max-num-batched-tokens 20000 \\
+        --no-enable-prefix-caching --block-size 64 --num-gpu-blocks-override 350 \\
+        --offload-group-size 1 --offload-num-in-group 1 --offload-prefetch-step 2
+    " > >(tee server.log) 2>&1 &
 
     server_pid=$!
     PIDS+=($server_pid)

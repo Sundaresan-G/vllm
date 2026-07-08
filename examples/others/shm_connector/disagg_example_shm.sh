@@ -33,7 +33,7 @@ print_mem_stats() {
     numactl -H
     for node in /sys/devices/system/node/node[0-9]*; do
         nid=$(basename $node | tr -d 'node')
-        awk -v n=$nid '/MemTotal/{t=$4} /MemFree/{f=$4} /FilePages/{c=$4} /Slab/{s=$4} END{printf "node%s: total=%dGB free=%dGB actual_used=%dGB page_cache=%dGB\n", n, t/1024/1024, f/1024/1024, (t-f-c-s)/1024/1024, (c+s)/1024/1024}' $node/meminfo
+        awk -v n=$nid '/MemTotal/{t=$4} /MemFree/{f=$4} /FilePages/{c=$4} /Slab/{s=$4} END{printf "node%s: total=%.2fGB free=%.2fGB actual_used=%.2fGB page_cache=%.2fGB\n", n, t/1024/1024, f/1024/1024, (t-f-c-s)/1024/1024, (c+s)/1024/1024}' $node/meminfo
     done
     sudo nvtop -s | grep mem_util | awk '{print "GPU " NR-1 ":", $0}'
 }
@@ -86,7 +86,23 @@ stop_server() {
     PIDS=()
     log "Cleaning up shared memory..."
     find /dev/shm -maxdepth 1 -user $USER -type f -exec rm -f {} +
-    print_mem_stats
+
+    # Per-node memory diff
+    while IFS='=:' read -r node free_kb actual_kb cache_kb; do
+        local vfree="BASELINE_${node^^}_FREE"
+        local vactual="BASELINE_${node^^}_ACTUAL"
+        local vcache="BASELINE_${node^^}_CACHE"
+        local b_free=${!vfree} b_actual=${!vactual} b_cache=${!vcache}
+        [[ -z "$b_free" ]] && continue
+        local lost_gb=$(echo "scale=2; ($b_free - $free_kb) / 1048576" | bc)
+        local b_free_gb=$(echo "scale=2; $b_free / 1048576" | bc)
+        local free_gb=$(echo "scale=2; $free_kb / 1048576" | bc)
+        local b_actual_gb=$(echo "scale=2; $b_actual / 1048576" | bc)
+        local actual_gb=$(echo "scale=2; $actual_kb / 1048576" | bc)
+        local b_cache_gb=$(echo "scale=2; $b_cache / 1048576" | bc)
+        local cache_gb=$(echo "scale=2; $cache_kb / 1048576" | bc)
+        log "${node}: free: ${b_free_gb}GB -> ${free_gb}GB (lost ${lost_gb}GB)  |  actual_used: ${b_actual_gb}GB -> ${actual_gb}GB  |  page_cache: ${b_cache_gb}GB -> ${cache_gb}GB"
+    done < <(snapshot_stats_per_node)
 }
 
 cleanup() {
@@ -94,16 +110,6 @@ cleanup() {
     log "Stopping everything… (reason: ${reason})"
     trap '' INT TERM  # ignore signals during cleanup to prevent re-entrancy
     stop_server
-    # Per-node memory diff
-    while IFS='=:' read -r node free_kb actual_kb cache_kb; do
-        local vfree="MEM_BASELINE_${node^^}_FREE"
-        local vactual="MEM_BASELINE_${node^^}_ACTUAL"
-        local vcache="MEM_BASELINE_${node^^}_CACHE"
-        local b_free=${!vfree} b_actual=${!vactual} b_cache=${!vcache}
-        [[ -z "$b_free" ]] && continue
-        local lost_free_gb=$(echo "scale=2; ($b_free - $free_kb) / 1048576" | bc)
-        log "${node}: free: $(( b_free/1048576 ))GB -> $(( free_kb/1048576 ))GB (lost ${lost_free_gb}GB)  |  actual_used: $(( b_actual/1048576 ))GB -> $(( actual_kb/1048576 ))GB  |  page_cache: $(( b_cache/1048576 ))GB -> $(( cache_kb/1048576 ))GB"
-    done < <(snapshot_stats_per_node)
     exit 0
 }
 
@@ -165,38 +171,35 @@ main() {
 
     # Capture per-node baseline
     while IFS='=:' read -r node free_kb actual_kb cache_kb; do
-        declare -g "MEM_BASELINE_${node^^}_FREE=$free_kb"
-        declare -g "MEM_BASELINE_${node^^}_ACTUAL=$actual_kb"
-        declare -g "MEM_BASELINE_${node^^}_CACHE=$cache_kb"
-        log "Memory baseline ${node}: free=$(( free_kb/1048576 ))GB  actual_used=$(( actual_kb/1048576 ))GB  page_cache=$(( cache_kb/1048576 ))GB"
+        declare -g "BASELINE_${node^^}_FREE=$free_kb"
+        declare -g "BASELINE_${node^^}_ACTUAL=$actual_kb"
+        declare -g "BASELINE_${node^^}_CACHE=$cache_kb"
+        log "Memory baseline ${node}: free=$(echo "scale=2; $free_kb / 1048576" | bc)GB  actual_used=$(echo "scale=2; $actual_kb / 1048576" | bc)GB  page_cache=$(echo "scale=2; $cache_kb / 1048576" | bc)GB"
     done < <(snapshot_stats_per_node)
     log "Please check prefiller.log, decoder.log and proxy.log for logs."
 
     setsid bash -c "
-        exec > >(tee decoder.log) 2>&1
         source '${CONDA_BASE}/etc/profile.d/conda.sh'
         conda activate '${CPU_ENV}'
         VLLM_TP=2 VLLM_LOGGING_PREFIX='DECODER ' \
         numactl -C 8-59,68-119 \
         bash prefiller_decoder_vllm_launcher.sh decoder '${MODEL}'
-    " &
+    " > >(tee decoder.log) 2>&1 &
     decoder_pid=$!
     PIDS+=($decoder_pid)
 
     setsid bash -c "
-        exec > >(tee prefiller.log) 2>&1
         source '${CONDA_BASE}/etc/profile.d/conda.sh'
         conda activate '${GPU_ENV}'
         # ONEAPI_DEVICE_SELECTOR='level_zero:0,4;opencl:0,4'
         VLLM_TP=4 VLLM_LOGGING_PREFIX='PREFILLER ' \
         numactl -C 0-7 \
         bash prefiller_decoder_vllm_launcher.sh prefiller '${MODEL}'
-    " &
+    " > >(tee prefiller.log) 2>&1 &
     prefiller_pid=$!
     PIDS+=($prefiller_pid)
 
     setsid bash -c "
-        exec > >(tee proxy.log) 2>&1
         source '${CONDA_BASE}/etc/profile.d/conda.sh'
         conda activate '${GPU_ENV}'
         numactl -C 60-67 \
@@ -207,7 +210,7 @@ main() {
             --prefiller-port 8100 \
             --decoder-host localhost \
             --decoder-port 8200
-    " &
+    " > >(tee proxy.log) 2>&1 &
     proxy_pid=$!
     PIDS+=($proxy_pid)
 
