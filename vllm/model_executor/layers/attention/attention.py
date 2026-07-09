@@ -485,23 +485,6 @@ class Attention(nn.Module, AttentionLayerBase):
             if self.impl.supports_quant_query_input:
                 query, _ = self.query_quant(query, self._q_scale)
 
-        # Set forward context kv_cache to the device scratch
-        if envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU:
-            forward_context = get_forward_context()
-            if hasattr(forward_context.no_compile_layers[self.layer_name], "kv_cache_device_scratch"):
-                kv_cache_device_scratch_raw = forward_context.no_compile_layers[self.layer_name].kv_cache_device_scratch
-                kv_cache_forward_context = forward_context.no_compile_layers[self.layer_name].kv_cache
-
-                kv_cache_device_scratch = kv_cache_device_scratch_raw.view(kv_cache_forward_context.dtype).as_strided(
-                    kv_cache_forward_context.shape,
-                    kv_cache_forward_context.stride(),
-                    storage_offset=0
-                )
-
-                
-                forward_context.no_compile_layers[self.layer_name].curr_layer_kv_cache_cpu = kv_cache_forward_context
-                forward_context.no_compile_layers[self.layer_name].kv_cache = kv_cache_device_scratch
-
         if output_shape is None:
             # Handle both 2D [num_tokens, hidden] and
             # 3D [num_tokens, heads, head_dim] query
@@ -558,14 +541,6 @@ class Attention(nn.Module, AttentionLayerBase):
                 encoded,
                 kv_cache_dummy_dep=kv_cache_dummy_dep,
             )
-        
-        # Restore the original CPU KV cache after attention forward
-        if envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU:
-            forward_context = get_forward_context()
-            if hasattr(forward_context.no_compile_layers[self.layer_name], "curr_layer_kv_cache_cpu"):
-                forward_context.no_compile_layers[self.layer_name].kv_cache = forward_context.no_compile_layers[self.layer_name].curr_layer_kv_cache_cpu
-
-                delattr(forward_context.no_compile_layers[self.layer_name], "curr_layer_kv_cache_cpu")
         
         return output.view(-1, hidden_size)
 
@@ -728,6 +703,16 @@ def get_attention_context(
         attn_metadata = attn_metadata_raw
     attn_layer: Attention | MLAAttention = forward_context.no_compile_layers[layer_name]
     kv_cache = attn_layer.kv_cache
+    # When KV cache is offloaded to CPU, use the device scratch (on-device
+    # tensor) instead. This must happen here rather than in Attention.forward()
+    # because torch.compile bypasses Attention.forward() and calls the custom
+    # ops (unified_kv_cache_update / unified_attention_with_output) directly.
+    if hasattr(attn_layer, "kv_cache_device_scratch"):
+        kv_cache = attn_layer.kv_cache_device_scratch.view(kv_cache.dtype).as_strided(
+            kv_cache.shape,
+            kv_cache.stride(),
+            storage_offset=0,
+        )
     slot_mapping = forward_context.slot_mapping
     assert isinstance(slot_mapping, dict), (
         f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
@@ -760,11 +745,11 @@ def unified_kv_cache_update(
         )
 
         if envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU:
-            forward_context = get_forward_context()
-            if hasattr(forward_context.no_compile_layers[layer_name], "curr_layer_kv_cache_cpu"):
-                kv_cache_cpu = forward_context.no_compile_layers[layer_name].curr_layer_kv_cache_cpu
-
-                # Write to the kv cache on cpu too
+            if hasattr(attn_layer, "kv_cache_device_scratch"):
+                # kv_cache is the device scratch; attn_layer.kv_cache is the
+                # CPU tensor. Write new KV to CPU too so it persists across
+                # requests.
+                kv_cache_cpu = attn_layer.kv_cache
                 attn_layer.impl.do_kv_cache_update(
                     attn_layer,
                     key,

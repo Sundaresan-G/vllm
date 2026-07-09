@@ -49,11 +49,11 @@ if [[ $1 == "prefiller" ]]; then
     --max-num-batched-tokens 20000 \
     --block-size $BLOCK_SIZE \
     --kv-transfer-config '{"kv_connector":"ShmConnector","kv_role":"kv_both"}' \
-    --enforce-eager \
     -tp $VLLM_TP \
     --num-gpu-blocks-override $((2 * 20000 / BLOCK_SIZE)) \
-    --offload-group-size 1 --offload-num-in-group 1 --offload-prefetch-step 2 \
     --enable-prefix-caching \
+    --offload-group-size 1 --offload-num-in-group 1 --offload-prefetch-step 2 \
+    # --enforce-eager \
     # --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile_prefiller", "torch_profiler_record_shapes": 1, "torch_profiler_with_flops": 1, "torch_profiler_with_stack": 1, "torch_profiler_with_memory": 1}' \
     
 elif [[ $1 == "decoder" ]]; then
