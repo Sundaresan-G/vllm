@@ -17,15 +17,15 @@
 set -x
 
 # MODEL="Qwen/Qwen2.5-1.5B-Instruct"
-MODEL="Qwen/Qwen2.5-7B"
-# MODEL="Qwen/Qwen3-30B-A3B"
+# MODEL="Qwen/Qwen2.5-7B"
+MODEL="Qwen/Qwen3-30B-A3B"
 # MODEL="sarvamai/sarvam-30b"
-INPUT_LEN=2048
+INPUT_LEN=16384
 OUTPUT_LEN=8
 NUM_PROMPTS=3
 
-GPU_ENV="vllm_0.24.0_xpu"
-CPU_ENV="vllm_0.24.0_cpu"
+GPU_ENV="vllm_0.25.1_xpu"
+CPU_ENV="vllm_0.25.1_cpu"
 CONDA_BASE="/data/nfs_home/sundares/miniforge3"
 SHM_CONNECTOR_DIR="/data/nfs_home/sundares/vllm/vllm/examples/others/shm_connector"
 
@@ -248,28 +248,28 @@ main() {
             --num-prompts $NUM_PROMPTS --max-concurrency 1 \
             2>&1 | tee benchmark.log
 
-        # $(which vllm) bench serve --port 9000 --seed $(date +%s) \
-        #     --model $MODEL \
-        #     --dataset-name prefix_repetition \
-        #     --prefix-repetition-prefix-len $((INPUT_LEN/2)) \
-        #     --prefix-repetition-suffix-len $((INPUT_LEN/2)) \
-        #     --prefix-repetition-num-prefixes 1 \
-        #     --prefix-repetition-output-len $OUTPUT_LEN \
-        #     --num-prompts $NUM_PROMPTS \
-        #     --max-concurrency 1 \
-        #     2>&1 | tee benchmark_prefix_caching.log
+        $(which vllm) bench serve --port 9000 --seed $(date +%s) \
+            --model $MODEL \
+            --dataset-name prefix_repetition \
+            --prefix-repetition-prefix-len $((INPUT_LEN/2)) \
+            --prefix-repetition-suffix-len $((INPUT_LEN/2)) \
+            --prefix-repetition-num-prefixes 1 \
+            --prefix-repetition-output-len $OUTPUT_LEN \
+            --num-prompts $NUM_PROMPTS \
+            --max-concurrency 1 \
+            2>&1 | tee benchmark_prefix_caching.log
 
-        # curl --fail-with-body -X POST http://localhost:9000/v1/completions \
-        # -H "Content-Type: application/json" \
-        # -d '{
-        #     "model": "'"$MODEL"'",
-        #     "prompt": [
-        #     "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, and tensor parallelism to serve large language models efficiently. Requests are scheduled by a central scheduler that tracks per-request KV cache block allocations. The KV cache is divided into fixed-size blocks, and a block table maps logical blocks to physical GPU memory. Prefix caching reuses KV blocks for identical prompt prefixes across requests, avoiding redundant computation. Now answer the following question: What are the main benefits of prefix caching in LLM serving?"
-        #     ],
-        #     "max_tokens": 200,
-        #     "temperature": 0.7
-        # }' \
-        # 2>&1 | tee "accuracy_test.log"
+        curl --fail-with-body -X POST http://localhost:9000/v1/completions \
+        -H "Content-Type: application/json" \
+        -d '{
+            "model": "'"$MODEL"'",
+            "prompt": [
+            "You are a helpful AI assistant. The following context describes a large distributed inference system. The system uses paged KV caching, continuous batching, and tensor parallelism to serve large language models efficiently. Requests are scheduled by a central scheduler that tracks per-request KV cache block allocations. The KV cache is divided into fixed-size blocks, and a block table maps logical blocks to physical GPU memory. Prefix caching reuses KV blocks for identical prompt prefixes across requests, avoiding redundant computation. Now answer the following question: What are the main benefits of prefix caching in LLM serving?"
+            ],
+            "max_tokens": 200,
+            "temperature": 0.7
+        }' \
+        2>&1 | tee "accuracy_test.log"
 
         # echo -e "\n\n" | tee -a "accuracy_test.log"
 
