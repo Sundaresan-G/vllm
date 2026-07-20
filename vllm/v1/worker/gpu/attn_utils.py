@@ -7,6 +7,7 @@ from typing import Any, cast
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import (
     VllmConfig,
     get_layers_from_vllm_config,
@@ -172,6 +173,16 @@ def init_attn_backend(
 def _allocate_kv_cache(
     kv_cache_config: KVCacheConfig, shared_layers: dict[str, str], device: torch.device
 ):
+    # When VLLM_OFFLOAD_KV_CACHE_TO_CPU is set on a non-CPU device, allocate the
+    # KV cache tensors on pinned CPU memory. An on-device scratch buffer is
+    # bound separately (see init_kv_cache) so attention kernels still run on the
+    # device. Mirrors the V1 runner's _allocate_kv_cache_tensors behavior.
+    offload_kv_cache_to_cpu = (
+        envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU and device.type != "cpu"
+    )
+    alloc_device: str | torch.device = "cpu" if offload_kv_cache_to_cpu else device
+    pin_memory = offload_kv_cache_to_cpu
+
     kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
     packed_backing: torch.Tensor | None = None
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
@@ -179,11 +190,19 @@ def _allocate_kv_cache(
             # Allocate once; all packed tensors alias the same backing.
             if packed_backing is None:
                 packed_backing = torch.zeros(
-                    kv_cache_tensor.size, dtype=torch.int8, device=device
+                    kv_cache_tensor.size,
+                    dtype=torch.int8,
+                    device=alloc_device,
+                    pin_memory=pin_memory,
                 )
             tensor = packed_backing
         else:
-            tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
+            tensor = torch.zeros(
+                kv_cache_tensor.size,
+                dtype=torch.int8,
+                device=alloc_device,
+                pin_memory=pin_memory,
+            )
         for layer_name in kv_cache_tensor.shared_by:
             kv_cache_raw_tensors[layer_name] = tensor
 
@@ -540,6 +559,23 @@ def init_kv_cache(
         shared_kv_cache_layers=shared_kv_cache_layers,
         kv_cache_config=kv_cache_config,
     )
+
+    # When the KV cache is offloaded to CPU, attention kernels still run on the
+    # device against a shared on-device scratch buffer sized to the largest
+    # layer. Bind it to each layer's forward context; the attention custom ops
+    # redirect to this scratch and write results back to the CPU tensor.
+    if envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU and device.type != "cpu":
+        max_size = 0
+        for kv_cache in kv_caches.values():
+            max_size = max(max_size, kv_cache.numel() * kv_cache.element_size())
+        kv_cache_device_scratch = torch.empty(
+            max_size, dtype=torch.int8, device=device
+        )
+        for layer_name in kv_caches:
+            forward_context[layer_name].kv_cache_device_scratch = (
+                kv_cache_device_scratch
+            )
+
     bind_kv_cache(kv_caches, forward_context, runner_kv_caches)
     return kv_caches
 

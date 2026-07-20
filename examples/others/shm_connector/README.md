@@ -1,22 +1,34 @@
 # Installation Instructions
 ## NVIDIA GPUs:
 ```bash
-echo '
+bash << 'SCRIPT' 2>&1 | tee build_cuda_0.25.1_$(date +%Y%m%d_%H%M%S).log
 set -xe
 # Ensure that the tag is present as it is needed for proper versioning purpose
-# git fetch vllm_public tag v0.18.0 --no-tags
-# git reset --hard v0.18.0
-# conda create -n vllm_0.18.0_cuda python==3.12 -y
-eval "$(conda shell.bash hook)"
-conda activate vllm_0.18.0_cuda
+# git fetch vllm_public tag v0.25.1 --no-tags
+# git reset --hard v0.25.1
+CONDA_BASE="/data/nfs_home/sundares/miniforge3"
+source $CONDA_BASE/etc/profile.d/conda.sh
+conda create -n vllm_0.25.1_cuda python==3.12 -y
+mkdir -p $CONDA_BASE/envs/vllm_0.25.1_cuda/etc/conda/activate.d
+cat > $CONDA_BASE/envs/vllm_0.25.1_cuda/etc/conda/activate.d/cuda-vars.activate.sh << 'EOF'
+#!/bin/bash
+
+[[ "$-" != *x* ]] && _xtrace_was_off=1 && set -x
+
 source /swtools/cuda/12.9.0/cuda_vars.sh
-# TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install -r requirements/cuda.txt --extra-index-url https://download.pytorch.org/whl/cu129 -v 
-# pip install setuptools_scm
+
+if [[ -n "$_xtrace_was_off" ]]; then set +x; unset _xtrace_was_off; fi
+EOF
+conda activate vllm_0.25.1_cuda
+pip install "pip<26"
+pip install -r requirements/cuda.txt --extra-index-url https://download.pytorch.org/whl/cu129 -v
+pip install setuptools_scm
+pip install setuptools_rust
 # rm -rf .deps dist *.egg-info
-# TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install . --no-build-isolation -v --extra-index-url https://download.pytorch.org/whl/cu129
+# pip install . --no-build-isolation -v --extra-index-url https://download.pytorch.org/whl/cu129
 # git ls-files --others --exclude='.vscode' --exclude='example*' --exclude="build*" --exclude=".deps" | xargs rm
 # Ensure to comment out optional modules in setup.py
-NVCC_THREADS=4 TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" pip install -e . --no-build-isolation -v --extra-index-url https://download.pytorch.org/whl/cu129 --config-settings editable_mode=strict
+VLLM_VERSION_OVERRIDE="v0.25.1" NVCC_THREADS=4 pip install -e . --no-build-isolation -v --extra-index-url https://download.pytorch.org/whl/cu129 --config-settings editable_mode=strict
 TARGET_DIR=$(ls -dt build/__editable__.vllm-* 2>/dev/null | head -1) && \
 [ -n "$TARGET_DIR" ] || { echo "Error: No editable build directory found"; exit 1; } && \
 git ls-files --others --exclude='.vscode' --exclude='example*' --exclude="build*" --exclude=".deps" | \
@@ -27,7 +39,7 @@ while IFS= read -r file; do \
   echo "Moved: $file to $TARGET_DIR/$file"; \
 done
 set +xe
-' | bash 2>&1 | tee build_cuda_0.18.0_$(date +%Y%m%d_%H%M%S).log
+SCRIPT
 ```
 ## Intel GPUs:
 ```bash
