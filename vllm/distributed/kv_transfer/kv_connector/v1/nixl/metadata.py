@@ -39,8 +39,9 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
 #   2: Add remote_request_id to kv_transfer_params
 #   3: Add physical_blocks_per_logical_kv_block to NixlAgentMetadata
 #   4: Add KV block lease renewal through heartbeats
+#   5: Add kv_cache_memory_type to NixlAgentMetadata
 #
-NIXL_CONNECTOR_VERSION: int = 4
+NIXL_CONNECTOR_VERSION: int = 5
 
 
 @dataclass
@@ -56,6 +57,11 @@ class NixlAgentMetadata:
     ssm_sizes: tuple[int, int]
     attn_backend_name: str
     physical_blocks_per_logical_kv_block: int
+    # NIXL memory type ("VRAM"/"DRAM") of the registered KV cache. Needed so a
+    # consumer with a different local memory type (e.g. a CPU/DRAM decoder
+    # reading from a GPU/VRAM prefiller) can build remote transfer descriptors
+    # that resolve against the producer's registered memory.
+    kv_cache_memory_type: str = "VRAM"
 
 
 @dataclass

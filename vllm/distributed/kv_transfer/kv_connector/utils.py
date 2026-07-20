@@ -433,6 +433,14 @@ class TransferTopology:
             len(kv_cache_shape) == 5 and kv_cache_shape[0] == 1
         )
 
+        # Some backends (e.g. CPU_ATTN with shape
+        # [num_blocks, H, block_size, 2*D]) lay out num_blocks first and keep
+        # K and V joined in the last dimension, so there is no leading K/V
+        # dimension to register as separate regions. Such caches are
+        # registered as a single region per layer and cannot be virtually
+        # split into K/V halves.
+        self._kv_joined_in_block = (not self.is_mamba) and len(kv_cache_shape) == 4
+
         self._cross_layers_blocks = False
         if self.tensor_shape is not None:
             self._cross_layers_blocks = (
@@ -511,7 +519,10 @@ class TransferTopology:
     def split_k_and_v(self) -> bool:
         # Whether to register regions for K and V separately (when present).
         return not (
-            self._cross_layers_blocks or self.is_mla or self.is_kv_layout_blocks_first
+            self._cross_layers_blocks
+            or self.is_mla
+            or self.is_kv_layout_blocks_first
+            or self._kv_joined_in_block
         )
 
     # ============================================================

@@ -58,6 +58,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.ssm_conv_transfer_utils import
     MambaConvSplitInfo,
     derive_mamba_conv_split,
 )
+from vllm import envs
 from vllm.distributed.nixl_utils import NixlWrapper, nixl_agent_config
 from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
@@ -347,6 +348,14 @@ class NixlBaseConnectorWorker:
         self.num_blocks = kv_cache_config.num_blocks
         self.enable_permute_local_kv = False
         self.enable_heterogeneous_attn_post_process = False
+        # KV cache layout ("NHD"/"HND") reported by a heterogeneous remote
+        # (e.g. GPU flash-attn prefiller). Captured at handshake and used to
+        # reinterpret received bytes during the CPU_ATTN repack.
+        self._heterogeneous_remote_layout: str | None = None
+        # Number of remote-rank head slices concatenated into one local block
+        # for the heterogeneous CPU_ATTN repack (P_TP > D_TP). 1 for
+        # homogeneous TP (no head splitting across ranks).
+        self._heterogeneous_split_ranks: int = 1
 
         # KV Caches and nixl tracking data.
         self.device_type = current_platform.device_type
@@ -364,6 +373,12 @@ class NixlBaseConnectorWorker:
         # used when device memory can not be registered under nixl
         self.host_xfer_buffers: dict[str, torch.Tensor] = {}
         if self.device_type == "cpu":
+            self.use_host_buffer = False
+        elif envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU:
+            # KV cache already lives in CPU pinned memory (device_kv_caches are
+            # CPU tensors). No separate host buffer is needed; NIXL registers
+            # them directly as DRAM. A separate host_xfer_buffers allocation
+            # and the save_kv_to_host CPU→CPU copy are redundant and skipped.
             self.use_host_buffer = False
         else:
             self.use_host_buffer = self.kv_buffer_device == "cpu"
@@ -396,6 +411,17 @@ class NixlBaseConnectorWorker:
                 f"{self.device_type} with {self.kv_buffer_device} kv_buffer "
                 "is not supported."
             )
+        # When the KV cache is offloaded to CPU pinned memory on a GPU worker
+        # (VLLM_OFFLOAD_KV_CACHE_TO_CPU=1), the tensors passed to
+        # register_kv_caches are CPU tensors.  Register them as DRAM so NIXL
+        # selects the correct transport (UCX/CPU) instead of treating the
+        # pointers as GPU VRAM addresses.
+        if envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU and self.device_type != "cpu":
+            logger.info(
+                "VLLM_OFFLOAD_KV_CACHE_TO_CPU is enabled: registering KV cache "
+                "as DRAM since it lives in CPU pinned memory."
+            )
+            nixl_memory_type = "DRAM"
         self.nixl_memory_type = nixl_memory_type
 
         # Note: host xfer buffer ops when use_host_buffer is True
@@ -548,7 +574,11 @@ class NixlBaseConnectorWorker:
         # when we are using device buffers, we need to set the device
         # explicitly to make sure the handshake background thread has a valid
         # cuda context.
-        if not self.use_host_buffer:
+        # Only do this when the KV cache actually lives in VRAM; when it lives
+        # in DRAM (e.g. VLLM_OFFLOAD_KV_CACHE_TO_CPU=1 or cpu kv_buffer),
+        # no CUDA context is needed and device_id may not reflect the actual
+        # GPU device.
+        if self.nixl_memory_type == "VRAM":
             current_platform.set_device(self.device_id)
 
         # When target instance TP > local TP, we need to perform multiple
@@ -697,7 +727,7 @@ class NixlBaseConnectorWorker:
     def set_host_xfer_buffer_ops(self, copy_operation: CopyBlocksOp):
         """Assign copy (d2h, h2d) operations when host buffer is used."""
         # Set a no-op if the host buffer is not cpu.
-        if self.kv_buffer_device != "cpu":
+        if self.kv_buffer_device != "cpu" or envs.VLLM_OFFLOAD_KV_CACHE_TO_CPU:
             return
         # Set a no-op if self.device_type is 'cpu'.
         if self.device_type == "cpu":
@@ -922,6 +952,7 @@ class NixlBaseConnectorWorker:
             physical_blocks_per_logical_kv_block=(
                 self._physical_blocks_per_logical_kv_block
             ),
+            kv_cache_memory_type=self.nixl_memory_type,
         )
         assert self.compat_hash is not None
         encoder = msgspec.msgpack.Encoder()
@@ -1178,6 +1209,7 @@ class NixlBaseConnectorWorker:
             physical_blocks_per_logical_kv_block=(
                 self._physical_blocks_per_logical_kv_block
             ),
+            kv_cache_memory_type=self.nixl_memory_type,
         )
         # Wrap metadata in payload with hash for defensive decoding
         assert self.compat_hash is not None
@@ -1529,6 +1561,24 @@ class NixlBaseConnectorWorker:
 
         plan = self.tp_mappings[engine_id]
 
+        # Number of remote-rank head slices concatenated into one local block.
+        # Used by the heterogeneous CPU_ATTN repack to undo the rank-major
+        # concatenation. Only P_TP > D_TP (tp_ratio < 0) splits heads; MLA and
+        # homogeneous TP keep a single slice.
+        if tp_ratio < 0 and not self.use_mla:
+            fa_group_idx = next(
+                (
+                    i
+                    for i, t in enumerate(self._group_spec_types)
+                    if _is_attention_spec(t)
+                ),
+                None,
+            )
+            if fa_group_idx is not None:
+                self._heterogeneous_split_ranks = len(
+                    plan.source_ranks_per_group[fa_group_idx]
+                )
+
         ### (Optional) Register local agent memory regions. MLA is not split.
         if (
             tp_ratio < 0
@@ -1584,8 +1634,15 @@ class NixlBaseConnectorWorker:
                 )
             )
 
-        # Register with NIXL.
-        descs = self.nixl_wrapper.get_xfer_descs(blocks_data, self.nixl_memory_type)
+        # Register with NIXL. Remote descriptors must use the producer's memory
+        # type (e.g. VRAM for a GPU prefiller), which may differ from this
+        # worker's local memory type (e.g. DRAM for a CPU decoder). Otherwise
+        # NIXL cannot resolve the descriptors against the remote's registered
+        # memory and raises NIXL_ERR_NOT_FOUND.
+        remote_memory_type = getattr(
+            nixl_agent_meta, "kv_cache_memory_type", self.nixl_memory_type
+        )
+        descs = self.nixl_wrapper.get_xfer_descs(blocks_data, remote_memory_type)
         self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
             self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
         )
@@ -1663,6 +1720,22 @@ class NixlBaseConnectorWorker:
                     "HMA does not support block size post processing"
                 )
                 self.enable_permute_local_kv = True
+            elif (
+                self.backend_name == "CPU_ATTN"
+                and nixl_agent_meta.attn_backend_name != self.backend_name
+            ):
+                # Heterogeneous attention (e.g. GPU flash-attn prefiller ->
+                # CPU_ATTN decoder). The layout difference is reconciled during
+                # the CPU_ATTN repack in
+                # post_process_device_kv_on_receive_heterogeneous_attn, which
+                # reinterprets the received bytes according to the producer's
+                # layout, so the raw layout mismatch here is expected.
+                logger.info(
+                    "[Experimental] CPU_ATTN backend with heterogeneous remote "
+                    "layout %s (local %s); layout reconciled during repack.",
+                    nixl_agent_meta.kv_cache_layout,
+                    kv_cache_layout,
+                )
             else:
                 raise RuntimeError(
                     "Heterogeneous TP expects same kv_cache_layout. "
@@ -1684,6 +1757,10 @@ class NixlBaseConnectorWorker:
                 "hint heterogeneous attn post process"
             )
             self.enable_heterogeneous_attn_post_process = True
+            # Remember the producer's KV layout so the repack can reinterpret
+            # the received bytes correctly (NHD: [.., block_size, H, ..];
+            # HND: [.., H, block_size, ..]).
+            self._heterogeneous_remote_layout = nixl_agent_meta.kv_cache_layout
 
         # Heterogeneous TP requires head-splitting, which only works with
         # HND layout. MLA and replicated-KV cases don't split on heads.
@@ -1862,22 +1939,112 @@ class NixlBaseConnectorWorker:
         self, block_ids: list[int]
     ):
         """
-        Post process device kv cache after receiving from remote
-        for heterogeneous attention.
+        Convert KV blocks received from a heterogeneous (e.g. GPU flash-attn)
+        prefiller into the local CPU_ATTN layout.
+
+        The NIXL transfer writes the prefiller's raw flash-attn bytes straight
+        into the local CPU_ATTN kv-cache buffer (per-block byte layout
+        ``[H, block_size, 2*head_size]``). Because CPU_ATTN registers each block
+        as two virtual K/V halves (see ``virtually_split_kv_in_blocks``), the K
+        region is written into the first half of the block and V into the
+        second, so each received block now holds the remote ``[2, ...]`` (K then
+        V) flash-attn layout.
+
+        We reinterpret those bytes, copy K and V into a staging buffer (a clone,
+        to avoid aliasing the destination), and rewrite them into the CPU_ATTN
+        cache with the backend-specific ``cpu_attn_reshape_and_cache`` kernel —
+        exactly as a normal CPU forward would populate the cache.
+
+        Heterogeneous-TP (P_TP > D_TP) concatenates several remote-rank head
+        slices into one local block, rank-major, on the local head-outermost
+        buffer. The reinterpret below models that rank dimension explicitly and
+        reorders it so the heads land in global order, which works for both
+        ``NHD`` and ``HND`` prefiller layouts (no ``HND`` requirement).
         """
         assert self.enable_heterogeneous_attn_post_process
 
-        indices = torch.tensor(block_ids, device=self.device_type, dtype=torch.long)
+        from vllm._custom_ops import cpu_attn_reshape_and_cache
+        from vllm.v1.attention.backends.cpu_attn import _get_attn_isa
 
-        for _, cache_or_caches in self.device_kv_caches.items():
-            blocks_to_update = cache_or_caches.index_select(1, indices)
-            current_platform.pack_kv_cache(
-                key=blocks_to_update[0],
-                value=blocks_to_update[1],
-                key_cache=cache_or_caches[0],
-                value_cache=cache_or_caches[1],
-                block_ids=block_ids,
-                indices=indices,
+        # CPU_ATTN reports "HND"; default to it when the remote layout is unknown.
+        remote_layout = self._heterogeneous_remote_layout or "HND"
+
+        indices = torch.tensor(block_ids, device=self.device_type, dtype=torch.long)
+        num_recv_blocks = len(block_ids)
+
+        for _, kv_cache in self.device_kv_caches.items():
+            num_blocks, num_kv_heads, block_size, two_head_size = kv_cache.shape
+            head_size = two_head_size // 2
+            if kv_cache.dtype == torch.uint8:
+                raise NotImplementedError(
+                    "FP8 KV cache is not yet supported with KV transfer on CPU"
+                )
+            isa = _get_attn_isa(kv_cache.dtype, block_size, head_size)
+
+            # Reinterpret the received raw flash-attn bytes for this rank's
+            # blocks and copy them out into a staging buffer.
+            #
+            # With heterogeneous TP (P_TP > D_TP) a local block is assembled
+            # from ``R`` remote-rank head slices concatenated head-major on the
+            # local (head-outermost) buffer. Each slice holds ``hpr`` heads in
+            # the producer's flash-attn layout, so the raw block bytes are
+            # rank-major ``[R, 2(K/V), ...]``. We reshape with an explicit rank
+            # dimension and move it next to the per-rank heads so the heads end
+            # up in global order ``[rank0 heads.., rank1 heads.., ..]``.
+            # For ``R == 1`` (homogeneous TP) this reduces to a plain
+            # reinterpret.
+            num_ranks = max(1, self._heterogeneous_split_ranks)
+            assert num_kv_heads % num_ranks == 0, (
+                f"num_kv_heads ({num_kv_heads}) must be divisible by the number "
+                f"of remote head-slice ranks ({num_ranks}) for heterogeneous-TP "
+                "CPU_ATTN repack."
+            )
+            heads_per_rank = num_kv_heads // num_ranks
+            if remote_layout == "NHD":
+                # [n, R, 2, bs, hpr, d]
+                fa_view = kv_cache.view(
+                    num_blocks, num_ranks, 2, block_size, heads_per_rank, head_size
+                )
+                staging = fa_view.index_select(0, indices).clone()
+                keys = staging[:, :, 0]  # [n, R, bs, hpr, d]
+                values = staging[:, :, 1]
+                # -> token-major [n, bs, R, hpr, d] -> [n*bs, H, d]
+                key = keys.permute(0, 2, 1, 3, 4).flatten(2, 3).flatten(0, -3)
+                value = values.permute(0, 2, 1, 3, 4).flatten(2, 3).flatten(0, -3)
+            else:
+                # [n, R, 2, hpr, bs, d]
+                fa_view = kv_cache.view(
+                    num_blocks, num_ranks, 2, heads_per_rank, block_size, head_size
+                )
+                staging = fa_view.index_select(0, indices).clone()
+                keys = staging[:, :, 0]  # [n, R, hpr, bs, d]
+                values = staging[:, :, 1]
+                # -> token-major [n, bs, R, hpr, d] -> [n*bs, H, d]
+                key = keys.permute(0, 3, 1, 2, 4).flatten(2, 3).flatten(0, -3)
+                value = values.permute(0, 3, 1, 2, 4).flatten(2, 3).flatten(0, -3)
+
+            # Views into the same buffer; safe to write since `staging` is a
+            # clone. Matches the CPU_ATTN forward's cache view.
+            kv_view = kv_cache.view(
+                num_blocks, num_kv_heads, block_size * 2, head_size
+            )
+            key_cache, value_cache = kv_view.chunk(2, dim=2)
+
+            block_offsets = torch.arange(
+                block_size, device=self.device_type, dtype=torch.long
+            )
+            slot_mapping = (
+                block_offsets.reshape(1, block_size)
+                + indices.reshape(num_recv_blocks, 1) * block_size
+            ).flatten()
+
+            cpu_attn_reshape_and_cache(
+                key,
+                value,
+                key_cache,
+                value_cache,
+                slot_mapping,
+                isa,
             )
 
     def get_finished(self) -> tuple[set[str], set[str]]:
@@ -2182,11 +2349,24 @@ class NixlBaseConnectorWorker:
         # not per-token data, so trimming would corrupt the transfer.
         remote_block_ids = list(remote_block_ids)
         if not self._has_mamba:
+            local_block_ids = list(local_block_ids)
             for i, remote_group in enumerate(remote_block_ids):
                 num_local_blocks = len(local_block_ids[i])
-                assert num_local_blocks <= len(remote_group)
-                if num_local_blocks < len(remote_group):
+                num_remote_blocks = len(remote_group)
+                if num_local_blocks < num_remote_blocks:
+                    # Decoder already has a prefix cached locally; read only
+                    # the matching suffix from the remote blocks.
                     remote_block_ids[i] = remote_group[-num_local_blocks:]
+                elif num_local_blocks > num_remote_blocks:
+                    # Decoder allocated more blocks than the remote produced.
+                    # This happens when the decode prompt is longer than the
+                    # prefiller prompt (the disagg proxy appends the first
+                    # sampled token) and that extra token starts a fresh block
+                    # with no remote counterpart -- e.g. a prefiller prompt that
+                    # is an exact multiple of the block size. Read only the
+                    # blocks the remote has; the trailing block(s) are computed
+                    # locally during decode.
+                    local_block_ids[i] = local_block_ids[i][:num_remote_blocks]
         else:
             # (NOTE: ZhanqiuHu) Mamba hybrid: no prefix caching support so far.HeteroTP
             # can cause different kernel block counts due to logical block rounding.
