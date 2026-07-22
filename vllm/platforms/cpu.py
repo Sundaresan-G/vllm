@@ -448,38 +448,91 @@ class CpuPlatform(Platform):
     @classmethod
     def pack_kv_cache(
         cls,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        key_cache: torch.Tensor,
-        value_cache: torch.Tensor,
-        block_ids: list[int],
+        kv_cache: torch.Tensor,
         indices: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        remote_layout: str = "HND",
+        num_ranks: int = 1,
     ) -> None:
         """
-        Rewrite the kv cache shape for the current platform.
+        Repack KV blocks received from a heterogeneous (e.g. GPU flash-attn)
+        prefiller into the local CPU_ATTN layout.
+
+        The NIXL transfer writes the prefiller's raw flash-attn bytes straight
+        into the local CPU_ATTN kv-cache buffer. Because CPU_ATTN registers
+        each block as two virtual K/V halves, the K region lands in the first
+        half of the block and V in the second, so each received block holds the
+        remote ``[2, ...]`` (K then V) flash-attn layout. We reinterpret those
+        bytes, copy K and V into a staging buffer (a clone, to avoid aliasing
+        the destination), and rewrite them into the CPU_ATTN cache with the
+        ``cpu_attn_reshape_and_cache`` kernel — exactly as a normal CPU forward
+        would populate the cache.
+
+        Heterogeneous-TP (P_TP > D_TP) concatenates ``num_ranks`` remote-rank
+        head slices into one local block, rank-major, on the local
+        (head-outermost) buffer. The reinterpret below models that rank
+        dimension explicitly and reorders it so the heads land in global order,
+        which works for both ``NHD`` and ``HND`` prefiller layouts (no ``HND``
+        requirement). For ``num_ranks == 1`` (homogeneous TP) this reduces to a
+        plain reinterpret.
+
+        Args:
+            kv_cache: Local CPU_ATTN cache tensor
+                ``[num_blocks, num_kv_heads, block_size, 2*head_size]``.
+            indices: Received block ids as a device tensor.
+            slot_mapping: Precomputed flat slot mapping for ``indices``.
+            remote_layout: Producer KV layout (``"NHD"`` or ``"HND"``).
+            num_ranks: Number of remote head-slice ranks concatenated into one
+                local block.
         """
         # Import lazily: cpu_attn pulls in _custom_ops, which needs a fully
         # initialized vllm.platforms (avoid circular import while CpuPlatform loads).
         from vllm._custom_ops import cpu_attn_reshape_and_cache
         from vllm.v1.attention.backends.cpu_attn import _get_attn_isa
 
-        dtype = key.dtype
-        # For CPU_ATTN, the shape is [N, num_kv_heads, block_size, head_size]
-        _, _, block_size, head_size = key_cache.shape
-        key = key.permute(0, 2, 1, 3).flatten(0, 1)
-        value = value.permute(0, 2, 1, 3).flatten(0, 1)
-
-        isa = _get_attn_isa(dtype, block_size, head_size)
-        block_offsets = torch.arange(block_size, device="cpu", dtype=torch.long)
-        num_blocks = len(block_ids)
-        slot_mapping = (
-            block_offsets.reshape(1, block_size)
-            + indices.reshape(num_blocks, 1) * block_size
-        ).flatten()
-        if key_cache.dtype == torch.uint8:
+        num_blocks, num_kv_heads, block_size, two_head_size = kv_cache.shape
+        head_size = two_head_size // 2
+        if kv_cache.dtype == torch.uint8:
             raise NotImplementedError(
                 "FP8 KV cache is not yet supported with KV transfer on CPU"
             )
+        isa = _get_attn_isa(kv_cache.dtype, block_size, head_size)
+
+        num_ranks = max(1, num_ranks)
+        assert num_kv_heads % num_ranks == 0, (
+            f"num_kv_heads ({num_kv_heads}) must be divisible by the number "
+            f"of remote head-slice ranks ({num_ranks}) for heterogeneous-TP "
+            "CPU_ATTN repack."
+        )
+        heads_per_rank = num_kv_heads // num_ranks
+        if remote_layout == "NHD":
+            # [n, R, 2, bs, hpr, d]
+            fa_view = kv_cache.view(
+                num_blocks, num_ranks, 2, block_size, heads_per_rank, head_size
+            )
+            staging = fa_view.index_select(0, indices).clone()
+            keys = staging[:, :, 0]  # [n, R, bs, hpr, d]
+            values = staging[:, :, 1]
+            # -> token-major [n, bs, R, hpr, d] -> [n*bs, H, d]
+            key = keys.permute(0, 2, 1, 3, 4).flatten(2, 3).flatten(0, -3)
+            value = values.permute(0, 2, 1, 3, 4).flatten(2, 3).flatten(0, -3)
+        else:
+            # [n, R, 2, hpr, bs, d]
+            fa_view = kv_cache.view(
+                num_blocks, num_ranks, 2, heads_per_rank, block_size, head_size
+            )
+            staging = fa_view.index_select(0, indices).clone()
+            keys = staging[:, :, 0]  # [n, R, hpr, bs, d]
+            values = staging[:, :, 1]
+            # -> token-major [n, bs, R, hpr, d] -> [n*bs, H, d]
+            key = keys.permute(0, 3, 1, 2, 4).flatten(2, 3).flatten(0, -3)
+            value = values.permute(0, 3, 1, 2, 4).flatten(2, 3).flatten(0, -3)
+
+        # Views into the same buffer; safe to write since `staging` is a clone.
+        # Matches the CPU_ATTN forward's cache view.
+        kv_view = kv_cache.view(num_blocks, num_kv_heads, block_size * 2, head_size)
+        key_cache, value_cache = kv_view.chunk(2, dim=2)
+
         cpu_attn_reshape_and_cache(
             key,
             value,
