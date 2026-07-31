@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import datetime
 import logging
 from pathlib import Path
 
@@ -73,6 +74,14 @@ class NewLineFormatter(logging.Formatter):
             parts = msg.split(record.message)
             msg = msg.replace("\n", "\r\n" + parts[0])
         return msg
+
+    def formatTime(self, record, datefmt=None):
+        ct = datetime.datetime.fromtimestamp(record.created)
+        if datefmt:
+            s = ct.strftime(datefmt)
+        else:
+            s = ct.strftime("%m-%d %H:%M:%S")
+        return f"{s}.{ct.microsecond:06d}"
 
 
 class ColoredFormatter(NewLineFormatter):

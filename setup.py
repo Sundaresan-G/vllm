@@ -408,15 +408,16 @@ class cmake_build_ext(build_ext):
             # copy vllm/third_party/triton_kernels/**/*.py from self.build_lib
             # to current directory so that they can be included in the editable
             # build
-            print(
-                f"Copying {self.build_lib}/vllm/third_party/triton_kernels "
-                "to vllm/third_party/triton_kernels"
-            )
-            shutil.copytree(
-                f"{self.build_lib}/vllm/third_party/triton_kernels",
-                "vllm/third_party/triton_kernels",
-                dirs_exist_ok=True,
-            )
+            if os.path.exists(f"{self.build_lib}/vllm/third_party/triton_kernels"):
+                print(
+                    f"Copying {self.build_lib}/vllm/third_party/triton_kernels "
+                    "to vllm/third_party/triton_kernels"
+                )
+                shutil.copytree(
+                    f"{self.build_lib}/vllm/third_party/triton_kernels",
+                    "vllm/third_party/triton_kernels",
+                    dirs_exist_ok=True,
+                )
 
         if _is_cuda():
             # copy vendored deep_gemm package from build_lib to source tree
@@ -1020,7 +1021,6 @@ def get_vllm_version() -> str:
     if env_version := os.getenv("VLLM_VERSION_OVERRIDE"):
         print(f"Overriding VLLM version with {env_version} from VLLM_VERSION_OVERRIDE")
         os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
-        return get_version(write_to="vllm/_version.py")
 
     version = get_version(write_to="vllm/_version.py")
     sep = "+" if "+" not in version else "."  # dev versions might contain +
@@ -1119,7 +1119,7 @@ if _is_cuda() or _is_hip():
     ext_modules.append(CMakeExtension(name="vllm.cumem_allocator"))
     # Optional since this doesn't get built (produce an .so file). This is just
     # copying the relevant .py files from the source repository.
-    ext_modules.append(CMakeExtension(name="vllm.triton_kernels", optional=True))
+    # ext_modules.append(CMakeExtension(name="vllm.triton_kernels", optional=True))
 
 if sys.version_info >= (3, 11):
     ext_modules.append(CMakeExtension(name="vllm.spinloop"))
@@ -1137,9 +1137,9 @@ if _is_cuda():
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa3_C"))
     # FA4 CuteDSL - Python-only component for FA4's cute DSL support
     # Optional since this doesn't produce a .so file, just copies Python files
-    ext_modules.append(
-        CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa4_cutedsl_C", optional=True)
-    )
+    # ext_modules.append(
+    #     CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa4_cutedsl_C", optional=True)
+    # )
     if USE_PRECOMPILED_EXTENSIONS or (
         CUDA_HOME and get_nvcc_cuda_version() >= Version("12.9")
     ):
