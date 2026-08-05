@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import argparse
+import asyncio
 import itertools
-import logging
+import json
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -11,9 +12,11 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
+import time
 
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+from vllm.logger import init_logger
+
+logger = init_logger("vllm.proxy_server")
 
 
 @asynccontextmanager
@@ -27,7 +30,7 @@ async def lifespan(app: FastAPI):
 
     # Create prefill clients
     for i, (host, port) in enumerate(global_args.prefiller_instances):
-        prefiller_base_url = f"http://{host}:{port}/v1"
+        prefiller_base_url = f"http://{host}:{port}"
         app.state.prefill_clients.append(
             {
                 "client": httpx.AsyncClient(
@@ -46,7 +49,7 @@ async def lifespan(app: FastAPI):
 
     # Create decode clients
     for i, (host, port) in enumerate(global_args.decoder_instances):
-        decoder_base_url = f"http://{host}:{port}/v1"
+        decoder_base_url = f"http://{host}:{port}"
         app.state.decode_clients.append(
             {
                 "client": httpx.AsyncClient(
@@ -151,7 +154,16 @@ def get_next_client(app, service_type: str):
     else:
         raise ValueError(f"Unknown service type: {service_type}")
 
+def measure_time(func):
+    async def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = await func(*args, **kwargs)
+        end_time = time.time()
+        logger.info("%s took %.4f seconds", func.__name__, end_time - start_time)
+        return result
+    return wrapper
 
+@measure_time
 async def send_request_to_service(
     client_info: dict, endpoint: str, req_data: dict, request_id: str
 ):
@@ -173,6 +185,10 @@ async def send_request_to_service(
         req_data["max_completion_tokens"] = 1
     if "stream_options" in req_data:
         del req_data["stream_options"]
+    # Ask the prefiller to return the tokenized prompt and the sampled token
+    # ids so the decoder can be fed pre-tokenized input and skip re-tokenizing
+    # the (potentially large) prompt on its critical path.
+    req_data["return_token_ids"] = True
     # These args are not supported for P
     min_tokens = req_data.pop("min_tokens", None)
     min_completion_tokens = req_data.pop("min_completion_tokens", None)
@@ -196,7 +212,17 @@ async def send_request_to_service(
 
     return response
 
+def measure_generator_time(func):
+    async def wrapper(*args, **kwargs):
+        start_time = time.time()  # Record the time before the item is generated
+        async for item in func(*args, **kwargs):
+            end_time = time.time()  # Record the time after the item is generated
+            logger.info("%s generated an item in %.4f seconds", func.__name__, end_time - start_time)
+            yield item
+            start_time = time.time()  # Record the time before the item is generated again
+    return wrapper
 
+@measure_generator_time
 async def stream_service_response(
     client_info: dict, endpoint: str, req_data: dict, request_id: str
 ):
@@ -216,37 +242,155 @@ async def stream_service_response(
             yield chunk
 
 
+async def _handle_single_prompt_completions(
+    api: str,
+    request: Request,
+    req_data: dict,
+    request_id: str,
+) -> tuple[dict, dict]:
+    """Run prefill + build the decode request for a single-prompt request.
+
+    Args:
+        api: Downstream endpoint path (e.g. ``/completions``).
+        request: Incoming FastAPI request (used to pick clients).
+        req_data: The (single-prompt) request payload.
+        request_id: Unique id propagated to prefiller and decoder.
+
+    Returns:
+        A ``(prefill_response_json, decode_req_data)`` tuple. The caller
+        forwards the prefiller's one-token output to the client and streams
+        the decoder response built from ``decode_req_data``.
+    """
+    prefill_client_info = get_next_client(request.app, "prefill")
+
+    response = await send_request_to_service(
+        prefill_client_info, api, req_data, request_id
+    )
+    response_json = response.json()
+    await response.aclose()  # CRITICAL: Release connection back to pool
+
+    # Build the decode request inheriting all fields from the prefill request.
+    decode_req_data = req_data.copy()
+    kv_transfer_params = response_json.get("kv_transfer_params", {})
+    if kv_transfer_params:
+        decode_req_data["kv_transfer_params"] = kv_transfer_params
+
+    choice = response_json["choices"][0]
+    prompt_token_ids = choice.get("prompt_token_ids")
+    output_token_ids = choice.get("token_ids")
+
+    if prompt_token_ids is not None and output_token_ids is not None:
+        # Fast path: feed the decoder pre-tokenized ids (full prompt plus the
+        # one token already sampled by the prefiller). This avoids re-tokenizing
+        # the whole prompt on the decoder, which otherwise dominates TTFT for
+        # long prompts.
+        decode_req_data["prompt"] = list(prompt_token_ids) + list(output_token_ids)
+    elif "prompt" in decode_req_data and "text" in choice:
+        # Fallback: append the one prefilled token as text so the decoder
+        # continues from there (requires re-tokenization on the decoder).
+        decode_req_data["prompt"] = decode_req_data["prompt"] + choice["text"]
+
+    # The decoder does not need to echo token ids back.
+    decode_req_data.pop("return_token_ids", None)
+
+    # Prefill generated one token already; decrement the remaining budget.
+    if "max_tokens" in decode_req_data:
+        decode_req_data["max_tokens"] -= 1
+
+    # Avoid forwarding the large token-id arrays back to the client; restore the
+    # original (null) shape of the prefill response chunk.
+    choice["prompt_token_ids"] = None
+    choice["token_ids"] = None
+
+    return response_json, decode_req_data
+
+
 async def _handle_completions(api: str, request: Request):
     try:
         req_data = await request.json()
+
+        prompts = req_data.get("prompt")
+
+        if isinstance(prompts, list) and all(isinstance(p, str) for p in prompts):
+            # Split into individual single-prompt requests so each gets its own
+            # kv_transfer_params from the prefiller. A shared multi-prompt
+            # request would give every sub-request the same remote_block_ids,
+            # causing later sub-requests to fail the "block marked busy" assert
+            # in start_load_kv after the first sub-request clears the flag.
+            single_reqs = []
+            for prompt in prompts:
+                single_req = req_data.copy()
+                single_req["prompt"] = prompt
+                single_reqs.append(single_req)
+            request_ids = [str(uuid.uuid4()) for _ in single_reqs]
+
+            # Run all prefills concurrently.
+            prefill_results = await asyncio.gather(
+                *[
+                    _handle_single_prompt_completions(api, request, r, rid)
+                    for r, rid in zip(single_reqs, request_ids)
+                ]
+            )
+
+            decode_client_info = get_next_client(request.app, "decode")
+
+            async def generate_stream_multi():
+                # Forward each prefiller's one-token output first.
+                for (prefill_response_json, _), rid in zip(
+                    prefill_results, request_ids
+                ):
+                    prefill_output = b"data: " + json.dumps(prefill_response_json).encode()
+                    yield prefill_output
+                    logger.info("[%s] Forwarding prefill result to client (%d bytes)", rid, len(prefill_output))
+
+                async def _decode_one(dreq, rid):
+                    chunks = []
+                    async for chunk in stream_service_response(
+                        decode_client_info, api, dreq, request_id=rid
+                    ):
+                        chunks.append(chunk)
+                    return chunks
+
+                decode_chunk_lists = await asyncio.gather(
+                    *[
+                        _decode_one(dreq, rid)
+                        for (_, dreq), rid in zip(prefill_results, request_ids)
+                    ]
+                )
+                for chunks, (prefill_response_json, _), rid in zip(decode_chunk_lists, prefill_results, request_ids):
+                    for chunk in chunks:
+                        logger.info("[%s] Forwarding decode chunk to client (%d bytes): %s", rid, len(chunk), chunk)
+                        yield chunk
+
+            return StreamingResponse(
+                generate_stream_multi(), media_type="application/json"
+            )
+
+        # Single-prompt fast path.
         request_id = str(uuid.uuid4())
-
-        # Get the next prefill client in round-robin fashion
-        prefill_client_info = get_next_client(request.app, "prefill")
-
-        # Send request to prefill service
-        response = await send_request_to_service(
-            prefill_client_info, api, req_data, request_id
+        (
+            prefill_response_json,
+            decode_req_data,
+        ) = await _handle_single_prompt_completions(
+            api, request, req_data.copy(), request_id
         )
 
-        # Extract the needed fields
-        response_json = response.json()
-        await response.aclose()  # CRITICAL: Release connection back to pool
-        kv_transfer_params = response_json.get("kv_transfer_params", {})
-        if kv_transfer_params:
-            req_data["kv_transfer_params"] = kv_transfer_params
-
-        # Get the next decode client in round-robin fashion
         decode_client_info = get_next_client(request.app, "decode")
+        logger.debug("Using decode client %s", decode_client_info)
 
-        logger.debug("Using %s %s", prefill_client_info, decode_client_info)
-
-        # Stream response from decode service
         async def generate_stream():
-            async for chunk in stream_service_response(
-                decode_client_info, api, req_data, request_id=request_id
-            ):
-                yield chunk
+            # Emit the one-token prefill output first, then stream the decoder.
+            prefill_output = b"data: " + json.dumps(prefill_response_json).encode()
+            yield prefill_output
+            logger.info("[%s] Forwarding prefill result to client (%d bytes)", request_id, len(prefill_output))
+            try:
+                async for chunk in stream_service_response(
+                    decode_client_info, api, decode_req_data, request_id=request_id
+                ):
+                    logger.info("[%s] Forwarding decode chunk to client (%d bytes): %s", request_id, len(chunk), chunk)
+                    yield chunk
+            except Exception as exc:
+                logger.error("[%s] Error while streaming decode response: %s", request_id, exc, exc_info=True)
 
         return StreamingResponse(generate_stream(), media_type="application/json")
 
@@ -255,22 +399,47 @@ async def _handle_completions(api: str, request: Request):
         import traceback
 
         exc_info = sys.exc_info()
-        print(f"Error occurred in disagg prefill proxy server - {api} endpoint")
-        print(e)
-        print("".join(traceback.format_exception(*exc_info)))
+        logger.error("Error occurred in disagg prefill proxy server - %s endpoint", api)
+        logger.error("%s", e)
+        logger.error("%s", "".join(traceback.format_exception(*exc_info)))
         raise
 
 
 @app.post("/v1/completions")
 async def handle_completions(request: Request):
-    return await _handle_completions("/completions", request)
+    return await _handle_completions("/v1/completions", request)
 
 
 @app.post("/v1/chat/completions")
 async def handle_chat_completions(request: Request):
-    return await _handle_completions("/chat/completions", request)
+    return await _handle_completions("/v1/chat/completions", request)
+
+async def profile(api: str, request: Request):
+    req_data = await request.json()
+    request_id = str(uuid.uuid4())
+    # Get the next prefill client in round-robin fashion
+    prefill_client_info = get_next_client(request.app, "prefill")
+    # Send request to prefill service
+    await send_request_to_service(
+        prefill_client_info, api, req_data, request_id
+    )
+    # Get the next decode client in round-robin fashion
+    decode_client_info = get_next_client(request.app, "decode")
+    await send_request_to_service(
+        decode_client_info, api, req_data, request_id
+    )
+    return {"status": "ok"}
+
+@app.post("/start_profile")
+async def handle_start_profile(request: Request):
+    return await profile("/start_profile", request)
+
+@app.post("/stop_profile")
+async def handle_stop_profile(request: Request):
+    return await profile("/stop_profile", request)
 
 
+@app.get("/health")
 @app.get("/healthcheck")
 async def healthcheck():
     """Simple endpoint to check if the server is running."""

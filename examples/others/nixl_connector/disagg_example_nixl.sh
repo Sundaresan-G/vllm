@@ -37,7 +37,7 @@ NUM_PROMPTS=3
 GPU_ENV="vllm_0.26.1rc0_xpu"
 CPU_ENV="vllm_0.26.1rc0_cpu"
 CONDA_BASE="/data/nfs_home/sundares/miniforge3"
-NIXL_CONNECTOR_DIR="/data/nfs_home/sundares/vllm/vllm/examples/others/nixl_connector"
+PROXY_SERVER_DIR="/data/nfs_home/sundares/vllm/vllm/tests/v1/kv_connector/nixl_integration"
 
 print_mem_stats() {
     numactl -H
@@ -222,7 +222,7 @@ main() {
         source '${CONDA_BASE}/etc/profile.d/conda.sh'
         conda activate '${GPU_ENV}'
         # numactl -C 60-67 
-        python '${NIXL_CONNECTOR_DIR}/toy_proxy_server.py' \
+        python '${PROXY_SERVER_DIR}/toy_proxy_server.py' \
             --host 0.0.0.0 \
             --port 9000 \
             --prefiller-host localhost \
