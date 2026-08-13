@@ -153,7 +153,7 @@ cat > $CONDA_BASE/envs/vllm_0.26.1rc0_cpu/etc/conda/activate.d/cpu-vars.activate
 [[ "\$-" != *x* ]] && _xtrace_was_off=1 && set -x
 
 TC_PATH="$CONDA_BASE/envs/vllm_0.26.1rc0_cpu/lib/libtcmalloc_minimal.so"
-IOMP_PATH="/swtools/intel/2025.3/lib/libiomp5.so"
+IOMP_PATH="$CONDA_BASE/envs/vllm_0.26.1rc0_cpu/lib/libiomp5.so"
 
 export LD_PRELOAD="\${TC_PATH}:\${IOMP_PATH}\${LD_PRELOAD:+:\${LD_PRELOAD}}"
 
