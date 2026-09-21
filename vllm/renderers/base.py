@@ -3,8 +3,10 @@
 import asyncio
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import Executor, ThreadPoolExecutor
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, Generic, overload
 
@@ -45,6 +47,26 @@ from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.metrics.stats import MultiModalCacheStats
 
 from .embed_utils import safe_load_prompt_embeds
+
+_request_phase_timings: ContextVar[dict[str, float] | None] = ContextVar(
+    "api_server_request_phase_timings", default=None
+)
+
+
+@contextmanager
+def collect_request_phase_timings(
+    timings_ms: dict[str, float],
+) -> Iterator[None]:
+    token = _request_phase_timings.set(timings_ms)
+    try:
+        yield
+    finally:
+        _request_phase_timings.reset(token)
+
+
+def record_request_phase_timing(name: str, duration_ms: float) -> None:
+    if (timings := _request_phase_timings.get()) is not None:
+        timings[name] = timings.get(name, 0.0) + duration_ms
 from .inputs import (
     DictPrompt,
     EncoderDecoderDictPrompt,
@@ -1018,12 +1040,22 @@ class BaseRenderer(ABC, Generic[_T]):
         if tok_params is None:
             tok_params = self.default_cmpl_tok_params
 
+        phase_start = time.perf_counter()
         dict_prompts = await self.render_prompts_async(prompts)
+        record_request_phase_timing(
+            "prompt_render_ms", (time.perf_counter() - phase_start) * 1000.0
+        )
+
+        phase_start = time.perf_counter()
         tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
+        record_request_phase_timing(
+            "tokenize_ms", (time.perf_counter() - phase_start) * 1000.0
+        )
 
         self._apply_prompt_extras(tok_prompts, prompt_extras)
 
-        return await asyncio.gather(
+        phase_start = time.perf_counter()
+        engine_inputs = await asyncio.gather(
             *(
                 self.process_for_engine_async(
                     p, arrival_time, skip_mm_cache=skip_mm_cache
@@ -1031,6 +1063,10 @@ class BaseRenderer(ABC, Generic[_T]):
                 for p in tok_prompts
             )
         )
+        record_request_phase_timing(
+            "input_processing_ms", (time.perf_counter() - phase_start) * 1000.0
+        )
+        return engine_inputs
 
     def render_chat(
         self,
@@ -1082,6 +1118,7 @@ class BaseRenderer(ABC, Generic[_T]):
         if tok_params is None:
             tok_params = self.default_chat_tok_params
 
+        phase_start = time.perf_counter()
         rendered = [
             self.render_messages_async(conversation, chat_params)
             for conversation in conversations
@@ -1092,11 +1129,19 @@ class BaseRenderer(ABC, Generic[_T]):
         for conv, prompt in await asyncio.gather(*rendered):
             out_conversations.append(conv)
             dict_prompts.append(prompt)
+        record_request_phase_timing(
+            "prompt_render_ms", (time.perf_counter() - phase_start) * 1000.0
+        )
 
+        phase_start = time.perf_counter()
         tok_prompts = await self.tokenize_prompts_async(dict_prompts, tok_params)
+        record_request_phase_timing(
+            "tokenize_ms", (time.perf_counter() - phase_start) * 1000.0
+        )
 
         self._apply_prompt_extras(tok_prompts, prompt_extras)
 
+        phase_start = time.perf_counter()
         eng_prompts = await asyncio.gather(
             *(
                 self.process_for_engine_async(
@@ -1104,6 +1149,9 @@ class BaseRenderer(ABC, Generic[_T]):
                 )
                 for p in tok_prompts
             )
+        )
+        record_request_phase_timing(
+            "input_processing_ms", (time.perf_counter() - phase_start) * 1000.0
         )
 
         return out_conversations, eng_prompts

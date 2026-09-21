@@ -45,6 +45,14 @@ if TYPE_CHECKING:
     VLLM_LOGGING_COLOR: str = "auto"
     NO_COLOR: bool = False
     VLLM_LOG_STATS_INTERVAL: float = 10.0
+    VLLM_LOG_STEP_TIMINGS: bool = False
+    VLLM_STEP_TIMING_INTERVAL: int = 50
+    VLLM_LOG_API_SERVER_STEP_TIMINGS: bool = False
+    VLLM_API_SERVER_STEP_TIMING_INTERVAL: int = 50
+    VLLM_LOG_ENGINE_CORE_STEP_TIMINGS: bool = False
+    VLLM_ENGINE_CORE_STEP_TIMING_INTERVAL: int = 50
+    VLLM_LOG_GPU_MODEL_RUNNER_STEP_TIMINGS: bool = False
+    VLLM_GPU_MODEL_RUNNER_STEP_TIMING_INTERVAL: int = 50
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
@@ -544,6 +552,18 @@ def get_env_or_set_default(
     return _get_or_set_default
 
 
+def _step_timing_enabled(component_env_name: str) -> bool:
+    return (
+        os.getenv("VLLM_LOG_STEP_TIMINGS", "0") == "1"
+        and os.getenv(component_env_name, "1") == "1"
+    )
+
+
+def _step_timing_interval(component_env_name: str) -> int:
+    default = os.getenv("VLLM_STEP_TIMING_INTERVAL", "50")
+    return max(1, int(os.getenv(component_env_name, default)))
+
+
 # The start-* and end* here are used by the documentation generator
 # to extract the used env vars.
 
@@ -849,6 +869,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
         val
         if (val := float(os.getenv("VLLM_LOG_STATS_INTERVAL", "10."))) > 0.0
         else 10.0
+    ),
+    # Per-step timing is disabled by default. The master switch enables timing
+    # globally; component switches can then selectively disable individual logs.
+    "VLLM_LOG_STEP_TIMINGS": lambda: (
+        os.getenv("VLLM_LOG_STEP_TIMINGS", "0") == "1"
+    ),
+    # Number of steps buffered per timing log. Component-specific intervals
+    # override this master value when explicitly set.
+    "VLLM_STEP_TIMING_INTERVAL": lambda: max(
+        1, int(os.getenv("VLLM_STEP_TIMING_INTERVAL", "50"))
+    ),
+    "VLLM_LOG_API_SERVER_STEP_TIMINGS": lambda: _step_timing_enabled(
+        "VLLM_LOG_API_SERVER_STEP_TIMINGS"
+    ),
+    "VLLM_API_SERVER_STEP_TIMING_INTERVAL": lambda: _step_timing_interval(
+        "VLLM_API_SERVER_STEP_TIMING_INTERVAL"
+    ),
+    "VLLM_LOG_ENGINE_CORE_STEP_TIMINGS": lambda: _step_timing_enabled(
+        "VLLM_LOG_ENGINE_CORE_STEP_TIMINGS"
+    ),
+    "VLLM_ENGINE_CORE_STEP_TIMING_INTERVAL": lambda: _step_timing_interval(
+        "VLLM_ENGINE_CORE_STEP_TIMING_INTERVAL"
+    ),
+    "VLLM_LOG_GPU_MODEL_RUNNER_STEP_TIMINGS": lambda: _step_timing_enabled(
+        "VLLM_LOG_GPU_MODEL_RUNNER_STEP_TIMINGS"
+    ),
+    "VLLM_GPU_MODEL_RUNNER_STEP_TIMING_INTERVAL": lambda: _step_timing_interval(
+        "VLLM_GPU_MODEL_RUNNER_STEP_TIMING_INTERVAL"
     ),
     # Trace function calls
     # If set to 1, vllm will trace function calls
@@ -2257,6 +2305,14 @@ def compile_factors() -> dict[str, object]:
         "VLLM_LOGGING_CONFIG_PATH",
         "VLLM_LOGGING_COLOR",
         "VLLM_LOG_STATS_INTERVAL",
+        "VLLM_LOG_STEP_TIMINGS",
+        "VLLM_STEP_TIMING_INTERVAL",
+        "VLLM_LOG_API_SERVER_STEP_TIMINGS",
+        "VLLM_API_SERVER_STEP_TIMING_INTERVAL",
+        "VLLM_LOG_ENGINE_CORE_STEP_TIMINGS",
+        "VLLM_ENGINE_CORE_STEP_TIMING_INTERVAL",
+        "VLLM_LOG_GPU_MODEL_RUNNER_STEP_TIMINGS",
+        "VLLM_GPU_MODEL_RUNNER_STEP_TIMING_INTERVAL",
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",

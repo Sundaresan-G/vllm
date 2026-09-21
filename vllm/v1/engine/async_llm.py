@@ -7,6 +7,7 @@ import time
 import warnings
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from copy import copy
+from datetime import datetime
 from typing import Any
 
 import torch
@@ -55,6 +56,11 @@ from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
 
 logger = init_logger(__name__)
+
+_LOG_API_SERVER_STEP_TIMINGS = envs.VLLM_LOG_API_SERVER_STEP_TIMINGS
+_API_SERVER_STEP_TIMING_LOG_INTERVAL = (
+    envs.VLLM_API_SERVER_STEP_TIMING_INTERVAL
+)
 
 
 class InputStreamError(Exception):
@@ -682,23 +688,77 @@ class AsyncLLM(EngineClient):
         # P0 multi-modal sender ("shadow") cache; None for text-only models.
         mm_processor_cache = renderer.mm_processor_cache
         chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
+        step_timing_records: list[
+            tuple[int, int, int, int, float, float, dict[str, float]]
+        ] = []
+        step_timing_count = 0
+
+        def log_step_timings() -> None:
+            if not step_timing_records:
+                return
+
+            lines = []
+            for record in step_timing_records:
+                (
+                    step_index,
+                    engine_index,
+                    num_request_outputs,
+                    num_output_token_ids,
+                    start_time,
+                    end_time,
+                    timings_ms,
+                ) = record
+                phases = " ".join(
+                    f"{name.removesuffix('_ms')}=%.3f" % value
+                    for name, value in timings_ms.items()
+                )
+                lines.append(
+                    "API server step timing "
+                    f"step={step_index} engine={engine_index} "
+                    f"num_request_outputs={num_request_outputs} "
+                    f"num_output_token_ids={num_output_token_ids} "
+                    f"start={datetime.fromtimestamp(start_time):%m-%d %H:%M:%S.%f} "
+                    f"end={datetime.fromtimestamp(end_time):%m-%d %H:%M:%S.%f}: "
+                    f"{phases} total={sum(timings_ms.values()):.3f}"
+                )
+            logger.info(
+                "API server step timing details (steps %d-%d, ms):\n%s",
+                step_timing_records[0][0],
+                step_timing_records[-1][0],
+                "\n".join(lines),
+            )
+            step_timing_records.clear()
 
         async def output_handler():
+            nonlocal step_timing_count
             try:
                 while True:
                     # 1) Pull EngineCoreOutputs from the EngineCore.
+                    if _LOG_API_SERVER_STEP_TIMINGS:
+                        step_start_time = time.time()
+                        receive_start = time.perf_counter()
                     outputs = await engine_core.get_output_async()
-                    num_outputs = len(outputs.outputs)
+                    if _LOG_API_SERVER_STEP_TIMINGS:
+                        receive_end = time.perf_counter()
+                    num_request_outputs = len(outputs.outputs)
+                    if _LOG_API_SERVER_STEP_TIMINGS:
+                        num_output_token_ids = sum(
+                            len(output.new_token_ids) for output in outputs.outputs
+                        )
 
                     iteration_stats = (
-                        IterationStats() if (log_stats and num_outputs) else None
+                        IterationStats()
+                        if (log_stats and num_request_outputs)
+                        else None
                     )
 
+                    if _LOG_API_SERVER_STEP_TIMINGS:
+                        process_start = time.perf_counter()
                     # Split outputs into chunks of at most
                     # VLLM_V1_OUTPUT_PROC_CHUNK_SIZE, so that we don't block the
                     # event loop for too long.
                     engine_core_outputs = outputs.outputs
-                    for start in range(0, num_outputs, chunk_size):
+                    for start in range(0, num_request_outputs, chunk_size):
                         end = start + chunk_size
                         outputs_slice = engine_core_outputs[start:end]
                         # 2) Process EngineCoreOutputs.
@@ -719,7 +779,7 @@ class AsyncLLM(EngineClient):
                                         mm_processor_cache.invalidate(mm_hash)
 
                         # Allow other asyncio tasks to run between chunks
-                        if end < num_outputs:
+                        if end < num_request_outputs:
                             await asyncio.sleep(0)
 
                         # 3) Abort any reqs that finished due to stop strings.
@@ -729,10 +789,14 @@ class AsyncLLM(EngineClient):
                             )
 
                     output_processor.update_scheduler_stats(outputs.scheduler_stats)
+                    if _LOG_API_SERVER_STEP_TIMINGS:
+                        process_end = time.perf_counter()
 
                     # 4) Logging.
                     # TODO(rob): make into a coroutine and launch it in
                     # background thread once Prometheus overhead is non-trivial.
+                    if _LOG_API_SERVER_STEP_TIMINGS:
+                        stats_logging_start = time.perf_counter()
                     if logger_ref[0]:
                         logger_ref[0].record(
                             engine_idx=outputs.engine_index,
@@ -740,9 +804,44 @@ class AsyncLLM(EngineClient):
                             iteration_stats=iteration_stats,
                             mm_cache_stats=renderer.stat_mm_cache(),
                         )
+                    if _LOG_API_SERVER_STEP_TIMINGS:
+                        stats_logging_end = time.perf_counter()
+                        step_timing_count += 1
+                        step_timing_records.append(
+                            (
+                                step_timing_count,
+                                outputs.engine_index,
+                                num_request_outputs,
+                                num_output_token_ids,
+                                step_start_time,
+                                time.time(),
+                                {
+                                    "receive_wait_ms": (
+                                        receive_end - receive_start
+                                    )
+                                    * 1000.0,
+                                    "process_outputs_ms": (
+                                        process_end - process_start
+                                    )
+                                    * 1000.0,
+                                    "stats_logging_ms": (
+                                        stats_logging_end - stats_logging_start
+                                    )
+                                    * 1000.0,
+                                },
+                            )
+                        )
+                        if (
+                            len(step_timing_records)
+                            >= _API_SERVER_STEP_TIMING_LOG_INTERVAL
+                        ):
+                            log_step_timings()
             except Exception as e:
                 logger.exception("AsyncLLM output_handler failed.")
                 output_processor.propagate_error(e)
+            finally:
+                if _LOG_API_SERVER_STEP_TIMINGS:
+                    log_step_timings()
 
         self.output_handler = asyncio.create_task(output_handler())
 

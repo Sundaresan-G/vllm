@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import replace
+from datetime import datetime
 from functools import reduce
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
@@ -254,6 +255,10 @@ if TYPE_CHECKING:
     from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 logger = init_logger(__name__)
+
+# Optional CPU/GPU timing of the model forward and sampling phases.
+_LOG_GPU_STEP_TIMINGS = envs.VLLM_LOG_GPU_MODEL_RUNNER_STEP_TIMINGS
+_GPU_STEP_TIMING_INTERVAL = envs.VLLM_GPU_MODEL_RUNNER_STEP_TIMING_INTERVAL
 
 
 def _get_parameter_for_reload(model: nn.Module, name: str) -> nn.Parameter:
@@ -992,6 +997,47 @@ class GPUModelRunner(
         self.kv_connector_output: KVConnectorOutput | None = None
         self.mamba_state_idx: dict[str, int] = {}
         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
+
+        # Optional GPU-event timing of execute_model/sample phases. Keep enough
+        # event sets to retain the batches that may still be in flight. When a
+        # timing interval ends, only older, known-complete batches are logged,
+        # so timing never needs to synchronize the accelerator.
+        self._gpu_timing_count = 0
+        self._gpu_timing_step_count = 0
+        # EngineCore must collect batch N before it can dispatch batch N plus
+        # max_concurrent_batches. Its output copy waits for the default stream,
+        # so all timing events for N are complete by then.
+        self._gpu_timing_completion_lag = max(
+            1, vllm_config.max_concurrent_batches
+        )
+        self._step_is_decode = False
+        self._timing_events: list[dict[str, torch.Event]] | None = None
+        self._cpu_timing_records: list[dict[str, float | int | bool]] | None = None
+        if _LOG_GPU_STEP_TIMINGS:
+            self._timing_events = [
+                {
+                    key: torch.Event(enable_timing=True)
+                    for key in (
+                        "pre_start",
+                        "pre_end",
+                        "fwd_start",
+                        "fwd_end",
+                        "post_start",
+                        "post_end",
+                        "samp_start",
+                        "samp_end",
+                    )
+                }
+                for _ in range(
+                    _GPU_STEP_TIMING_INTERVAL + self._gpu_timing_completion_lag
+                )
+            ]
+            self._cpu_timing_records = [
+                {}
+                for _ in range(
+                    _GPU_STEP_TIMING_INTERVAL + self._gpu_timing_completion_lag
+                )
+            ]
         self.mamba_prev_last_scheduled_idx: CpuGpuBuffer | None = None
         if self.cache_config.mamba_cache_mode == "all" and self.num_spec_tokens > 0:
             self.mamba_prev_last_scheduled_idx = self._make_buffer(
@@ -4297,6 +4343,16 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
+        if _LOG_GPU_STEP_TIMINGS:
+            assert self._timing_events is not None
+            assert self._cpu_timing_records is not None
+            timing_record = self._cpu_timing_records[self._gpu_timing_count]
+            timing_record.clear()
+            timing_record["num_tokens"] = scheduler_output.total_num_scheduled_tokens
+            timing_record["pre_wall_start"] = time.time()
+            timing_record["pre_start"] = time.perf_counter()
+            self._timing_events[self._gpu_timing_count]["pre_start"].record()
+
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
         # The replace is much faster than deepcopy.
@@ -4366,6 +4422,18 @@ class GPUModelRunner(
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
+
+            if _LOG_GPU_STEP_TIMINGS:
+                # A request generates its first token on the step that finishes
+                # its prefill. A step counts as "decode" (non-first tokens for
+                # every request) only when all requests already have their full
+                # prompt computed, i.e. num_computed_tokens >= num_prompt_tokens.
+                self._step_is_decode = bool(
+                    np.all(
+                        self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                        >= self.input_batch.num_prompt_tokens[:num_reqs]
+                    )
+                )
 
             logits_indices, spec_decode_metadata, max_num_sampled_tokens = (
                 self._prepare_inputs(scheduler_output, num_scheduled_tokens_np)
@@ -4562,6 +4630,15 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
+            if _LOG_GPU_STEP_TIMINGS and self._timing_events is not None:
+                assert self._cpu_timing_records is not None
+                timing_record = self._cpu_timing_records[self._gpu_timing_count]
+                timing_record["pre_wall_end"] = time.time()
+                timing_record["pre_end"] = time.perf_counter()
+                self._timing_events[self._gpu_timing_count]["pre_end"].record()
+                timing_record["fwd_wall_start"] = time.time()
+                timing_record["fwd_start"] = time.perf_counter()
+                self._timing_events[self._gpu_timing_count]["fwd_start"].record()
             model_output = self._model_forward(
                 input_ids=input_ids,
                 positions=positions,
@@ -4569,7 +4646,19 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            if _LOG_GPU_STEP_TIMINGS and self._timing_events is not None:
+                assert self._cpu_timing_records is not None
+                timing_record = self._cpu_timing_records[self._gpu_timing_count]
+                self._timing_events[self._gpu_timing_count]["fwd_end"].record()
+                timing_record["fwd_wall_end"] = time.time()
+                timing_record["fwd_end"] = time.perf_counter()
 
+        if _LOG_GPU_STEP_TIMINGS and self._timing_events is not None:
+            assert self._cpu_timing_records is not None
+            timing_record = self._cpu_timing_records[self._gpu_timing_count]
+            timing_record["post_wall_start"] = time.time()
+            timing_record["post_start"] = time.perf_counter()
+            self._timing_events[self._gpu_timing_count]["post_start"].record()
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
                 # True when EAGLE 3 is used.
@@ -4647,7 +4736,86 @@ class GPUModelRunner(
         if deferred_state_corrections_fn:
             deferred_state_corrections_fn()
 
+        if _LOG_GPU_STEP_TIMINGS and self._timing_events is not None:
+            assert self._cpu_timing_records is not None
+            timing_record = self._cpu_timing_records[self._gpu_timing_count]
+            self._timing_events[self._gpu_timing_count]["post_end"].record()
+            timing_record["post_wall_end"] = time.time()
+            timing_record["post_end"] = time.perf_counter()
+
         return None
+
+    def _record_phase_timings(self) -> None:
+        """Log known-complete timing records without synchronizing the device."""
+        assert self._timing_events is not None
+        assert self._cpu_timing_records is not None
+        timing_record = self._cpu_timing_records[self._gpu_timing_count]
+        timing_record["decode"] = self._step_is_decode
+        self._gpu_timing_count += 1
+        self._gpu_timing_step_count += 1
+        if self._gpu_timing_step_count % _GPU_STEP_TIMING_INTERVAL:
+            return
+
+        self._log_completed_phase_timings()
+
+    def _log_completed_phase_timings(self) -> None:
+        """Log records older than the maximum number of in-flight batches."""
+        assert self._timing_events is not None
+        assert self._cpu_timing_records is not None
+        n = self._gpu_timing_count - self._gpu_timing_completion_lag
+        if n <= 0:
+            return
+
+        phase_keys = {
+            "preprocess": ("pre", "pre_start", "pre_end"),
+            "forward": ("fwd", "fwd_start", "fwd_end"),
+            "postprocess": ("post", "post_start", "post_end"),
+            "sample": ("samp", "samp_start", "samp_end"),
+        }
+        first_step = self._gpu_timing_step_count - self._gpu_timing_count + 1
+        lines: list[str] = []
+        records = zip(self._timing_events[:n], self._cpu_timing_records[:n])
+        for offset, (ev, record) in enumerate(records):
+            step = first_step + offset
+            lines.append(
+                "GPU model runner step timing "
+                f"step={step} num_tokens={record['num_tokens']} "
+                f"decode={record['decode']}"
+            )
+            for phase, (wall_key, start_key, end_key) in phase_keys.items():
+                cpu_start = cast(float, record[start_key])
+                cpu_end = cast(float, record[end_key])
+                wall_start = cast(float, record[f"{wall_key}_wall_start"])
+                wall_end = cast(float, record[f"{wall_key}_wall_end"])
+                gpu_duration = ev[start_key].elapsed_time(ev[end_key])
+                lines.append(
+                    f"  {phase} "
+                    f"cpu_start={datetime.fromtimestamp(wall_start):%m-%d %H:%M:%S.%f} "
+                    f"cpu_end={datetime.fromtimestamp(wall_end):%m-%d %H:%M:%S.%f} "
+                    f"cpu_duration_ms={(cpu_end - cpu_start) * 1000.0:.3f} "
+                    f"gpu_duration_ms={gpu_duration:.3f}"
+                )
+
+        logger.info(
+            "GPU model runner step timing details "
+            "(steps %d-%d; durations in ms):\n%s",
+            first_step,
+            first_step + n - 1,
+            "\n".join(lines),
+        )
+
+        pending_events = self._timing_events[n : self._gpu_timing_count]
+        reusable_events = (
+            self._timing_events[self._gpu_timing_count :] + self._timing_events[:n]
+        )
+        self._timing_events = pending_events + reusable_events
+        pending_records = self._cpu_timing_records[n : self._gpu_timing_count]
+        reusable_records = (
+            self._cpu_timing_records[self._gpu_timing_count :]
+            + self._cpu_timing_records[:n]
+        )
+        self._cpu_timing_records = pending_records + reusable_records
+        self._gpu_timing_count -= n
 
     def _input_fits_in_drafter(
         self, common_attn_metadata: CommonAttentionMetadata | None
@@ -4701,7 +4869,20 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
+            if _LOG_GPU_STEP_TIMINGS and self._timing_events is not None:
+                assert self._cpu_timing_records is not None
+                timing_record = self._cpu_timing_records[self._gpu_timing_count]
+                timing_record["samp_wall_start"] = time.time()
+                timing_record["samp_start"] = time.perf_counter()
+                self._timing_events[self._gpu_timing_count]["samp_start"].record()
             sampler_output = self._sample(logits, spec_decode_metadata)
+            if _LOG_GPU_STEP_TIMINGS and self._timing_events is not None:
+                assert self._cpu_timing_records is not None
+                timing_record = self._cpu_timing_records[self._gpu_timing_count]
+                self._timing_events[self._gpu_timing_count]["samp_end"].record()
+                timing_record["samp_wall_end"] = time.time()
+                timing_record["samp_end"] = time.perf_counter()
+                self._record_phase_timings()
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -6687,6 +6868,13 @@ class GPUModelRunner(
         memory is reclaimable when running in the same process."""
         from vllm.model_executor.layers.rotary_embedding import _ROPE_DICT
         from vllm.v1.worker.workspace import reset_workspace_manager
+
+        if (
+            _LOG_GPU_STEP_TIMINGS
+            and self._timing_events is not None
+            and self._gpu_timing_count
+        ):
+            self._log_completed_phase_timings()
 
         # Calls torch.accelerator.synchronize()
         self._cleanup_profiling_kv_cache()

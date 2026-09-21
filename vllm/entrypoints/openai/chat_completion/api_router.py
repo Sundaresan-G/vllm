@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+import time
 from http import HTTPStatus
 
 from fastapi import APIRouter, Depends, FastAPI, Request
@@ -22,6 +23,7 @@ from vllm.entrypoints.serve.utils.api_utils import (
 )
 from vllm.entrypoints.serve.utils.orca_metrics import metrics_header
 from vllm.logger import init_logger
+from vllm.renderers.base import collect_request_phase_timings
 
 logger = init_logger(__name__)
 
@@ -51,6 +53,9 @@ def batch_chat(request: Request) -> OpenAIServingChatBatch | None:
 @with_cancellation
 @load_aware_call
 async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
+    raw_request.state.api_server_endpoint_start = time.perf_counter()
+    phase_timings_ms: dict[str, float] = {}
+    raw_request.state.api_server_phase_timings_ms = phase_timings_ms
     metrics_header_format = raw_request.headers.get(
         ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, ""
     )
@@ -58,7 +63,11 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     if handler is None:
         raise NotImplementedError("The model does not support Chat Completions API")
 
-    generator = await handler.create_chat_completion(request, raw_request)
+    try:
+        with collect_request_phase_timings(phase_timings_ms):
+            generator = await handler.create_chat_completion(request, raw_request)
+    finally:
+        raw_request.state.api_server_endpoint_done = time.perf_counter()
 
     if isinstance(generator, ErrorResponse):
         return JSONResponse(

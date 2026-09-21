@@ -323,6 +323,13 @@ def build_app(
                 f"Invalid middleware {middleware}. Must be a function or a class."
             )
 
+    if envs.VLLM_LOG_API_SERVER_STEP_TIMINGS:
+        from vllm.entrypoints.serve.utils.server_utils import (
+            APIServerRequestTimingMiddleware,
+        )
+
+        app.add_middleware(APIServerRequestTimingMiddleware)
+
     app = sagemaker_standards_bootstrap(app)
     return app
 

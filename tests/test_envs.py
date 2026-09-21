@@ -29,6 +29,62 @@ def test_getattr_without_cache(monkeypatch: pytest.MonkeyPatch):
     assert not hasattr(envs.__getattr__, "cache_info")
 
 
+def test_component_step_timing_envs_are_independent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    master_name = "VLLM_LOG_STEP_TIMINGS"
+    master_interval_name = "VLLM_STEP_TIMING_INTERVAL"
+    enabled_names = (
+        "VLLM_LOG_API_SERVER_STEP_TIMINGS",
+        "VLLM_LOG_ENGINE_CORE_STEP_TIMINGS",
+        "VLLM_LOG_GPU_MODEL_RUNNER_STEP_TIMINGS",
+    )
+    interval_names = (
+        "VLLM_API_SERVER_STEP_TIMING_INTERVAL",
+        "VLLM_ENGINE_CORE_STEP_TIMING_INTERVAL",
+        "VLLM_GPU_MODEL_RUNNER_STEP_TIMING_INTERVAL",
+    )
+    for name in (
+        master_name,
+        master_interval_name,
+        *enabled_names,
+        *interval_names,
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert not envs.VLLM_LOG_STEP_TIMINGS
+    assert envs.VLLM_STEP_TIMING_INTERVAL == 50
+    assert [getattr(envs, name) for name in enabled_names] == [False] * 3
+    assert [getattr(envs, name) for name in interval_names] == [50] * 3
+
+    monkeypatch.setenv(master_name, "1")
+    monkeypatch.setenv(master_interval_name, "100")
+    monkeypatch.setenv("VLLM_LOG_GPU_MODEL_RUNNER_STEP_TIMINGS", "0")
+    monkeypatch.setenv("VLLM_ENGINE_CORE_STEP_TIMING_INTERVAL", "7")
+
+    assert envs.VLLM_LOG_STEP_TIMINGS
+    assert envs.VLLM_STEP_TIMING_INTERVAL == 100
+    assert envs.VLLM_LOG_API_SERVER_STEP_TIMINGS
+    assert envs.VLLM_LOG_ENGINE_CORE_STEP_TIMINGS
+    assert not envs.VLLM_LOG_GPU_MODEL_RUNNER_STEP_TIMINGS
+    assert envs.VLLM_API_SERVER_STEP_TIMING_INTERVAL == 100
+    assert envs.VLLM_ENGINE_CORE_STEP_TIMING_INTERVAL == 7
+    assert envs.VLLM_GPU_MODEL_RUNNER_STEP_TIMING_INTERVAL == 100
+
+    monkeypatch.setenv(master_name, "0")
+    assert [getattr(envs, name) for name in enabled_names] == [False] * 3
+
+    monkeypatch.setenv("VLLM_GPU_MODEL_RUNNER_STEP_TIMING_INTERVAL", "0")
+    assert envs.VLLM_GPU_MODEL_RUNNER_STEP_TIMING_INTERVAL == 1
+
+    monkeypatch.delenv("VLLM_GPU_MODEL_RUNNER_STEP_TIMING_INTERVAL")
+    monkeypatch.setenv(master_interval_name, "0")
+    assert envs.VLLM_STEP_TIMING_INTERVAL == 1
+    assert envs.VLLM_API_SERVER_STEP_TIMING_INTERVAL == 1
+    assert envs.VLLM_ENGINE_CORE_STEP_TIMING_INTERVAL == 7
+    assert envs.VLLM_GPU_MODEL_RUNNER_STEP_TIMING_INTERVAL == 1
+
+
 def test_nixl_side_channel_host_is_not_compile_factor(
     monkeypatch: pytest.MonkeyPatch,
 ):
