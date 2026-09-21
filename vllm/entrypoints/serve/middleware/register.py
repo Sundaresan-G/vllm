@@ -62,6 +62,11 @@ def init_entrypoints_middleware(
         )
         app.middleware("http")(log_response)
 
+    if envs.VLLM_LOG_API_SERVER_STEP_TIMINGS:
+        from .api_server_timing import APIServerRequestTimingMiddleware
+
+        app.add_middleware(APIServerRequestTimingMiddleware)
+
     for middleware in args.middleware:
         module_path, object_name = middleware.rsplit(".", 1)
         imported = getattr(importlib.import_module(module_path), object_name)
