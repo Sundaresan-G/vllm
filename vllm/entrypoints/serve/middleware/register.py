@@ -40,6 +40,11 @@ def init_entrypoints_middleware(
 
         app.add_middleware(XRequestIdMiddleware)
 
+    if envs.VLLM_LOG_API_SERVER_STEP_TIMINGS:
+        from .request_timing import APIServerRequestTimingMiddleware
+
+        app.add_middleware(APIServerRequestTimingMiddleware)
+
     if "generate" in supported_tasks:
         # Add scaling middleware to check for scaling state
         from vllm.entrypoints.serve.elastic_ep.middleware import ScalingMiddleware

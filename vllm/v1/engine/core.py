@@ -10,6 +10,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
+from datetime import datetime
 from enum import IntEnum
 from functools import partial
 from inspect import isclass, signature
@@ -98,6 +99,10 @@ logger = init_logger(__name__)
 
 
 HANDSHAKE_TIMEOUT_MINS = 5
+
+# Per-step timing instrumentation.
+_LOG_STEP_TIMINGS = envs.VLLM_LOG_ENGINE_CORE_STEP_TIMINGS
+_STEP_TIMING_LOG_INTERVAL = envs.VLLM_ENGINE_CORE_STEP_TIMING_INTERVAL
 
 _R = TypeVar("_R")  # Return type for collective_rpc
 
@@ -209,7 +214,18 @@ class EngineCore:
         # to eliminate pipeline bubbles.
         self.batch_queue_size = vllm_config.max_concurrent_batches
         self.batch_queue: (
-            deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
+            deque[
+                tuple[
+                    Future[ModelRunnerOutput],
+                    SchedulerOutput,
+                    Future[Any],
+                    int,
+                    float,
+                    float,
+                    dict[str, float],
+                ]
+            ]
+            | None
         ) = None
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
@@ -236,6 +252,10 @@ class EngineCore:
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
+
+        self._step_timing_records: list[dict[str, Any]] = []
+        self._step_timing_batch_count = 0
+        self._step_timing_invocation_count = 0
 
         self.aborts_queue = queue.Queue[list[str]]()
 
@@ -616,26 +636,231 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
-        scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-        future = self.model_executor.execute_model(scheduler_output, non_block=True)
-        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-        with (
-            self.capture_iteration_details(scheduler_output) as iteration_details,
-            self.log_error_detail(scheduler_output),
-        ):
-            model_output = future.result()
-            if model_output is None:
-                model_output = self.model_executor.sample_tokens(grammar_output)
+
+        if not _LOG_STEP_TIMINGS:
+            scheduler_output = self.scheduler.schedule(
+                self._should_throttle_prefills()
+            )
+            future = self.model_executor.execute_model(
+                scheduler_output, non_block=True
+            )
+            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+            with (
+                self.capture_iteration_details(scheduler_output) as iteration_details,
+                self.log_error_detail(scheduler_output),
+            ):
+                model_output = future.result()
+                if model_output is None:
+                    model_output = self.model_executor.sample_tokens(grammar_output)
+        else:
+            self._step_timing_invocation_count += 1
+            invocation_id = self._step_timing_invocation_count
+            self._step_timing_batch_count += 1
+            batch_id = self._step_timing_batch_count
+            step_start_time = time.time()
+            t0 = time.perf_counter()
+            scheduler_output = self.scheduler.schedule(
+                self._should_throttle_prefills()
+            )
+            t1 = time.perf_counter()
+            # For UniProc (TP=1) the forward pass runs inline here; for
+            # MultiProc (TP>1) this only dispatches and returns a Future.
+            future = self.model_executor.execute_model(
+                scheduler_output, non_block=True
+            )
+            t2 = time.perf_counter()
+            grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+            t3 = time.perf_counter()
+            dispatch_end_time = time.time()
+            with (
+                self.capture_iteration_details(scheduler_output) as iteration_details,
+                self.log_error_detail(scheduler_output),
+            ):
+                # For MultiProc this blocks on the worker forward pass; for
+                # UniProc the result is already available.
+                collect_start_time = time.time()
+                model_output = future.result()
+                t4 = time.perf_counter()
+                if model_output is None:
+                    model_output = self.model_executor.sample_tokens(grammar_output)
+                t5 = time.perf_counter()
+            step_timings_ms = {
+                "schedule_ms": (t1 - t0) * 1000.0,
+                "execute_dispatch_ms": (t2 - t1) * 1000.0,
+                "grammar_bitmask_ms": (t3 - t2) * 1000.0,
+                "execute_wait_ms": (t4 - t3) * 1000.0,
+                "sample_tokens_ms": (t5 - t4) * 1000.0,
+            }
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
         self._process_aborts_queue()
+        if _LOG_STEP_TIMINGS:
+            update_start = time.perf_counter()
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
         self._attach_iteration_details(engine_core_outputs, iteration_details)
+        if _LOG_STEP_TIMINGS:
+            step_timings_ms["update_output_ms"] = (
+                time.perf_counter() - update_start
+            ) * 1000.0
+            self._record_step_timing_invocation(
+                invocation_id=invocation_id,
+                mode="step",
+                dispatch={
+                    "batch_id": batch_id,
+                    "num_tokens": scheduler_output.total_num_scheduled_tokens,
+                    "start_time": step_start_time,
+                    "end_time": dispatch_end_time,
+                    "timings_ms": step_timings_ms,
+                },
+                collect={
+                    "batch_id": batch_id,
+                    "start_time": collect_start_time,
+                    "end_time": time.time(),
+                    "dispatch_start_time": step_start_time,
+                    "dispatch_end_time": dispatch_end_time,
+                    "timings_ms": step_timings_ms,
+                },
+            )
 
         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+
+    def _record_step_timing_invocation(
+        self,
+        invocation_id: int,
+        mode: str,
+        dispatch: dict[str, Any] | None,
+        collect: dict[str, Any] | None,
+    ) -> None:
+        self._step_timing_records.append(
+            {
+                "invocation_id": invocation_id,
+                "mode": mode,
+                "dispatch": dispatch,
+                "collect": collect,
+            }
+        )
+        if len(self._step_timing_records) >= _STEP_TIMING_LOG_INTERVAL:
+            self._log_step_timings()
+
+    def _log_step_timings(self) -> None:
+        if not self._step_timing_records:
+            return
+
+        display_names = {
+            "schedule_ms": "schedule_cpu",
+            "execute_dispatch_ms": "execute_model_rpc_enqueue",
+            "sample_dispatch_ms": "sample_tokens_rpc_enqueue",
+            "grammar_bitmask_ms": "grammar_bitmask_cpu",
+            "execute_wait_ms": "execute_model_future_wait",
+            "sample_tokens_ms": "sample_tokens_call",
+            "result_wait_ms": "model_output_future_wait",
+            "update_output_ms": "scheduler_update_from_output_cpu",
+        }
+        dispatch_phases = {
+            "schedule_ms",
+            "execute_dispatch_ms",
+            "sample_dispatch_ms",
+            "grammar_bitmask_ms",
+        }
+        collect_phases = {
+            "execute_wait_ms",
+            "sample_tokens_ms",
+            "result_wait_ms",
+            "update_output_ms",
+        }
+        lines = []
+        for record in self._step_timing_records:
+            lines.append(
+                "engine invocation timing "
+                f"call={record['invocation_id']} mode={record['mode']}"
+            )
+            if dispatch_record := record["dispatch"]:
+                timings_ms = cast(
+                    dict[str, float], dispatch_record["timings_ms"]
+                )
+                post_collect_dispatch = dispatch_record.get(
+                    "post_collect_dispatch"
+                )
+                phases = " ".join(
+                    f"{display_names[name]}={value:.3f}"
+                    for name, value in timings_ms.items()
+                    if name in dispatch_phases
+                    and not (post_collect_dispatch and name == "sample_dispatch_ms")
+                )
+                start_time = cast(float, dispatch_record["start_time"])
+                end_time = cast(float, dispatch_record["end_time"])
+                total = sum(
+                    value
+                    for name, value in timings_ms.items()
+                    if name in dispatch_phases
+                    and not (post_collect_dispatch and name == "sample_dispatch_ms")
+                )
+                lines.append(
+                    "  dispatch "
+                    f"batch={dispatch_record['batch_id']} "
+                    f"num_tokens={dispatch_record['num_tokens']} "
+                    f"start={datetime.fromtimestamp(start_time):%m-%d %H:%M:%S.%f} "
+                    f"end={datetime.fromtimestamp(end_time):%m-%d %H:%M:%S.%f}: "
+                    f"{phases} total={total:.3f}"
+                )
+            if collect_record := record["collect"]:
+                timings_ms = cast(dict[str, float], collect_record["timings_ms"])
+                phases = " ".join(
+                    f"{display_names[name]}={value:.3f}"
+                    for name, value in timings_ms.items()
+                    if name in collect_phases
+                )
+                start_time = cast(float, collect_record["start_time"])
+                end_time = cast(float, collect_record["end_time"])
+                dispatch_start = cast(
+                    float, collect_record["dispatch_start_time"]
+                )
+                dispatch_end = cast(float, collect_record["dispatch_end_time"])
+                total = sum(
+                    value
+                    for name, value in timings_ms.items()
+                    if name in collect_phases
+                )
+                queued_ms = max(0.0, start_time - dispatch_end) * 1000.0
+                end_to_end_ms = (end_time - dispatch_start) * 1000.0
+                lines.append(
+                    "  collect[future.result()] "
+                    f"batch={collect_record['batch_id']} "
+                    f"start={datetime.fromtimestamp(start_time):%m-%d %H:%M:%S.%f} "
+                    f"end={datetime.fromtimestamp(end_time):%m-%d %H:%M:%S.%f}: "
+                    f"{phases} total={total:.3f} "
+                    f"queued_before_collect={queued_ms:.3f} "
+                    f"batch_end_to_end={end_to_end_ms:.3f}"
+                )
+            if dispatch_record and (
+                post_collect_dispatch := dispatch_record.get(
+                    "post_collect_dispatch"
+                )
+            ):
+                timings_ms = cast(
+                    "  collect[blocking_future_result] "
+                )
+                sample_dispatch_ms = timings_ms["sample_dispatch_ms"]
+                start_time = cast(float, post_collect_dispatch["start_time"])
+                end_time = cast(float, post_collect_dispatch["end_time"])
+                lines.append(
+                    "  dispatch_after_collect "
+                    f"batch={dispatch_record['batch_id']} "
+                    f"start={datetime.fromtimestamp(start_time):%m-%d %H:%M:%S.%f} "
+                    f"end={datetime.fromtimestamp(end_time):%m-%d %H:%M:%S.%f}: "
+                    "reason=structured_output_grammar_dependency "
+                    f"sample_tokens_rpc_enqueue={sample_dispatch_ms:.3f}"
+                )
+        logger.info(
+            "engine invocation timing details (calls %d-%d, ms):\n%s",
+            self._step_timing_records[0]["invocation_id"],
+            self._step_timing_records[-1]["invocation_id"],
+            "\n".join(lines),
+        )
+        self._step_timing_records.clear()
 
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
@@ -666,6 +891,12 @@ class EngineCore:
         batch_queue = self.batch_queue
         assert batch_queue is not None
 
+        if _LOG_STEP_TIMINGS:
+            self._step_timing_invocation_count += 1
+            invocation_id = self._step_timing_invocation_count
+        else:
+            invocation_id = 0
+
         # Try to schedule a new batch if the batch queue is not full, but
         # the scheduler may return an empty batch if all requests are scheduled.
         # Note that this is not blocking.
@@ -673,12 +904,32 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
+        scheduled_batch_id = 0
+        scheduled_step_start_time = 0.0
+        scheduled_dispatch_end_time = 0.0
+        scheduled_step_timings_ms: dict[str, float] = {}
+        dispatch_timing_record: dict[str, Any] | None = None
+        collect_timing_record: dict[str, Any] | None = None
         if self.scheduler.has_requests():
+            if _LOG_STEP_TIMINGS:
+                self._step_timing_batch_count += 1
+                scheduled_batch_id = self._step_timing_batch_count
+                scheduled_step_start_time = time.time()
+                t0 = time.perf_counter()
             scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            if _LOG_STEP_TIMINGS:
+                t1 = time.perf_counter()
+                scheduled_step_timings_ms["schedule_ms"] = (t1 - t0) * 1000.0
             with self.log_error_detail(scheduler_output):
                 exec_future = self.model_executor.execute_model(
                     scheduler_output, non_block=True
                 )
+            if _LOG_STEP_TIMINGS:
+                t2 = time.perf_counter()
+                execute_dispatch_end_time = time.time()
+                scheduled_step_timings_ms["execute_dispatch_ms"] = (
+                    t2 - t1
+                ) * 1000.0
             if self.is_ec_consumer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
@@ -695,19 +946,58 @@ class EngineCore:
                     future = self.model_executor.sample_tokens(
                         grammar_output, non_block=True
                     )
+                    if _LOG_STEP_TIMINGS:
+                        scheduled_step_timings_ms["sample_dispatch_ms"] = (
+                            time.perf_counter() - t2
+                        ) * 1000.0
                 else:
                     # We need to defer sampling until we have processed the model output
                     # from the prior step.
                     deferred_scheduler_output = scheduler_output
+                    if _LOG_STEP_TIMINGS:
+                        scheduled_dispatch_end_time = execute_dispatch_end_time
+                        dispatch_timing_record = {
+                            "batch_id": scheduled_batch_id,
+                            "num_tokens": scheduler_output.total_num_scheduled_tokens,
+                            "start_time": scheduled_step_start_time,
+                            "end_time": scheduled_dispatch_end_time,
+                            "timings_ms": scheduled_step_timings_ms,
+                        }
 
             if not deferred_scheduler_output:
                 # Add this step's future to the queue.
-                batch_queue.appendleft((future, scheduler_output, exec_future))
+                if _LOG_STEP_TIMINGS:
+                    scheduled_dispatch_end_time = time.time()
+                    dispatch_timing_record = {
+                        "batch_id": scheduled_batch_id,
+                        "num_tokens": scheduler_output.total_num_scheduled_tokens,
+                        "start_time": scheduled_step_start_time,
+                        "end_time": scheduled_dispatch_end_time,
+                        "timings_ms": scheduled_step_timings_ms,
+                    }
+                batch_queue.appendleft(
+                    (
+                        future,
+                        scheduler_output,
+                        exec_future,
+                        scheduled_batch_id,
+                        scheduled_step_start_time,
+                        scheduled_dispatch_end_time,
+                        scheduled_step_timings_ms,
+                    )
+                )
                 if len(batch_queue) < self.batch_queue_size and (
                     model_executed or self.scheduler.has_requests()
                 ):
                     # Don't block on next worker response unless the queue is full
                     # or there are no more requests to schedule.
+                    if _LOG_STEP_TIMINGS:
+                        self._record_step_timing_invocation(
+                            invocation_id=invocation_id,
+                            mode="batch_queue",
+                            dispatch=dispatch_timing_record,
+                            collect=None,
+                        )
                     return None, model_executed
 
         elif not batch_queue:
@@ -717,7 +1007,18 @@ class EngineCore:
             return None, False
 
         # Block until the next result is available.
-        future, scheduler_output, exec_model_fut = batch_queue.pop()
+        (
+            future,
+            scheduler_output,
+            exec_model_fut,
+            completed_batch_id,
+            completed_step_start_time,
+            completed_dispatch_end_time,
+            completed_step_timings_ms,
+        ) = batch_queue.pop()
+        if _LOG_STEP_TIMINGS:
+            t3 = time.perf_counter()
+            collect_start_time = time.time()
         with (
             self.capture_iteration_details(scheduler_output) as iteration_details,
             self.log_error_detail(scheduler_output),
@@ -728,6 +1029,9 @@ class EngineCore:
                 # call failed - raise that exception.
                 exec_model_fut.result()
                 raise RuntimeError("unexpected error")
+        if _LOG_STEP_TIMINGS:
+            t4 = time.perf_counter()
+            completed_step_timings_ms["result_wait_ms"] = (t4 - t3) * 1000.0
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.
@@ -735,12 +1039,29 @@ class EngineCore:
         engine_core_outputs = self.scheduler.update_from_output(
             scheduler_output, model_output
         )
+        if _LOG_STEP_TIMINGS:
+            completed_step_timings_ms["update_output_ms"] = (
+                time.perf_counter() - t4
+            ) * 1000.0
         self._attach_iteration_details(engine_core_outputs, iteration_details)
+
+        if _LOG_STEP_TIMINGS:
+            collect_timing_record = {
+                "batch_id": completed_batch_id,
+                "start_time": collect_start_time,
+                "end_time": time.time(),
+                "dispatch_start_time": completed_step_start_time,
+                "dispatch_end_time": completed_dispatch_end_time,
+                "timings_ms": completed_step_timings_ms,
+            }
 
         # NOTE(nick): We can either handle the deferred tasks here or save
         # in a field and do it immediately once step_with_batch_queue is
         # re-called. The latter slightly favors TTFT over TPOT/throughput.
         if deferred_scheduler_output:
+            if _LOG_STEP_TIMINGS:
+                sample_dispatch_start = time.perf_counter()
+                sample_dispatch_start_time = time.time()
             # When draft tokens are used with structured output, validate them
             # before computing the grammar bitmask for the deferred request.
             if self.check_for_draft_tokens:
@@ -758,7 +1079,35 @@ class EngineCore:
                 deferred_scheduler_output
             )
             future = self.model_executor.sample_tokens(grammar_output, non_block=True)
-            batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
+            if _LOG_STEP_TIMINGS:
+                scheduled_step_timings_ms["sample_dispatch_ms"] = (
+                    time.perf_counter() - sample_dispatch_start
+                ) * 1000.0
+                scheduled_dispatch_end_time = time.time()
+                assert dispatch_timing_record is not None
+                dispatch_timing_record["post_collect_dispatch"] = {
+                    "start_time": sample_dispatch_start_time,
+                    "end_time": scheduled_dispatch_end_time,
+                }
+            batch_queue.appendleft(
+                (
+                    future,
+                    deferred_scheduler_output,
+                    exec_future,
+                    scheduled_batch_id,
+                    scheduled_step_start_time,
+                    scheduled_dispatch_end_time,
+                    scheduled_step_timings_ms,
+                )
+            )
+
+        if _LOG_STEP_TIMINGS:
+            self._record_step_timing_invocation(
+                invocation_id=invocation_id,
+                mode="batch_queue",
+                dispatch=dispatch_timing_record,
+                collect=collect_timing_record,
+            )
 
         return engine_core_outputs, model_executed
 
@@ -773,6 +1122,8 @@ class EngineCore:
             self.abort_requests(request_ids)
 
     def shutdown(self):
+        if _LOG_STEP_TIMINGS:
+            self._log_step_timings()
         logger.debug_once("[shutdown] EngineCore: tearing down local resources")
         self.structured_output_manager.clear_backend()
         if self.model_executor:
