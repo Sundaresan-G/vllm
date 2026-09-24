@@ -34,6 +34,11 @@ INPUT_LEN=4
 OUTPUT_LEN=21
 NUM_PROMPTS=5
 
+# UVA CPU offloading: only expert weights are offloaded (matched by the
+# ".experts." name segment), up to CPU_OFFLOAD_GB per GPU. Set to 0 to disable.
+CPU_OFFLOAD_GB=${CPU_OFFLOAD_GB:-100}
+CPU_OFFLOAD_PARAMS=${CPU_OFFLOAD_PARAMS:-experts}
+
 GPU_ENV="vllm_0.27.2rc0+kimi_xpu"
 
 CONDA_BASE="/data/nfs_home/sundares/miniforge3"
@@ -210,12 +215,14 @@ main() {
         sycl-ls --verbose
 
         # NEOReadDebugKeys=1 EnableImplicitConvertionToCounterBasedEvents=0 \\
+        VLLM_LOG_STEP_TIMINGS=0 \\
         VLLM_XPU_ENABLE_XPU_GRAPH=1 \\
         ${UNITRACE_PREFIX} \\
         \$(which vllm) serve ${MODEL} --trust-remote-code \\
-        --port 9000 --max-model-len 200 --max-num-seqs 10 -tp 4 --max-num-batched-tokens 200 \\
+        --port 9000 --max-model-len 200 --max-num-seqs 10 -tp 1 --max-num-batched-tokens 200 \\
         --no-enable-prefix-caching --block-size 64 --num-gpu-blocks-override 10 \\
-        # --profiler-config '{\"profiler\": \"torch\", \"torch_profiler_dir\": \"./vllm_profile\", \"torch_profiler_record_shapes\": 1, \"torch_profiler_with_flops\": 1, \"torch_profiler_with_stack\": 1, \"torch_profiler_with_memory\": 1}' \\
+        --cpu-offload-gb ${CPU_OFFLOAD_GB} --cpu-offload-params ${CPU_OFFLOAD_PARAMS} \\
+        # --profiler-config '{\"profiler\": \"torch\", \"torch_profiler_dir\": \"./vllm_profile\", \"torch_profiler_record_shapes\": 1, \"torch_profiler_with_flops\": 1, \"torch_profiler_with_stack\": 0, \"torch_profiler_with_memory\": 1}' \\
         # --offload-group-size 1 --offload-num-in-group 1 --offload-prefetch-step 2 \\
         # --quantization fp8
     " > >(tee server.log) 2>&1 &
