@@ -48,17 +48,26 @@ class UVAOffloader(BaseOffloader):
             is_uva_available() and not envs.VLLM_WEIGHT_OFFLOADING_DISABLE_UVA
         )
 
+        # Diagnostics: per-parameter offload/resident tracking so it's easy
+        # to see exactly which parameters ended up offloaded vs. left on
+        # device, and how large each one is.
+        self.offloaded_param_info: list[tuple[str, int]] = []
+        self.resident_param_info: list[tuple[str, int]] = []
+
     def wrap_modules(
         self,
         modules_generator: Generator[nn.Module, None, None],
     ) -> list[nn.Module]:
         """Wrap modules with UVA offloading."""
-        modules = [self._maybe_offload_to_cpu(module) for module in modules_generator]
-        if self.cpu_offload_bytes > 0:
-            logger.info(
-                "Total CPU offloaded parameters: %s",
-                format_gib(self.cpu_offload_bytes),
-            )
+        modules = [
+            self._maybe_offload_to_cpu(module) for module in modules_generator
+        ]
+
+        for name, size in self.offloaded_param_info:
+            logger.debug("  [OFFLOADED] %s: %s GiB", name, format_gib(size))
+        for name, size in self.resident_param_info:
+            logger.debug("  [RESIDENT]  %s: %s GiB", name, format_gib(size))
+
         return modules
 
     def _maybe_offload_to_cpu(self, module: nn.Module) -> nn.Module:
@@ -71,7 +80,13 @@ class UVAOffloader(BaseOffloader):
         if device == torch.device("cpu"):
             return module
 
+        module_tag = type(module).__name__
+
         if self.cpu_offload_bytes >= self.cpu_offload_max_bytes:
+            for name, p in module.named_parameters():
+                self.resident_param_info.append(
+                    (f"{module_tag}.{name}", p.numel() * p.element_size())
+                )
             return module
 
         # offload parameters to CPU
@@ -81,6 +96,9 @@ class UVAOffloader(BaseOffloader):
             if self.cpu_offload_bytes >= self.cpu_offload_max_bytes:
                 # we use per-parameter offloading
                 # one module might have some parameters offloaded and some not
+                self.resident_param_info.append(
+                    (f"{module_tag}.{name}", p.numel() * p.element_size())
+                )
                 break
 
             if self.cpu_offload_params:
@@ -92,6 +110,9 @@ class UVAOffloader(BaseOffloader):
                     f".{param}." in f".{name}." for param in self.cpu_offload_params
                 )
                 if not should_offload:
+                    self.resident_param_info.append(
+                        (f"{module_tag}.{name}", p.numel() * p.element_size())
+                    )
                     continue
 
             cpu_data = p.data.to(device="cpu")
@@ -104,7 +125,9 @@ class UVAOffloader(BaseOffloader):
                 p.data = get_accelerator_view_from_cpu_tensor(cpu_data)
                 p._vllm_is_uva_offloaded = True
 
-            self.cpu_offload_bytes += p.data.numel() * p.data.element_size()
+            offloaded_bytes = p.data.numel() * p.data.element_size()
+            self.cpu_offload_bytes += offloaded_bytes
+            self.offloaded_param_info.append((f"{module_tag}.{name}", offloaded_bytes))
             offloaded_parameters = True
 
         if offloaded_parameters and not self.uva_offloading:
