@@ -27,19 +27,223 @@ PIDS=()
 # MODEL="cpatonn/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit"
 # MODEL="Qwen/Qwen3-30B-A3B-FP8"
 # MODEL="Qwen/Qwen3-30B-A3B"
-MODEL="moonshotai/Kimi-Linear-48B-A3B-Instruct"
+# MODEL="moonshotai/Kimi-Linear-48B-A3B-Instruct"
+MODEL="moonshotai/Kimi-K3"
 # MODEL="Qwen/Qwen3-235B-A22B"
 # MODEL="Qwen/Qwen2.5-1.5B"
 INPUT_LEN=4
-OUTPUT_LEN=21
-NUM_PROMPTS=5
+OUTPUT_LEN=3
+NUM_PROMPTS=2
 
 # UVA CPU offloading: only expert weights are offloaded (matched by the
 # ".experts." name segment), up to CPU_OFFLOAD_GB per GPU. Set to 0 to disable.
-CPU_OFFLOAD_GB=${CPU_OFFLOAD_GB:-100}
+CPU_OFFLOAD_GB=${CPU_OFFLOAD_GB:-2000}
 CPU_OFFLOAD_PARAMS=${CPU_OFFLOAD_PARAMS:-experts}
 
-GPU_ENV="vllm_0.27.2rc0+kimi_xpu"
+# Fast iteration knobs for debugging (no accuracy):
+#   DUMMY_WEIGHTS=1  -> --load-format dummy: skip reading checkpoint shards,
+#                       init random weights on device. Every kernel/memory path
+#                       still runs (offload path included); output is garbage.
+#   NUM_LAYERS=<N>   -> truncate to the first N decoder layers. Kimi-K3 nests
+#                       num_hidden_layers under text_config, so we override that.
+#                       Layer types/AttnRes use membership/modular tests, so
+#                       truncating is safe. N=4 hits every kernel once (KDA dense
+#                       MLP, MoE, MLA full-attn at idx3, one AttnRes block); N=13
+#                       also crosses the attn_res_block_size=12 boundary.
+DUMMY_WEIGHTS=${DUMMY_WEIGHTS:-1}
+NUM_LAYERS=${NUM_LAYERS:-6}
+
+# Tensor-parallel size / GPU count. For memory-allocation debugging, run a
+# single GPU with a few layers so the process is isolated and the per-node
+# NUMA counters in [UVA-ALLOC] reflect exactly one worker:
+#   TP=1 NUM_LAYERS=6 sbatch pure_gpu_trial.sh
+TP=${TP:-1}
+
+EXTRA_SERVE_ARGS=""
+if [[ "$DUMMY_WEIGHTS" == "1" ]]; then
+    EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS} --load-format dummy"
+fi
+if [[ "$NUM_LAYERS" != "0" ]]; then
+    EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS} --hf-overrides '{\"text_config\":{\"num_hidden_layers\":${NUM_LAYERS}}}'"
+fi
+
+# Torch profiler: set USE_PROFILER=1 to enable the torch profiler on the server
+# (--profiler-config) and trigger a capture window during `vllm bench serve`
+# (--profile). Traces land in ./vllm_profile. Default off to keep memory-debug
+# runs light. Override the config JSON via PROFILER_CONFIG_JSON if needed.
+USE_PROFILER=${USE_PROFILER:-0}
+PROFILER_CONFIG_JSON=${PROFILER_CONFIG_JSON:-'{"profiler": "torch", "torch_profiler_dir": "./vllm_profile", "torch_profiler_record_shapes": 1, "torch_profiler_with_flops": 1, "torch_profiler_with_stack": 0, "torch_profiler_with_memory": 1}'}
+PROFILER_SERVE_ARGS=""
+PROFILE_BENCH_ARG=""
+if [[ "$USE_PROFILER" == "1" ]]; then
+    PROFILER_SERVE_ARGS="--profiler-config '${PROFILER_CONFIG_JSON}'"
+    PROFILE_BENCH_ARG="--profile"
+fi
+
+# ---------------------------------------------------------------------------
+# TP=1 single-GPU-on-a-NUMA-node experiment. Set TP1_NODE=<n> (e.g. TP1_NODE=1)
+# to run a single worker pinned to one physical GPU attached to that NUMA node,
+# with CPU + host memory bound to the same node. This isolates the UVA
+# offloader so the [UVA-ALLOC] consumed[] deltas reflect exactly one worker and
+# you can watch whether host allocations land on the intended node.
+#
+# GPU selection: enumerate Intel GPU PCI devices sorted by BDF (matching the
+# Level Zero order from ZE_ENABLE_PCI_ID_DEVICE_ORDER=1) and pick the first one
+# whose numa_node == TP1_NODE, exposing only it via ZE_AFFINITY_MASK (so it
+# becomes xpu:0). Override the chosen index with TP1_GPU_INDEX (BDF-sorted,
+# global 0..7). numactl binds CPU+memory to TP1_NODE. TP1_NUMA_MODE controls
+# host-memory policy: membind (strict, hard-fail on exhaustion; default),
+# preferred (soft, allows spillover to the other node), or interleave (spread).
+#
+# Example: TP1_NODE=1 NUM_LAYERS=6 sbatch pure_gpu_trial.sh
+TP1_NODE=${TP1_NODE:-}
+ZE_AFFINITY_ENV=""
+NUMACTL_PREFIX=""
+PER_WORKER_ZE_ENV=""
+NUMA_BIND_SERVE_ARGS=""
+# ---------------------------------------------------------------------------
+# Generalized multi-GPU NUMA placement. Set GPU_SCHEME to map the TP ranks onto
+# physical GPUs (BDF-sorted, matching ZE_ENABLE_PCI_ID_DEVICE_ORDER=1) and their
+# NUMA nodes. Works for any TP; the number of ranks is TP (set TP separately).
+#
+#   linear    - consecutive GPUs: rank g -> BDF GPU g. Fills node0 first, then
+#               node1 (e.g. TP=8 -> GPUs 0,1,2,3,4,5,6,7; nodes 0 0 0 0 1 1 1 1).
+#   alternate - round-robin across NUMA nodes: rank0 -> first node0 GPU, rank1
+#               -> first node1 GPU, rank2 -> second node0 GPU, ... (e.g. TP=8 ->
+#               GPUs 0,4,1,5,2,6,3,7; nodes 0 1 0 1 0 1 0 1).
+#
+# The visible-device order (ZE_AFFINITY_MASK) follows the chosen order, and
+# --numa-bind-nodes carries the matching per-rank node so each worker's CPU +
+# host memory bind to its GPU's node. PER_WORKER_ZE_AFFINITY=1 (default) also
+# gives each worker a single-GPU ZE_AFFINITY_MASK so its pinned/USM-host buffers
+# land on its own node instead of node0. Unset GPU_SCHEME to disable.
+# Takes precedence over TP1_NODE.
+#
+# Example: GPU_SCHEME=alternate TP=8 NUM_LAYERS=6 sbatch pure_gpu_trial.sh
+GPU_SCHEME=${GPU_SCHEME:-}
+if [[ -n "$GPU_SCHEME" ]]; then
+    TP1_NODE=""
+    # BDF-sorted Intel GPU list: "<bdf> <numa_node>" per line.
+    mapfile -t _gpu_bdf_node < <(
+        for d in /sys/bus/pci/devices/*; do
+            cls=$(cat "$d/class" 2>/dev/null)
+            ven=$(cat "$d/vendor" 2>/dev/null)
+            [[ "$ven" == "0x8086" && "$cls" == 0x0300* ]] || continue
+            echo "$(basename "$d") $(cat "$d/numa_node" 2>/dev/null)"
+        done | sort
+    )
+    n_gpu="${#_gpu_bdf_node[@]}"
+    if [[ "$n_gpu" -lt "$TP" ]]; then
+        echo "GPU_SCHEME: need $TP Intel GPUs, found $n_gpu" >&2
+        exit 1
+    fi
+    # order[] = global BDF-sorted GPU indices assigned to ranks 0..TP-1.
+    order=()
+    case "$GPU_SCHEME" in
+        linear)
+            for ((g = 0; g < TP; g++)); do order+=("$g"); done
+            ;;
+        alternate)
+            # Bucket GPU indices by NUMA node (ascending node id), preserving
+            # BDF order within each node, then round-robin across the buckets.
+            declare -A _bucket=()
+            _nodes_seen=()
+            for ((g = 0; g < n_gpu; g++)); do
+                nn="${_gpu_bdf_node[g]##* }"
+                [[ -z "$nn" || "$nn" == "-1" ]] && nn=0
+                [[ -z "${_bucket[$nn]:-}" ]] && _nodes_seen+=("$nn")
+                _bucket[$nn]="${_bucket[$nn]:-} $g"
+            done
+            mapfile -t _sorted_nodes < <(printf '%s\n' "${_nodes_seen[@]}" | sort -n)
+            declare -A _cursor=()
+            while [[ "${#order[@]}" -lt "$TP" ]]; do
+                _progressed=0
+                for nn in "${_sorted_nodes[@]}"; do
+                    read -r -a _arr <<<"${_bucket[$nn]}"
+                    idx="${_cursor[$nn]:-0}"
+                    if [[ "$idx" -lt "${#_arr[@]}" ]]; then
+                        order+=("${_arr[$idx]}")
+                        _cursor[$nn]=$((idx + 1))
+                        _progressed=1
+                        [[ "${#order[@]}" -ge "$TP" ]] && break
+                    fi
+                done
+                [[ "$_progressed" -eq 0 ]] && break
+            done
+            ;;
+        *)
+            echo "GPU_SCHEME: unknown scheme '$GPU_SCHEME' (use linear|alternate)" >&2
+            exit 1
+            ;;
+    esac
+    mask_ids=(); node_list=()
+    rank=0
+    for gi in "${order[@]}"; do
+        entry="${_gpu_bdf_node[gi]}"
+        bdf="${entry%% *}"
+        nn="${entry##* }"
+        [[ -z "$nn" || "$nn" == "-1" ]] && nn=0
+        mask_ids+=("$gi")
+        node_list+=("$nn")
+        echo "GPU_SCHEME(${GPU_SCHEME}): rank${rank} -> xpu:${rank} = idx${gi}(${bdf}) node${nn}"
+        rank=$((rank + 1))
+    done
+    ze_mask=$(
+        IFS=,
+        echo "${mask_ids[*]}"
+    )
+    # ZE_AFFINITY_MASK order defines the visible device order (xpu:i -> order[i]);
+    # --numa-bind-nodes carries the matching per-rank node.
+    ZE_AFFINITY_ENV="ZE_AFFINITY_MASK=${ze_mask}"
+    NUMA_BIND_SERVE_ARGS="--numa-bind --numa-bind-nodes ${node_list[*]}"
+    # Give each worker a single-GPU ZE_AFFINITY_MASK so Level-Zero device 0 in
+    # the child == its local GPU, keeping pinned/USM-host memory on its node.
+    PER_WORKER_ZE_AFFINITY=${PER_WORKER_ZE_AFFINITY:-1}
+    if [[ "$PER_WORKER_ZE_AFFINITY" == "1" ]]; then
+        PER_WORKER_ZE_ENV="VLLM_XPU_PER_WORKER_ZE_AFFINITY=1"
+    fi
+fi
+if [[ -n "$TP1_NODE" ]]; then
+    TP=1
+    TP1_NUMA_MODE=${TP1_NUMA_MODE:-membind}
+    # BDF-sorted Intel GPU list: "<bdf> <numa_node>" per line.
+    mapfile -t _gpu_bdf_node < <(
+        for d in /sys/bus/pci/devices/*; do
+            cls=$(cat "$d/class" 2>/dev/null)
+            ven=$(cat "$d/vendor" 2>/dev/null)
+            [[ "$ven" == "0x8086" && "$cls" == 0x0300* ]] || continue
+            echo "$(basename "$d") $(cat "$d/numa_node" 2>/dev/null)"
+        done | sort
+    )
+    sel_index="${TP1_GPU_INDEX:-}"
+    if [[ -z "$sel_index" ]]; then
+        idx=0
+        for entry in "${_gpu_bdf_node[@]}"; do
+            if [[ "${entry##* }" == "$TP1_NODE" ]]; then
+                sel_index=$idx
+                break
+            fi
+            idx=$((idx + 1))
+        done
+    fi
+    if [[ -z "$sel_index" ]]; then
+        echo "TP1_NODE=$TP1_NODE: no Intel GPU found on that NUMA node" >&2
+        exit 1
+    fi
+    sel_bdf="${_gpu_bdf_node[sel_index]%% *}"
+    echo "TP1_NODE=${TP1_NODE} -> GPU index ${sel_index} (bdf ${sel_bdf}), numactl mode=${TP1_NUMA_MODE}"
+    ZE_AFFINITY_ENV="ZE_AFFINITY_MASK=${sel_index}"
+    case "$TP1_NUMA_MODE" in
+        preferred)  NUMACTL_PREFIX="numactl --cpunodebind=${TP1_NODE} --preferred=${TP1_NODE}" ;;
+        interleave) NUMACTL_PREFIX="numactl --cpunodebind=${TP1_NODE} --interleave=all" ;;
+        *)          NUMACTL_PREFIX="numactl --cpunodebind=${TP1_NODE} --membind=${TP1_NODE}" ;;
+    esac
+    # TP=1 runs the worker in-process, so vLLM's --numa-bind won't wrap it;
+    # numactl on the whole serve process is what binds it. Disable --numa-bind.
+    NUMA_BIND_SERVE_ARGS=""
+fi
+
+GPU_ENV="vllm_0.28.1rc0+kimi_xpu"
 
 CONDA_BASE="/data/nfs_home/sundares/miniforge3"
 SCRIPT_DIR="/data/nfs_home/sundares/vllm/vllm/examples/others/nixl_connector"
@@ -60,6 +264,19 @@ UNITRACE_SESSION="kimi"
 
 export VLLM_LOGGING_LEVEL=DEBUG
 # export VLLM_LOGGING_LEVEL=WARNING
+
+# PyTorch pins host memory in powers of two by default: its CachingHostAllocator
+# calls PowerOf2Ceil(size) on every pinned allocation (torch 2.13
+# aten/src/ATen/core/CachingHostAllocator.h), so a 9.19 GiB expert weight
+# reserves 16 GiB, 4.59 GiB -> 8 GiB, etc. (~1.74x blowup per MoE layer). Since
+# UVA offload allocates each buffer once and holds it, free-list reuse is
+# irrelevant, so disable the rounding. PINNED_MAX_ROUND_MB is the threshold in
+# MiB above which allocations are NOT rounded; 0 disables rounding entirely.
+# Set PINNED_MAX_ROUND_MB=max (or unset PYTORCH_ALLOC_CONF) to restore rounding.
+PINNED_MAX_ROUND_MB=${PINNED_MAX_ROUND_MB:-0}
+if [[ "$PINNED_MAX_ROUND_MB" != "max" ]]; then
+    export PYTORCH_ALLOC_CONF="pinned_max_round_threshold_mb:${PINNED_MAX_ROUND_MB}"
+fi
 
 # Logging helper — prints [file:line func()] message to stderr
 log() {
@@ -215,14 +432,22 @@ main() {
         sycl-ls --verbose
 
         # NEOReadDebugKeys=1 EnableImplicitConvertionToCounterBasedEvents=0 \\
+        ZE_ENABLE_PCI_ID_DEVICE_ORDER=1 \\
         VLLM_LOG_STEP_TIMINGS=0 \\
-        VLLM_XPU_ENABLE_XPU_GRAPH=1 \\
+        VLLM_XPU_ENABLE_XPU_GRAPH=0 \\
+        TRITON_DEFAULT_BACKEND=intel \\
+        ${ZE_AFFINITY_ENV} \\
+        ${PER_WORKER_ZE_ENV} \\
         ${UNITRACE_PREFIX} \\
+        ${NUMACTL_PREFIX} \\
         \$(which vllm) serve ${MODEL} --trust-remote-code \\
-        --port 9000 --max-model-len 200 --max-num-seqs 10 -tp 1 --max-num-batched-tokens 200 \\
+        --port 9000 --max-model-len 200 --max-num-seqs 10 -tp ${TP} --max-num-batched-tokens 200 \\
         --no-enable-prefix-caching --block-size 64 --num-gpu-blocks-override 10 \\
+        --gpu-memory-utilization 0.80 \\
         --cpu-offload-gb ${CPU_OFFLOAD_GB} --cpu-offload-params ${CPU_OFFLOAD_PARAMS} \\
-        # --profiler-config '{\"profiler\": \"torch\", \"torch_profiler_dir\": \"./vllm_profile\", \"torch_profiler_record_shapes\": 1, \"torch_profiler_with_flops\": 1, \"torch_profiler_with_stack\": 0, \"torch_profiler_with_memory\": 1}' \\
+        ${EXTRA_SERVE_ARGS} \\
+        ${NUMA_BIND_SERVE_ARGS} \\
+        ${PROFILER_SERVE_ARGS} \\
         # --offload-group-size 1 --offload-num-in-group 1 --offload-prefetch-step 2 \\
         # --quantization fp8
     " > >(tee server.log) 2>&1 &
@@ -254,7 +479,7 @@ main() {
     $(which vllm) bench serve --port 9000 --seed $(date +%s) \
         --model $MODEL --trust-remote-code \
         --dataset-name random --random-input-len $INPUT_LEN --random-output-len $OUTPUT_LEN \
-        --num-prompts $NUM_PROMPTS --max-concurrency 1 \
+        --num-prompts $NUM_PROMPTS --max-concurrency 1 ${PROFILE_BENCH_ARG} \
         2>&1 | tee benchmark_gpu.log
 
     if [[ "$USE_UNITRACE" == "1" ]]; then
