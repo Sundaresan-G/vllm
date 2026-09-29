@@ -47,17 +47,17 @@ SCRIPT
 ```
 ## Intel GPUs:
 ```bash
-bash << 'SCRIPT' 2>&1 | tee build_xpu_0.27.2rc0+kimi_$(date +%Y%m%d_%H%M%S).log
+bash << 'SCRIPT' 2>&1 | tee build_xpu_0.28.1rc0+kimi_$(date +%Y%m%d_%H%M%S).log
 set -xe
 # Ensure that the tag is present as it is needed for proper versioning purpose
-# git fetch origin tag v0.27.2rc0 --no-tags
-# git reset --hard v0.27.2rc0
+# git fetch origin tag v0.28.1rc0 --no-tags
+# git reset --hard v0.28.1rc0
 CONDA_BASE="/data/nfs_home/sundares/miniforge3"
 source $CONDA_BASE/etc/profile.d/conda.sh
-conda create -n vllm_0.27.2rc0+kimi_xpu python==3.12 -y
+conda create -n vllm_0.28.1rc0+kimi_xpu python==3.12 -y
 # Load oneAPI2025.3 and driver modules
-mkdir -p $CONDA_BASE/envs/vllm_0.27.2rc0+kimi_xpu/etc/conda/activate.d
-cat > $CONDA_BASE/envs/vllm_0.27.2rc0+kimi_xpu/etc/conda/activate.d/xpu-vars.activate.sh << 'EOF'
+mkdir -p $CONDA_BASE/envs/vllm_0.28.1rc0+kimi_xpu/etc/conda/activate.d
+cat > $CONDA_BASE/envs/vllm_0.28.1rc0+kimi_xpu/etc/conda/activate.d/xpu-vars.activate.sh << 'EOF'
 #!/bin/bash
 
 [[ "$-" != *x* ]] && _xtrace_was_off=1 && set -x
@@ -73,13 +73,13 @@ export FI_PROVIDER=tcp
 
 if [[ -n "$_xtrace_was_off" ]]; then set +x; unset _xtrace_was_off; fi
 EOF
-conda activate vllm_0.27.2rc0+kimi_xpu
+conda activate vllm_0.28.1rc0+kimi_xpu
 pip install "pip<26"
 set -x
 pip install -r requirements/xpu.txt --extra-index-url=https://download.pytorch.org/whl/xpu -v
 # rm -rf .deps dist *.egg-info
 # git ls-files --others --exclude='.vscode' --exclude='example*' --exclude="build*" --exclude=".deps" | xargs rm
-VLLM_VERSION_OVERRIDE="v0.27.2rc0+kimi.xpu" VLLM_TARGET_DEVICE=xpu pip install -e . --no-build-isolation -v --extra-index-url=https://download.pytorch.org/whl/xpu --config-settings editable_mode=strict
+VLLM_VERSION_OVERRIDE="v0.28.1rc0+kimi.xpu" VLLM_TARGET_DEVICE=xpu pip install -e . --no-build-isolation -v --extra-index-url=https://download.pytorch.org/whl/xpu --config-settings editable_mode=strict
 TARGET_DIR=$(ls -dt build/__editable__.vllm-* 2>/dev/null | head -1) && \
 [ -n "$TARGET_DIR" ] || { echo "Error: No editable build directory found"; exit 1; } && \
 git ls-files --others --exclude='.vscode' --exclude='example*' --exclude="build*" --exclude=".deps" | \
@@ -102,8 +102,8 @@ git checkout pr-480
 # git checkout f86cd8ac855b61ac4839d9fe2fe3f390a9baae2f
 
 # git submodule update --init --recursive
-pip install -r requirements.txt
-# rm -rf build
+# pip install -r requirements.txt
+rm -rf build *.egg-info .deps
 VLLM_CHUNK_PREFILL_CONFIG=chunk_prefill_default.conf VLLM_PAGED_DECODE_CONFIG=paged_decode_default.conf pip install --no-build-isolation . -v
 cd ../vllm
 
