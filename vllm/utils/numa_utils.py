@@ -21,6 +21,8 @@ import psutil
 from vllm import envs
 
 if TYPE_CHECKING:
+    import torch
+
     from vllm.config import VllmConfig
 
 logger = logging.getLogger(__name__)
@@ -464,13 +466,21 @@ def _log_numactl_show(label: str) -> bool:
         return False
 
     summary = ", ".join(line.strip() for line in output.splitlines() if line.strip())
-    logger.debug("%s affinity: %s", label, summary)
+    logger.info("[NUMA] %s (pid=%d): %s", label, os.getpid(), summary)
     return True
 
 
-def log_current_affinity_state(label: str) -> None:
-    """Log the process's effective NUMA affinity state."""
+def log_current_affinity_state(
+    label: str, device: "torch.device | None" = None
+) -> None:
+    """Log the process's effective NUMA affinity state.
+
+    When ``device`` is given, also logs the worker's GPU PCI/NUMA identity so
+    the accelerator-to-NUMA mapping shows up next to the CPU/memory binding.
+    """
     _log_numactl_show(label)
+    if device is not None:
+        logger.info("[NUMA] %s: %s", label, worker_tag(device))
 
 
 def _probe_numactl_args(numactl_args: str) -> bool:
@@ -601,3 +611,95 @@ def _mp_set_executable(executable: str, debug_str: str):
             f"expected {executable}, got {multiprocessing.spawn.get_executable()}"
         )
         multiprocessing.spawn.set_executable(old_executable)
+
+
+def _parse_cpulist(cpulist: str) -> set[int]:
+    """Parse a Linux cpulist like ``0-59,120-179`` into a set of ints."""
+    cpus: set[int] = set()
+    for part in cpulist.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            lo, _, hi = part.partition("-")
+            if lo.isdigit() and hi.isdigit():
+                cpus.update(range(int(lo), int(hi) + 1))
+        elif part.isdigit():
+            cpus.add(int(part))
+    return cpus
+
+
+def read_allowed_numa_nodes() -> list[int]:
+    """NUMA nodes whose CPUs intersect this process's CPU affinity mask."""
+    try:
+        allowed = os.sched_getaffinity(0)
+    except Exception:
+        return []
+    base = "/sys/devices/system/node"
+    nodes: list[int] = []
+    try:
+        for entry in os.listdir(base):
+            if not entry.startswith("node") or not entry[4:].isdigit():
+                continue
+            node = int(entry[4:])
+            try:
+                with open(f"{base}/{entry}/cpulist") as f:
+                    cpus = _parse_cpulist(f.read().strip())
+            except Exception:
+                continue
+            if cpus & allowed:
+                nodes.append(node)
+    except Exception:
+        pass
+    return sorted(nodes)
+
+
+def gpu_pci_bdf(device: "torch.device") -> str | None:
+    """PCI BDF of an XPU device, decoded from its Level-Zero UUID.
+
+    The torch XPU ``uuid`` embeds the PCI address: the 4th UUID group holds
+    ``bus`` (byte 8) and ``dev/func`` (byte 9).
+    """
+    import torch
+
+    if device.type != "xpu":
+        return None
+    try:
+        props = torch.xpu.get_device_properties(device.index or 0)
+        b = props.uuid.bytes
+        bus, devfunc = b[8], b[9]
+        return f"{bus:02x}:{devfunc >> 3:02x}.{devfunc & 0x7:x}"
+    except Exception:
+        return None
+
+
+def gpu_numa_node(bdf: str | None) -> int | None:
+    """NUMA node the GPU is attached to, from sysfs."""
+    if not bdf:
+        return None
+    for prefix in ("0000:", ""):
+        try:
+            with open(f"/sys/bus/pci/devices/{prefix}{bdf}/numa_node") as f:
+                return int(f.read().strip())
+        except Exception:
+            continue
+    return None
+
+
+def worker_tag(device: "torch.device") -> str:
+    """One-line worker identity: rank, device, pid, GPU PCI/NUMA, CPU NUMA."""
+    import torch
+
+    try:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+        else:
+            rank = -1
+    except Exception:
+        rank = -1
+    bdf = gpu_pci_bdf(device)
+    return (
+        f"rank={rank} device={device} pid={os.getpid()} "
+        f"gpu_pci={bdf} gpu_numa={gpu_numa_node(bdf)} "
+        f"cpu_numa={read_allowed_numa_nodes()}"
+    )

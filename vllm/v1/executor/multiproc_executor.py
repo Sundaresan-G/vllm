@@ -741,11 +741,42 @@ class WorkerProc:
             daemon=True,
         )
 
-        # Apply NUMA binding if configured
-        with numa_utils.configure_subprocess(
-            vllm_config, local_rank, process_kind="worker"
-        ):
-            proc.start()
+        # Apply NUMA binding if configured.
+        #
+        # DEBUG (XPU pinned-memory NUMA experiment): when
+        # VLLM_XPU_PER_WORKER_ZE_AFFINITY=1, give each worker a single-GPU
+        # ZE_AFFINITY_MASK containing only its own physical GPU (the
+        # local_rank-th entry of the parent's mask). This makes Level-Zero
+        # device 0 in the child == the worker's local GPU, so the driver's
+        # USM-host (pin_memory) pool is placed on the worker's local NUMA
+        # node instead of always on the primary device's node (node0).
+        _prev_ze: str | None = None
+        _ze_overridden = False
+        if os.environ.get("VLLM_XPU_PER_WORKER_ZE_AFFINITY") == "1":
+            _mask = os.environ.get("ZE_AFFINITY_MASK", "")
+            _ids = _mask.split(",") if _mask else []
+            if local_rank < len(_ids):
+                _prev_ze = os.environ.get("ZE_AFFINITY_MASK")
+                os.environ["ZE_AFFINITY_MASK"] = _ids[local_rank]
+                _ze_overridden = True
+                logger.info(
+                    "[ZE-AFFINITY] worker rank=%d local_rank=%d "
+                    "ZE_AFFINITY_MASK=%s (single-GPU per worker)",
+                    rank,
+                    local_rank,
+                    _ids[local_rank],
+                )
+        try:
+            with numa_utils.configure_subprocess(
+                vllm_config, local_rank, process_kind="worker"
+            ):
+                proc.start()
+        finally:
+            if _ze_overridden:
+                if _prev_ze is None:
+                    os.environ.pop("ZE_AFFINITY_MASK", None)
+                else:
+                    os.environ["ZE_AFFINITY_MASK"] = _prev_ze
 
         # Close child ends of pipes here in the parent
         ready_writer.close()
@@ -911,7 +942,10 @@ class WorkerProc:
             worker = WorkerProc(*args, **kwargs)
             assert worker.worker_response_mq is not None
             if kwargs["vllm_config"].parallel_config.numa_bind:
-                numa_utils.log_current_affinity_state(f"Worker_{worker.rank}")
+                device = getattr(worker.worker, "device", None)
+                numa_utils.log_current_affinity_state(
+                    f"Worker_{worker.rank}", device
+                )
 
             worker.monitor_death_pipe(death_pipe, shutdown_requested)
 

@@ -40,11 +40,20 @@ class XPUWorker(Worker):
         assert current_platform.is_xpu()
 
     def init_device(self):
+        # DEBUG (XPU pinned-memory NUMA experiment): when
+        # VLLM_XPU_PER_WORKER_ZE_AFFINITY=1, each worker was launched with a
+        # single-GPU ZE_AFFINITY_MASK (see multiproc_executor), so only one
+        # device (ordinal 0) is visible in this process. Select xpu:0 and skip
+        # the DP local-rank device offset, which assumes all devices are
+        # visible in every worker.
+        per_worker_ze = os.environ.get("VLLM_XPU_PER_WORKER_ZE_AFFINITY") == "1"
+
         # In DP mode, XPU workers see all visible devices.
         # Offset local_rank by the local DP shard.
         parallel_config = self.parallel_config
         if (
-            parallel_config.distributed_executor_backend
+            not per_worker_ze
+            and parallel_config.distributed_executor_backend
             not in ("ray", "external_launcher")
             and parallel_config.data_parallel_backend != "ray"
             and (
@@ -130,12 +139,13 @@ class XPUWorker(Worker):
             and device.type == "xpu"
             and current_platform.is_xpu()
         ):
-            self.device = torch.device(f"xpu:{self.local_rank}")
+            device_index = 0 if per_worker_ze else self.local_rank
+            self.device = torch.device(f"xpu:{device_index}")
             torch.accelerator.set_device_index(self.device)
             current_platform.check_if_supports_dtype(self.model_config.dtype)
             torch.accelerator.empty_cache()
             self.init_gpu_memory = torch.xpu.get_device_properties(
-                self.local_rank
+                device_index
             ).total_memory
         else:
             raise RuntimeError(f"Unsupported device type: {self.device_config.device}")
@@ -146,13 +156,17 @@ class XPUWorker(Worker):
         )
         os.environ["CCL_ATL_TRANSPORT"] = ENV_CCL_ATL_TRANSPORT
         os.environ["LOCAL_WORLD_SIZE"] = ENV_LOCAL_WORLD_SIZE
-        os.environ["LOCAL_RANK"] = str(self.local_rank)
+        # In per-worker single-GPU mode only ordinal 0 is visible, so the
+        # device-selecting local rank must be 0 (the global rank still
+        # distinguishes workers for collectives).
+        dist_local_rank = 0 if per_worker_ze else self.local_rank
+        os.environ["LOCAL_RANK"] = str(dist_local_rank)
 
         init_worker_distributed_environment(
             self.vllm_config,
             self.rank,
             self.distributed_init_method,
-            self.local_rank,
+            dist_local_rank,
             current_platform.dist_backend,
         )
 
