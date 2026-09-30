@@ -33,7 +33,7 @@ MODEL="moonshotai/Kimi-K3"
 # MODEL="Qwen/Qwen2.5-1.5B"
 INPUT_LEN=4
 OUTPUT_LEN=21
-NUM_PROMPTS=2
+NUM_PROMPTS=3
 
 # UVA CPU offloading: only expert weights are offloaded (matched by the
 # ".experts." name segment), up to CPU_OFFLOAD_GB per GPU. Set to 0 to disable.
@@ -376,7 +376,7 @@ main() {
 
         # NEOReadDebugKeys=1 EnableImplicitConvertionToCounterBasedEvents=0 \\
         ZE_ENABLE_PCI_ID_DEVICE_ORDER=1 \\
-        VLLM_LOG_STEP_TIMINGS=0 \\
+        VLLM_LOG_STEP_TIMINGS=1 \\
         VLLM_XPU_ENABLE_XPU_GRAPH=1 \\
         TRITON_DEFAULT_BACKEND=intel \\
         ${ZE_AFFINITY_ENV} \\

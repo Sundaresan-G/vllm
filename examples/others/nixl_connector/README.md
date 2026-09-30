@@ -96,8 +96,11 @@ pip uninstall -y vllm-xpu-kernels
 cd ..
 [ -d ./vllm-xpu-kernels ] || git clone https://github.com/vllm-project/vllm-xpu-kernels.git
 cd vllm-xpu-kernels
-git fetch origin pull/480/head:pr-480
-git checkout pr-480
+# Fetch the live head of PR #480 (Kimi Delta Attention + Kimi-Linear support)
+# into a detached checkout, so it always tracks the latest push and never
+# collides with a pre-existing local branch name.
+git fetch origin pull/480/head
+git checkout FETCH_HEAD
 # git fetch origin tag v0.1.10 --no-tags
 # git checkout f86cd8ac855b61ac4839d9fe2fe3f390a9baae2f
 
