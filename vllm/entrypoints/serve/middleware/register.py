@@ -41,7 +41,7 @@ def init_entrypoints_middleware(
         app.add_middleware(XRequestIdMiddleware)
 
     if envs.VLLM_LOG_API_SERVER_STEP_TIMINGS:
-        from .request_timing import APIServerRequestTimingMiddleware
+        from .log_response import APIServerRequestTimingMiddleware
 
         app.add_middleware(APIServerRequestTimingMiddleware)
 
