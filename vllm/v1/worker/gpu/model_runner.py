@@ -22,7 +22,8 @@ import gc
 import time
 from contextlib import AbstractContextManager
 from copy import deepcopy
-from typing import Any, NamedTuple
+from datetime import datetime
+from typing import Any, NamedTuple, cast
 
 import numpy as np
 import torch
@@ -178,6 +179,12 @@ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
 
 logger = init_logger(__name__)
 
+# Optional GPU-event timing of the execute_model/sample phases, gated on
+# VLLM_LOG_GPU_MODEL_RUNNER_STEP_TIMINGS. Kept module-level so the fast path
+# checks a cheap boolean.
+_LOG_GPU_STEP_TIMINGS = envs.VLLM_LOG_GPU_MODEL_RUNNER_STEP_TIMINGS
+_GPU_STEP_TIMING_INTERVAL = envs.VLLM_GPU_MODEL_RUNNER_STEP_TIMING_INTERVAL
+
 
 class GPUModelRunner(LoRAModelRunnerMixin):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
@@ -302,6 +309,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
 
         self.step_timing = StepTimingCollector()
+
+        # Optional GPU-event timing of execute_model/sample phases. Keep enough
+        # event sets to retain the batches that may still be in flight. When a
+        # timing interval ends, only older, known-complete batches are logged,
+        # so timing never needs to synchronize the accelerator.
+        self._gpu_timing_count = 0
+        self._gpu_timing_step_count = 0
+        # EngineCore must collect batch N before it can dispatch batch N plus
+        # max_concurrent_batches. Its output copy waits for the default stream,
+        # so all timing events for N are complete by then.
+        self._gpu_timing_completion_lag = max(1, vllm_config.max_concurrent_batches)
+        self._step_is_decode = False
+        self._timing_events: list[dict[str, torch.Event]] | None = None
+        self._cpu_timing_records: list[dict[str, float | int | bool]] | None = None
+        if _LOG_GPU_STEP_TIMINGS:
+            self._timing_events = [
+                {
+                    key: torch.Event(enable_timing=True)
+                    for key in (
+                        "pre_start",
+                        "pre_end",
+                        "fwd_start",
+                        "fwd_end",
+                        "post_start",
+                        "post_end",
+                        "samp_start",
+                        "samp_end",
+                    )
+                }
+                for _ in range(
+                    _GPU_STEP_TIMING_INTERVAL + self._gpu_timing_completion_lag
+                )
+            ]
+            self._cpu_timing_records = [
+                {}
+                for _ in range(
+                    _GPU_STEP_TIMING_INTERVAL + self._gpu_timing_completion_lag
+                )
+            ]
 
         # General request states.
         self.req_states = RequestState(
@@ -1570,6 +1616,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         context_len: int = 0,
         valid_dummy_state_slots: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        if _LOG_GPU_STEP_TIMINGS and not dummy_run:
+            assert self._timing_events is not None
+            assert self._cpu_timing_records is not None
+            timing_record = self._cpu_timing_records[self._gpu_timing_count]
+            timing_record.clear()
+            timing_record["num_tokens"] = scheduler_output.total_num_scheduled_tokens
+            timing_record["pre_wall_start"] = time.time()
+            timing_record["pre_start"] = time.perf_counter()
+            self._timing_events[self._gpu_timing_count]["pre_start"].record()
+
         if not dummy_run:
             # Update the request states.
             self.update_pp_decode_requests()
@@ -1589,6 +1645,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_reqs = len(scheduler_output.num_scheduled_tokens)
         num_toks = scheduler_output.total_num_scheduled_tokens
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
+        if _LOG_GPU_STEP_TIMINGS and not dummy_run:
+            # A step counts as "decode" when every request advances by exactly
+            # one token, i.e. no request is still consuming its prompt.
+            self._step_is_decode = max_query_len == 1
         batch_req_state, uniform_tok_count = self.gather_batch_req_state(
             scheduler_output, dummy_run
         )
@@ -1800,6 +1860,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         self.step_timing.forward_start()
 
+        if _LOG_GPU_STEP_TIMINGS and not dummy_run and self._timing_events is not None:
+            assert self._cpu_timing_records is not None
+            timing_record = self._cpu_timing_records[self._gpu_timing_count]
+            timing_record["pre_wall_end"] = time.time()
+            timing_record["pre_end"] = time.perf_counter()
+            self._timing_events[self._gpu_timing_count]["pre_end"].record()
+            timing_record["fwd_wall_start"] = time.time()
+            timing_record["fwd_start"] = time.perf_counter()
+            self._timing_events[self._gpu_timing_count]["fwd_start"].record()
+
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
@@ -1848,6 +1918,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
 
+        if _LOG_GPU_STEP_TIMINGS and not dummy_run and self._timing_events is not None:
+            assert self._cpu_timing_records is not None
+            timing_record = self._cpu_timing_records[self._gpu_timing_count]
+            self._timing_events[self._gpu_timing_count]["fwd_end"].record()
+            timing_record["fwd_wall_end"] = time.time()
+            timing_record["fwd_end"] = time.perf_counter()
+            timing_record["post_wall_start"] = time.time()
+            timing_record["post_start"] = time.perf_counter()
+            self._timing_events[self._gpu_timing_count]["post_start"].record()
+
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
                 assert isinstance(model_output, tuple)
@@ -1889,6 +1969,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return self.pp_handler.relay_aux_hidden_states(
                 model_inputs["intermediate_tensors"], output_intermediate_tensors
             )
+
+        if _LOG_GPU_STEP_TIMINGS and not dummy_run and self._timing_events is not None:
+            assert self._cpu_timing_records is not None
+            timing_record = self._cpu_timing_records[self._gpu_timing_count]
+            self._timing_events[self._gpu_timing_count]["post_end"].record()
+            timing_record["post_wall_end"] = time.time()
+            timing_record["post_end"] = time.perf_counter()
+
         return None
 
     @torch.inference_mode()
@@ -1937,9 +2025,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.pcp_manager, hidden_states, input_batch
         )
 
+        if _LOG_GPU_STEP_TIMINGS and self._timing_events is not None:
+            assert self._cpu_timing_records is not None
+            timing_record = self._cpu_timing_records[self._gpu_timing_count]
+            timing_record["samp_wall_start"] = time.time()
+            timing_record["samp_start"] = time.perf_counter()
+            self._timing_events[self._gpu_timing_count]["samp_start"].record()
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+        if _LOG_GPU_STEP_TIMINGS and self._timing_events is not None:
+            assert self._cpu_timing_records is not None
+            timing_record = self._cpu_timing_records[self._gpu_timing_count]
+            self._timing_events[self._gpu_timing_count]["samp_end"].record()
+            timing_record["samp_wall_end"] = time.time()
+            timing_record["samp_end"] = time.perf_counter()
+            self._record_phase_timings()
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -2112,10 +2213,88 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
+    def _record_phase_timings(self) -> None:
+        """Log known-complete timing records without synchronizing the device."""
+        assert self._timing_events is not None
+        assert self._cpu_timing_records is not None
+        timing_record = self._cpu_timing_records[self._gpu_timing_count]
+        timing_record["decode"] = self._step_is_decode
+        self._gpu_timing_count += 1
+        self._gpu_timing_step_count += 1
+        if self._gpu_timing_step_count % _GPU_STEP_TIMING_INTERVAL:
+            return
+
+        self._log_completed_phase_timings()
+
+    def _log_completed_phase_timings(self) -> None:
+        """Log records older than the maximum number of in-flight batches."""
+        assert self._timing_events is not None
+        assert self._cpu_timing_records is not None
+        n = self._gpu_timing_count - self._gpu_timing_completion_lag
+        if n <= 0:
+            return
+
+        phase_keys = {
+            "preprocess": ("pre", "pre_start", "pre_end"),
+            "forward": ("fwd", "fwd_start", "fwd_end"),
+            "postprocess": ("post", "post_start", "post_end"),
+            "sample": ("samp", "samp_start", "samp_end"),
+        }
+        first_step = self._gpu_timing_step_count - self._gpu_timing_count + 1
+        lines: list[str] = []
+        records = zip(self._timing_events[:n], self._cpu_timing_records[:n])
+        for offset, (ev, record) in enumerate(records):
+            step = first_step + offset
+            lines.append(
+                "GPU model runner step timing "
+                f"step={step} num_tokens={record['num_tokens']} "
+                f"decode={record['decode']}"
+            )
+            for phase, (wall_key, start_key, end_key) in phase_keys.items():
+                cpu_start = cast(float, record[start_key])
+                cpu_end = cast(float, record[end_key])
+                wall_start = cast(float, record[f"{wall_key}_wall_start"])
+                wall_end = cast(float, record[f"{wall_key}_wall_end"])
+                gpu_duration = ev[start_key].elapsed_time(ev[end_key])
+                lines.append(
+                    f"  {phase} "
+                    f"cpu_start={datetime.fromtimestamp(wall_start):%m-%d %H:%M:%S.%f} "
+                    f"cpu_end={datetime.fromtimestamp(wall_end):%m-%d %H:%M:%S.%f} "
+                    f"cpu_duration_ms={(cpu_end - cpu_start) * 1000.0:.3f} "
+                    f"gpu_duration_ms={gpu_duration:.3f}"
+                )
+
+        logger.info(
+            "GPU model runner step timing details "
+            "(steps %d-%d; durations in ms):\n%s",
+            first_step,
+            first_step + n - 1,
+            "\n".join(lines),
+        )
+
+        pending_events = self._timing_events[n : self._gpu_timing_count]
+        reusable_events = (
+            self._timing_events[self._gpu_timing_count :] + self._timing_events[:n]
+        )
+        self._timing_events = pending_events + reusable_events
+        pending_records = self._cpu_timing_records[n : self._gpu_timing_count]
+        reusable_records = (
+            self._cpu_timing_records[self._gpu_timing_count :]
+            + self._cpu_timing_records[:n]
+        )
+        self._cpu_timing_records = pending_records + reusable_records
+        self._gpu_timing_count -= n
+
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
         torch.accelerator.synchronize()
+        if (
+            _LOG_GPU_STEP_TIMINGS
+            and self._timing_events is not None
+            and self._gpu_timing_count
+        ):
+            self._log_completed_phase_timings()
         self.cudagraph_manager = None
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()
