@@ -32,7 +32,7 @@ MODEL="moonshotai/Kimi-K3"
 # MODEL="Qwen/Qwen3-235B-A22B"
 # MODEL="Qwen/Qwen2.5-1.5B"
 INPUT_LEN=4
-OUTPUT_LEN=3
+OUTPUT_LEN=21
 NUM_PROMPTS=2
 
 # UVA CPU offloading: only expert weights are offloaded (matched by the
@@ -51,13 +51,13 @@ CPU_OFFLOAD_PARAMS=${CPU_OFFLOAD_PARAMS:-experts}
 #                       MLP, MoE, MLA full-attn at idx3, one AttnRes block); N=13
 #                       also crosses the attn_res_block_size=12 boundary.
 DUMMY_WEIGHTS=${DUMMY_WEIGHTS:-1}
-NUM_LAYERS=${NUM_LAYERS:-6}
+NUM_LAYERS=${NUM_LAYERS:-47}
 
 # Tensor-parallel size / GPU count. For memory-allocation debugging, run a
 # single GPU with a few layers so the process is isolated and the per-node
 # NUMA counters in [UVA-ALLOC] reflect exactly one worker:
 #   TP=1 NUM_LAYERS=6 sbatch pure_gpu_trial.sh
-TP=${TP:-1}
+TP=${TP:-8}
 
 EXTRA_SERVE_ARGS=""
 if [[ "$DUMMY_WEIGHTS" == "1" ]]; then
@@ -81,22 +81,6 @@ if [[ "$USE_PROFILER" == "1" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# TP=1 single-GPU-on-a-NUMA-node experiment. Set TP1_NODE=<n> (e.g. TP1_NODE=1)
-# to run a single worker pinned to one physical GPU attached to that NUMA node,
-# with CPU + host memory bound to the same node. This isolates the UVA
-# offloader so the [UVA-ALLOC] consumed[] deltas reflect exactly one worker and
-# you can watch whether host allocations land on the intended node.
-#
-# GPU selection: enumerate Intel GPU PCI devices sorted by BDF (matching the
-# Level Zero order from ZE_ENABLE_PCI_ID_DEVICE_ORDER=1) and pick the first one
-# whose numa_node == TP1_NODE, exposing only it via ZE_AFFINITY_MASK (so it
-# becomes xpu:0). Override the chosen index with TP1_GPU_INDEX (BDF-sorted,
-# global 0..7). numactl binds CPU+memory to TP1_NODE. TP1_NUMA_MODE controls
-# host-memory policy: membind (strict, hard-fail on exhaustion; default),
-# preferred (soft, allows spillover to the other node), or interleave (spread).
-#
-# Example: TP1_NODE=1 NUM_LAYERS=6 sbatch pure_gpu_trial.sh
-TP1_NODE=${TP1_NODE:-}
 ZE_AFFINITY_ENV=""
 NUMACTL_PREFIX=""
 PER_WORKER_ZE_ENV=""
@@ -108,7 +92,7 @@ NUMA_BIND_SERVE_ARGS=""
 #
 #   linear    - consecutive GPUs: rank g -> BDF GPU g. Fills node0 first, then
 #               node1 (e.g. TP=8 -> GPUs 0,1,2,3,4,5,6,7; nodes 0 0 0 0 1 1 1 1).
-#   alternate - round-robin across NUMA nodes: rank0 -> first node0 GPU, rank1
+#   interleave - round-robin across NUMA nodes: rank0 -> first node0 GPU, rank1
 #               -> first node1 GPU, rank2 -> second node0 GPU, ... (e.g. TP=8 ->
 #               GPUs 0,4,1,5,2,6,3,7; nodes 0 1 0 1 0 1 0 1).
 #
@@ -117,12 +101,10 @@ NUMA_BIND_SERVE_ARGS=""
 # host memory bind to its GPU's node. PER_WORKER_ZE_AFFINITY=1 (default) also
 # gives each worker a single-GPU ZE_AFFINITY_MASK so its pinned/USM-host buffers
 # land on its own node instead of node0. Unset GPU_SCHEME to disable.
-# Takes precedence over TP1_NODE.
 #
-# Example: GPU_SCHEME=alternate TP=8 NUM_LAYERS=6 sbatch pure_gpu_trial.sh
-GPU_SCHEME=${GPU_SCHEME:-}
+# Example: GPU_SCHEME=interleave TP=8 NUM_LAYERS=6 sbatch pure_gpu_trial.sh
+GPU_SCHEME=${GPU_SCHEME:-linear}
 if [[ -n "$GPU_SCHEME" ]]; then
-    TP1_NODE=""
     # BDF-sorted Intel GPU list: "<bdf> <numa_node>" per line.
     mapfile -t _gpu_bdf_node < <(
         for d in /sys/bus/pci/devices/*; do
@@ -143,7 +125,7 @@ if [[ -n "$GPU_SCHEME" ]]; then
         linear)
             for ((g = 0; g < TP; g++)); do order+=("$g"); done
             ;;
-        alternate)
+        interleave)
             # Bucket GPU indices by NUMA node (ascending node id), preserving
             # BDF order within each node, then round-robin across the buckets.
             declare -A _bucket=()
@@ -172,7 +154,7 @@ if [[ -n "$GPU_SCHEME" ]]; then
             done
             ;;
         *)
-            echo "GPU_SCHEME: unknown scheme '$GPU_SCHEME' (use linear|alternate)" >&2
+            echo "GPU_SCHEME: unknown scheme '$GPU_SCHEME' (use linear|interleave)" >&2
             exit 1
             ;;
     esac
@@ -202,45 +184,6 @@ if [[ -n "$GPU_SCHEME" ]]; then
     if [[ "$PER_WORKER_ZE_AFFINITY" == "1" ]]; then
         PER_WORKER_ZE_ENV="VLLM_XPU_PER_WORKER_ZE_AFFINITY=1"
     fi
-fi
-if [[ -n "$TP1_NODE" ]]; then
-    TP=1
-    TP1_NUMA_MODE=${TP1_NUMA_MODE:-membind}
-    # BDF-sorted Intel GPU list: "<bdf> <numa_node>" per line.
-    mapfile -t _gpu_bdf_node < <(
-        for d in /sys/bus/pci/devices/*; do
-            cls=$(cat "$d/class" 2>/dev/null)
-            ven=$(cat "$d/vendor" 2>/dev/null)
-            [[ "$ven" == "0x8086" && "$cls" == 0x0300* ]] || continue
-            echo "$(basename "$d") $(cat "$d/numa_node" 2>/dev/null)"
-        done | sort
-    )
-    sel_index="${TP1_GPU_INDEX:-}"
-    if [[ -z "$sel_index" ]]; then
-        idx=0
-        for entry in "${_gpu_bdf_node[@]}"; do
-            if [[ "${entry##* }" == "$TP1_NODE" ]]; then
-                sel_index=$idx
-                break
-            fi
-            idx=$((idx + 1))
-        done
-    fi
-    if [[ -z "$sel_index" ]]; then
-        echo "TP1_NODE=$TP1_NODE: no Intel GPU found on that NUMA node" >&2
-        exit 1
-    fi
-    sel_bdf="${_gpu_bdf_node[sel_index]%% *}"
-    echo "TP1_NODE=${TP1_NODE} -> GPU index ${sel_index} (bdf ${sel_bdf}), numactl mode=${TP1_NUMA_MODE}"
-    ZE_AFFINITY_ENV="ZE_AFFINITY_MASK=${sel_index}"
-    case "$TP1_NUMA_MODE" in
-        preferred)  NUMACTL_PREFIX="numactl --cpunodebind=${TP1_NODE} --preferred=${TP1_NODE}" ;;
-        interleave) NUMACTL_PREFIX="numactl --cpunodebind=${TP1_NODE} --interleave=all" ;;
-        *)          NUMACTL_PREFIX="numactl --cpunodebind=${TP1_NODE} --membind=${TP1_NODE}" ;;
-    esac
-    # TP=1 runs the worker in-process, so vLLM's --numa-bind won't wrap it;
-    # numactl on the whole serve process is what binds it. Disable --numa-bind.
-    NUMA_BIND_SERVE_ARGS=""
 fi
 
 GPU_ENV="vllm_0.28.1rc0+kimi_xpu"
@@ -434,7 +377,7 @@ main() {
         # NEOReadDebugKeys=1 EnableImplicitConvertionToCounterBasedEvents=0 \\
         ZE_ENABLE_PCI_ID_DEVICE_ORDER=1 \\
         VLLM_LOG_STEP_TIMINGS=0 \\
-        VLLM_XPU_ENABLE_XPU_GRAPH=0 \\
+        VLLM_XPU_ENABLE_XPU_GRAPH=1 \\
         TRITON_DEFAULT_BACKEND=intel \\
         ${ZE_AFFINITY_ENV} \\
         ${PER_WORKER_ZE_ENV} \\
