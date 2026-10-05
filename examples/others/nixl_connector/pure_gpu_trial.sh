@@ -375,8 +375,9 @@ main() {
         sycl-ls --verbose
 
         # NEOReadDebugKeys=1 EnableImplicitConvertionToCounterBasedEvents=0 \\
+        VLLM_XPU_MOE_GATHER_OFFLOAD=1 \\
         ZE_ENABLE_PCI_ID_DEVICE_ORDER=1 \\
-        VLLM_LOG_STEP_TIMINGS=1 \\
+        VLLM_LOG_STEP_TIMINGS=0 \\
         VLLM_XPU_ENABLE_XPU_GRAPH=1 \\
         TRITON_DEFAULT_BACKEND=intel \\
         ${ZE_AFFINITY_ENV} \\
@@ -384,7 +385,7 @@ main() {
         ${UNITRACE_PREFIX} \\
         ${NUMACTL_PREFIX} \\
         \$(which vllm) serve ${MODEL} --trust-remote-code \\
-        --port 9000 --max-model-len 200 --max-num-seqs 10 -tp ${TP} --max-num-batched-tokens 200 \\
+        --port 9000 --max-model-len 2000 --max-num-seqs 10 -tp ${TP} --max-num-batched-tokens 2000 \\
         --no-enable-prefix-caching --block-size 64 --num-gpu-blocks-override 10 \\
         --gpu-memory-utilization 0.80 \\
         --cpu-offload-gb ${CPU_OFFLOAD_GB} --cpu-offload-params ${CPU_OFFLOAD_PARAMS} \\
