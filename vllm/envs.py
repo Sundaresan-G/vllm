@@ -328,6 +328,7 @@ if TYPE_CHECKING:
     VLLM_XPU_ENABLE_XPU_GRAPH: bool = False
     VLLM_XPU_FORCE_N_CONTIG_WEIGHT: bool = False
     VLLM_XPU_USE_SAMPLER_KERNEL: bool = True
+    VLLM_XPU_MOE_GATHER_OFFLOAD: bool = False
     VLLM_XPU_INC_WNA16_BACKEND: Literal["auto", "ark", "w4a16", "w4a8"] = "auto"
     VLLM_LORA_ENABLE_DUAL_STREAM: bool = False
     VLLM_GPU_NIC_PCIE_MAPPING: str = ""
@@ -2202,6 +2203,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # whether use xpu specific sample kernel
     "VLLM_XPU_USE_SAMPLER_KERNEL": lambda: bool(
         int(os.getenv("VLLM_XPU_USE_SAMPLER_KERNEL", "1"))
+    ),
+    # For CPU-offloaded (UVA) MoE weights on XPU, gather only the active
+    # experts from host memory into a contiguous device buffer before the
+    # grouped GEMM, instead of letting the GEMM stream weights straight from
+    # the UVA view. Trades a dedicated high-bandwidth PCIe copy for the
+    # kernel's slower on-demand weight streaming. Opt-in; only helps when MoE
+    # weights are offloaded.
+    "VLLM_XPU_MOE_GATHER_OFFLOAD": lambda: bool(
+        int(os.getenv("VLLM_XPU_MOE_GATHER_OFFLOAD", "0"))
     ),
     # Kernel backend for INC weight-only intN (WNA16) linear layers on XPU.
     # "auto" keeps the default preference order (ARK when importable, else the
