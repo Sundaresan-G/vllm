@@ -809,7 +809,9 @@ class AsyncLLM(EngineClient):
                     f"cpu_end={_fmt_ts(end_time)} "
                     f"cpu_duration_ms={(end_time - start_time) * 1000.0:.3f}"
                 )
-                for name, (ws, we, dur) in timings_ms.items():
+                for name, (ws, we, dur) in sorted(
+                    timings_ms.items(), key=lambda item: item[1][0]
+                ):
                     lines.append(
                         f"  {name.removesuffix('_ms')} "
                         f"cpu_start={_fmt_ts(ws)} "

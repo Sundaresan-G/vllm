@@ -2335,6 +2335,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 f"step={step} num_tokens={record['num_tokens']} "
                 f"decode={record['decode']}"
             )
+            # Emit phases in actual execution order (by wall-clock start)
+            # rather than the fixed logical order of phase_keys, so phases
+            # like pp_broadcast that overlap later ones read chronologically.
+            phase_lines: list[tuple[float, str]] = []
             for phase, (wall_key, start_key, end_key) in phase_keys.items():
                 if start_key not in record:
                     # Phase absent for this step (e.g. non-last PP ranks have
@@ -2352,13 +2356,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 end_str = datetime.fromtimestamp(
                     wall_end, timezone.utc
                 ).strftime(fmt)
-                lines.append(
-                    f"  {phase} "
-                    f"cpu_start={start_str} "
-                    f"cpu_end={end_str} "
-                    f"cpu_duration_ms={(cpu_end - cpu_start) * 1000.0:.3f} "
-                    f"gpu_duration_ms={gpu_duration:.3f}"
+                phase_lines.append(
+                    (
+                        wall_start,
+                        f"  {phase} "
+                        f"cpu_start={start_str} "
+                        f"cpu_end={end_str} "
+                        f"cpu_duration_ms={(cpu_end - cpu_start) * 1000.0:.3f} "
+                        f"gpu_duration_ms={gpu_duration:.3f}",
+                    )
                 )
+            phase_lines.sort(key=lambda item: item[0])
+            lines.extend(line for _, line in phase_lines)
 
         logger.info(
             "GPU model runner step timing details "

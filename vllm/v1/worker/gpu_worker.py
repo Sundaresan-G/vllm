@@ -1356,6 +1356,10 @@ class Worker(WorkerBase):
                 "Worker execute_model step timing "
                 f"step={record['step']} num_tokens={record['num_tokens']}"
             )
+            # Emit phases in actual execution order (by wall-clock start)
+            # rather than the fixed logical order of `phases`, so overlapping
+            # sub-phases read chronologically.
+            phase_lines: list[tuple[float, str]] = []
             for phase in phases:
                 if phase not in record:
                     continue
@@ -1376,7 +1380,9 @@ class Worker(WorkerBase):
                 if len(vals) > 3:
                     start_ev, end_ev = vals[3]
                     field += f" gpu_duration_ms={start_ev.elapsed_time(end_ev):.3f}"
-                lines.append(field)
+                phase_lines.append((wall_start, field))
+            phase_lines.sort(key=lambda item: item[0])
+            lines.extend(line for _, line in phase_lines)
         logger.info(
             "Worker execute_model step timing rank=%d "
             "(steps %d-%d; UTC timestamps, durations in ms):\n%s",
