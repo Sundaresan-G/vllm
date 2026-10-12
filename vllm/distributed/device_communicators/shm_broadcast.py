@@ -951,15 +951,19 @@ class MessageQueue:
             The MessageQueue instance for the calling process,
             and a list of handles (only non-empty for the reader process).
         """
-        from vllm.platforms.interface import get_assigned_physical_gpu_ids
+        from vllm.distributed.parallel_state import in_the_same_node_as
 
-        assigned_physical_gpu_ids = get_assigned_physical_gpu_ids()
-        if assigned_physical_gpu_ids is not None:
-            local_size = len(assigned_physical_gpu_ids)
-        else:
-            local_size = current_platform.device_count()
-        rank = dist.get_rank()
-        same_node = rank // local_size == reader_rank // local_size
+        # Determine node co-location via shared-memory probing instead of a
+        # device_count()-based heuristic. The latter breaks when a worker's
+        # visible device count differs from the node-local world size (e.g.
+        # XPU with VLLM_XPU_PER_WORKER_ZE_AFFINITY=1 exposes a single device
+        # per worker), which would wrongly mark same-node writers as remote and
+        # leave their response queues unset. This mirrors the writer-side
+        # create_from_process_group, which also uses in_the_same_node_as.
+        global_ranks = dist.get_process_group_ranks(pg)
+        reader_group_rank = global_ranks.index(reader_rank)
+        status = in_the_same_node_as(pg, source_rank=reader_group_rank)
+        same_node = status[dist.get_rank(pg)]
         buffer_io = MessageQueue(
             n_reader=1,
             n_local_reader=1 if same_node else 0,
@@ -967,6 +971,7 @@ class MessageQueue:
             max_chunks=max_chunks,
         )
         handle = buffer_io.export_handle()
+        rank = dist.get_rank()
         handles = [None] * dist.get_world_size(pg) if rank == reader_rank else None
         dist.gather_object(handle, handles, dst=reader_rank, group=pg)
         if blocking:
