@@ -10,7 +10,7 @@ from collections import defaultdict, deque
 from collections.abc import Callable, Generator, Sequence
 from concurrent.futures import Future
 from contextlib import ExitStack, contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import IntEnum
 from functools import partial
 from inspect import isclass, signature
@@ -103,6 +103,12 @@ HANDSHAKE_TIMEOUT_MINS = 5
 # Per-step timing instrumentation.
 _LOG_STEP_TIMINGS = envs.VLLM_LOG_ENGINE_CORE_STEP_TIMINGS
 _STEP_TIMING_LOG_INTERVAL = envs.VLLM_ENGINE_CORE_STEP_TIMING_INTERVAL
+
+
+def _fmt_ts(ts: float) -> str:
+    """Format an epoch timestamp as a UTC wall-clock string."""
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%m-%d %H:%M:%S.%f")
+
 
 _R = TypeVar("_R")  # Return type for collective_rpc
 
@@ -784,64 +790,72 @@ class EngineCore:
                 post_collect_dispatch = dispatch_record.get(
                     "post_collect_dispatch"
                 )
-                phases = " ".join(
-                    f"{display_names[name]}={value:.3f}"
-                    for name, value in timings_ms.items()
-                    if name in dispatch_phases
-                    and not (post_collect_dispatch and name == "sample_dispatch_ms")
-                )
                 start_time = cast(float, dispatch_record["start_time"])
                 end_time = cast(float, dispatch_record["end_time"])
-                total = sum(
-                    value
-                    for name, value in timings_ms.items()
-                    if name in dispatch_phases
-                    and not (post_collect_dispatch and name == "sample_dispatch_ms")
-                )
+                phase_lines: list[str] = []
+                cursor = start_time
+                for name, value in timings_ms.items():
+                    if name not in dispatch_phases:
+                        continue
+                    if post_collect_dispatch and name == "sample_dispatch_ms":
+                        continue
+                    ph_start, ph_end = cursor, cursor + value / 1000.0
+                    cursor = ph_end
+                    phase_lines.append(
+                        f"    {display_names[name]} "
+                        f"cpu_start={_fmt_ts(ph_start)} "
+                        f"cpu_end={_fmt_ts(ph_end)} "
+                        f"cpu_duration_ms={value:.3f}"
+                    )
                 lines.append(
                     "  dispatch "
                     f"batch={dispatch_record['batch_id']} "
                     f"num_tokens={dispatch_record['num_tokens']} "
-                    f"start={datetime.fromtimestamp(start_time):%m-%d %H:%M:%S.%f} "
-                    f"end={datetime.fromtimestamp(end_time):%m-%d %H:%M:%S.%f}: "
-                    f"{phases} total={total:.3f}"
+                    f"cpu_start={_fmt_ts(start_time)} "
+                    f"cpu_end={_fmt_ts(end_time)} "
+                    f"cpu_duration_ms={(end_time - start_time) * 1000.0:.3f}"
                 )
+                lines.extend(phase_lines)
             if collect_record := record["collect"]:
                 timings_ms = cast(dict[str, float], collect_record["timings_ms"])
-                phases = " ".join(
-                    f"{display_names[name]}={value:.3f}"
-                    for name, value in timings_ms.items()
-                    if name in collect_phases
-                )
                 start_time = cast(float, collect_record["start_time"])
                 end_time = cast(float, collect_record["end_time"])
                 dispatch_start = cast(
                     float, collect_record["dispatch_start_time"]
                 )
                 dispatch_end = cast(float, collect_record["dispatch_end_time"])
-                total = sum(
-                    value
-                    for name, value in timings_ms.items()
-                    if name in collect_phases
-                )
+                phase_lines = []
+                cursor = start_time
+                for name, value in timings_ms.items():
+                    if name not in collect_phases:
+                        continue
+                    ph_start, ph_end = cursor, cursor + value / 1000.0
+                    cursor = ph_end
+                    phase_lines.append(
+                        f"    {display_names[name]} "
+                        f"cpu_start={_fmt_ts(ph_start)} "
+                        f"cpu_end={_fmt_ts(ph_end)} "
+                        f"cpu_duration_ms={value:.3f}"
+                    )
                 queued_ms = max(0.0, start_time - dispatch_end) * 1000.0
                 end_to_end_ms = (end_time - dispatch_start) * 1000.0
                 lines.append(
                     "  collect[future.result()] "
                     f"batch={collect_record['batch_id']} "
-                    f"start={datetime.fromtimestamp(start_time):%m-%d %H:%M:%S.%f} "
-                    f"end={datetime.fromtimestamp(end_time):%m-%d %H:%M:%S.%f}: "
-                    f"{phases} total={total:.3f} "
+                    f"cpu_start={_fmt_ts(start_time)} "
+                    f"cpu_end={_fmt_ts(end_time)} "
+                    f"cpu_duration_ms={(end_time - start_time) * 1000.0:.3f} "
                     f"queued_before_collect={queued_ms:.3f} "
                     f"batch_end_to_end={end_to_end_ms:.3f}"
                 )
+                lines.extend(phase_lines)
             if dispatch_record and (
                 post_collect_dispatch := dispatch_record.get(
                     "post_collect_dispatch"
                 )
             ):
                 timings_ms = cast(
-                    "  collect[blocking_future_result] "
+                    dict[str, float], dispatch_record["timings_ms"]
                 )
                 sample_dispatch_ms = timings_ms["sample_dispatch_ms"]
                 start_time = cast(float, post_collect_dispatch["start_time"])
@@ -849,13 +863,20 @@ class EngineCore:
                 lines.append(
                     "  dispatch_after_collect "
                     f"batch={dispatch_record['batch_id']} "
-                    f"start={datetime.fromtimestamp(start_time):%m-%d %H:%M:%S.%f} "
-                    f"end={datetime.fromtimestamp(end_time):%m-%d %H:%M:%S.%f}: "
-                    "reason=structured_output_grammar_dependency "
-                    f"sample_tokens_rpc_enqueue={sample_dispatch_ms:.3f}"
+                    f"cpu_start={_fmt_ts(start_time)} "
+                    f"cpu_end={_fmt_ts(end_time)} "
+                    f"cpu_duration_ms={sample_dispatch_ms:.3f} "
+                    "reason=structured_output_grammar_dependency"
+                )
+                lines.append(
+                    "    sample_tokens_rpc_enqueue "
+                    f"cpu_start={_fmt_ts(start_time)} "
+                    f"cpu_end={_fmt_ts(end_time)} "
+                    f"cpu_duration_ms={sample_dispatch_ms:.3f}"
                 )
         logger.info(
-            "engine invocation timing details (calls %d-%d, ms):\n%s",
+            "engine invocation timing details "
+            "(calls %d-%d, UTC timestamps, ms):\n%s",
             self._step_timing_records[0]["invocation_id"],
             self._step_timing_records[-1]["invocation_id"],
             "\n".join(lines),
