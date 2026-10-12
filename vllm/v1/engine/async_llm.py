@@ -7,7 +7,7 @@ import time
 import warnings
 from collections.abc import AsyncGenerator, Iterable, Mapping
 from copy import copy
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import vllm.envs as envs
@@ -66,6 +66,11 @@ _LOG_API_SERVER_STEP_TIMINGS = envs.VLLM_LOG_API_SERVER_STEP_TIMINGS
 _API_SERVER_STEP_TIMING_LOG_INTERVAL = (
     envs.VLLM_API_SERVER_STEP_TIMING_INTERVAL
 )
+
+
+def _fmt_ts(ts: float) -> str:
+    """Format an epoch timestamp as a UTC wall-clock string."""
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%m-%d %H:%M:%S.%f")
 
 
 class InputStreamError(Exception):
@@ -773,8 +778,10 @@ class AsyncLLM(EngineClient):
         # P0 multi-modal sender ("shadow") cache; None for text-only models.
         mm_processor_cache = renderer.mm_processor_cache
         chunk_size = envs.VLLM_V1_OUTPUT_PROC_CHUNK_SIZE
+        # Per-phase value: (cpu_start_wall, cpu_end_wall, cpu_duration_ms).
+        _PhaseT = tuple[float, float, float]
         step_timing_records: list[
-            tuple[int, int, int, int, float, float, dict[str, float]]
+            tuple[int, int, int, int, float, float, dict[str, _PhaseT]]
         ] = []
         step_timing_count = 0
 
@@ -793,21 +800,25 @@ class AsyncLLM(EngineClient):
                     end_time,
                     timings_ms,
                 ) = record
-                phases = " ".join(
-                    f"{name.removesuffix('_ms')}=%.3f" % value
-                    for name, value in timings_ms.items()
-                )
                 lines.append(
                     "API server step timing "
                     f"step={step_index} engine={engine_index} "
                     f"num_request_outputs={num_request_outputs} "
                     f"num_output_token_ids={num_output_token_ids} "
-                    f"start={datetime.fromtimestamp(start_time):%m-%d %H:%M:%S.%f} "
-                    f"end={datetime.fromtimestamp(end_time):%m-%d %H:%M:%S.%f}: "
-                    f"{phases} total={sum(timings_ms.values()):.3f}"
+                    f"cpu_start={_fmt_ts(start_time)} "
+                    f"cpu_end={_fmt_ts(end_time)} "
+                    f"cpu_duration_ms={(end_time - start_time) * 1000.0:.3f}"
                 )
+                for name, (ws, we, dur) in timings_ms.items():
+                    lines.append(
+                        f"  {name.removesuffix('_ms')} "
+                        f"cpu_start={_fmt_ts(ws)} "
+                        f"cpu_end={_fmt_ts(we)} "
+                        f"cpu_duration_ms={dur:.3f}"
+                    )
             logger.info(
-                "API server step timing details (steps %d-%d, ms):\n%s",
+                "API server step timing details "
+                "(steps %d-%d, UTC timestamps, ms):\n%s",
                 step_timing_records[0][0],
                 step_timing_records[-1][0],
                 "\n".join(lines),
@@ -892,6 +903,10 @@ class AsyncLLM(EngineClient):
                     if _LOG_API_SERVER_STEP_TIMINGS:
                         stats_logging_end = time.perf_counter()
                         step_timing_count += 1
+                        # Map perf_counter boundaries onto the wall clock using
+                        # a single anchor (step_start_time taken right before
+                        # receive_start), preserving inter-phase gaps.
+                        aw, apc = step_start_time, receive_start
                         step_timing_records.append(
                             (
                                 step_timing_count,
@@ -902,17 +917,21 @@ class AsyncLLM(EngineClient):
                                 time.time(),
                                 {
                                     "receive_wait_ms": (
-                                        receive_end - receive_start
-                                    )
-                                    * 1000.0,
+                                        aw + (receive_start - apc),
+                                        aw + (receive_end - apc),
+                                        (receive_end - receive_start) * 1000.0,
+                                    ),
                                     "process_outputs_ms": (
-                                        process_end - process_start
-                                    )
-                                    * 1000.0,
+                                        aw + (process_start - apc),
+                                        aw + (process_end - apc),
+                                        (process_end - process_start) * 1000.0,
+                                    ),
                                     "stats_logging_ms": (
-                                        stats_logging_end - stats_logging_start
-                                    )
-                                    * 1000.0,
+                                        aw + (stats_logging_start - apc),
+                                        aw + (stats_logging_end - apc),
+                                        (stats_logging_end - stats_logging_start)
+                                        * 1000.0,
+                                    ),
                                 },
                             )
                         )
