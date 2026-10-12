@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from copy import copy, deepcopy
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import reduce
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
 
@@ -1034,6 +1034,10 @@ class GPUModelRunner(
                         "post_end",
                         "samp_start",
                         "samp_end",
+                        "upd_start",
+                        "upd_end",
+                        "ppbc_start",
+                        "ppbc_end",
                     )
                 }
                 for _ in range(
@@ -1052,6 +1056,13 @@ class GPUModelRunner(
                 self.max_num_reqs, dtype=torch.int32
             )
         self.layerwise_nvtx_hooks_registered = False
+
+        # Per-step sink for the PP receive-side sub-phase timings surfaced in
+        # the worker-level step-timing log. Set to a fresh dict by the worker
+        # when VLLM_LOG_WORKER_STEP_TIMINGS is on, then merged back after
+        # execute_model; stays None otherwise. Each entry is the worker's
+        # (wall_start, wall_end, cpu_duration_ms) tuple format.
+        self.pp_recv_timing: dict[str, tuple[float, float, float]] | None = None
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -3514,21 +3525,48 @@ class GPUModelRunner(
 
         tp = self.vllm_config.parallel_config.tensor_parallel_size
         is_rs = is_residual_scattered_for_sp(self.vllm_config, num_tokens)
+        timing = self.pp_recv_timing
 
         # When sequence parallelism is enabled, the "residual" tensor is
         # sharded across TP ranks. All-gather it here because downstream
         # QKV + Attention needs the full residual before the SP split point.
         if sync_self:
             assert intermediate_tensors is not None
-            for k, v in intermediate_tensors.items():
+
+            # The first access to the tensors (via .items()) forces the lazy
+            # PP receive to complete: the cross-stage irecv wait plus the
+            # deferred TP all-gather postprocess. Materialize it here so the
+            # recv cost is timed on its own rather than folded into the first
+            # copy_ below.
+            if timing is not None:
+                _w0, _p0 = time.time(), time.perf_counter()
+                items = list(intermediate_tensors.items())
+                timing["pp_sync_recv"] = (
+                    _w0,
+                    time.time(),
+                    (time.perf_counter() - _p0) * 1000.0,
+                )
+                _ag_w0, _ag_ms = time.time(), 0.0
+            else:
+                items = intermediate_tensors.items()
+
+            for k, v in items:
                 is_scattered = k == "residual" and is_rs
                 if is_scattered:
                     local_len = num_tokens // tp
-                    v = get_tp_group().all_gather(v[:local_len], dim=0)
+                    if timing is not None:
+                        _a0 = time.perf_counter()
+                        v = get_tp_group().all_gather(v[:local_len], dim=0)
+                        _ag_ms += (time.perf_counter() - _a0) * 1000.0
+                    else:
+                        v = get_tp_group().all_gather(v[:local_len], dim=0)
 
                 self.intermediate_tensors[k][:num_tokens].copy_(
                     v[:num_tokens], non_blocking=True
                 )
+
+            if timing is not None:
+                timing["sp_residual_all_gather"] = (_ag_w0, time.time(), _ag_ms)
 
         return IntermediateTensors(
             {k: v[:num_tokens] for k, v in self.intermediate_tensors.items()}
@@ -4659,6 +4697,19 @@ class GPUModelRunner(
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)
                     self.kv_connector_output = kv_connector_output
+                    if _LOG_GPU_STEP_TIMINGS and self._timing_events is not None:
+                        assert self._cpu_timing_records is not None
+                        timing_record = self._cpu_timing_records[
+                            self._gpu_timing_count
+                        ]
+                        self._timing_events[self._gpu_timing_count][
+                            "post_end"
+                        ].record()
+                        timing_record["post_wall_end"] = time.time()
+                        timing_record["post_end"] = time.perf_counter()
+                        # Non-last PP ranks have no sample phase; record the
+                        # pre/fwd/post timings here since execution ends early.
+                        self._record_phase_timings()
                     return hidden_states
 
                 if self.is_pooling_model:
@@ -4730,6 +4781,26 @@ class GPUModelRunner(
 
         return None
 
+    def _phase_timing_begin(self, key: str) -> None:
+        """Record CPU+GPU start markers for a step sub-phase in the current slot."""
+        if not (_LOG_GPU_STEP_TIMINGS and self._timing_events is not None):
+            return
+        assert self._cpu_timing_records is not None
+        record = self._cpu_timing_records[self._gpu_timing_count]
+        record[f"{key}_wall_start"] = time.time()
+        record[f"{key}_start"] = time.perf_counter()
+        self._timing_events[self._gpu_timing_count][f"{key}_start"].record()
+
+    def _phase_timing_end(self, key: str) -> None:
+        """Record CPU+GPU end markers for a step sub-phase in the current slot."""
+        if not (_LOG_GPU_STEP_TIMINGS and self._timing_events is not None):
+            return
+        assert self._cpu_timing_records is not None
+        record = self._cpu_timing_records[self._gpu_timing_count]
+        self._timing_events[self._gpu_timing_count][f"{key}_end"].record()
+        record[f"{key}_wall_end"] = time.time()
+        record[f"{key}_end"] = time.perf_counter()
+
     def _record_phase_timings(self) -> None:
         """Log known-complete timing records without synchronizing the device."""
         assert self._timing_events is not None
@@ -4756,6 +4827,8 @@ class GPUModelRunner(
             "forward": ("fwd", "fwd_start", "fwd_end"),
             "postprocess": ("post", "post_start", "post_end"),
             "sample": ("samp", "samp_start", "samp_end"),
+            "update_states": ("upd", "upd_start", "upd_end"),
+            "pp_broadcast": ("ppbc", "ppbc_start", "ppbc_end"),
         }
         first_step = self._gpu_timing_step_count - self._gpu_timing_count + 1
         lines: list[str] = []
@@ -4768,22 +4841,33 @@ class GPUModelRunner(
                 f"decode={record['decode']}"
             )
             for phase, (wall_key, start_key, end_key) in phase_keys.items():
+                if start_key not in record:
+                    # Phase absent for this step (e.g. non-last PP ranks have
+                    # no sample phase).
+                    continue
                 cpu_start = cast(float, record[start_key])
                 cpu_end = cast(float, record[end_key])
                 wall_start = cast(float, record[f"{wall_key}_wall_start"])
                 wall_end = cast(float, record[f"{wall_key}_wall_end"])
                 gpu_duration = ev[start_key].elapsed_time(ev[end_key])
+                fmt = "%m-%d %H:%M:%S.%f"
+                start_str = datetime.fromtimestamp(
+                    wall_start, timezone.utc
+                ).strftime(fmt)
+                end_str = datetime.fromtimestamp(
+                    wall_end, timezone.utc
+                ).strftime(fmt)
                 lines.append(
                     f"  {phase} "
-                    f"cpu_start={datetime.fromtimestamp(wall_start):%m-%d %H:%M:%S.%f} "
-                    f"cpu_end={datetime.fromtimestamp(wall_end):%m-%d %H:%M:%S.%f} "
+                    f"cpu_start={start_str} "
+                    f"cpu_end={end_str} "
                     f"cpu_duration_ms={(cpu_end - cpu_start) * 1000.0:.3f} "
                     f"gpu_duration_ms={gpu_duration:.3f}"
                 )
 
         logger.info(
             "GPU model runner step timing details "
-            "(steps %d-%d; durations in ms):\n%s",
+            "(steps %d-%d; UTC timestamps, durations in ms):\n%s",
             first_step,
             first_step + n - 1,
             "\n".join(lines),
@@ -4867,20 +4951,27 @@ class GPUModelRunner(
                 self._timing_events[self._gpu_timing_count]["samp_end"].record()
                 timing_record["samp_wall_end"] = time.time()
                 timing_record["samp_end"] = time.perf_counter()
-                self._record_phase_timings()
 
+        self._phase_timing_begin("upd")
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
         )
+        self._phase_timing_end("upd")
         if self.use_async_scheduling:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
             # PP outputs have been broadcasted to all ranks at logits computation.
             # Therefore, here is no need to send sampled token ids again in this case.
             if not self.broadcast_pp_output and pp.world_size > 1 and pp.is_last_rank:
+                self._phase_timing_begin("ppbc")
                 self._pp_broadcast_prev_sampled_token_ids(
                     sampler_output.sampled_token_ids
                 )
+                self._phase_timing_end("ppbc")
+        # Advance the timing slot only after the post-sample sub-phases
+        # (update_states, pp_broadcast) have been recorded into it.
+        if _LOG_GPU_STEP_TIMINGS and self._timing_events is not None:
+            self._record_phase_timings()
 
         self._draft_token_ids = None
         self._draft_probs = None

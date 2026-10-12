@@ -22,7 +22,7 @@ import gc
 import time
 from contextlib import AbstractContextManager
 from copy import deepcopy
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, NamedTuple, cast
 
 import numpy as np
@@ -229,6 +229,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.is_first_pp_rank = get_pp_group().is_first_rank
         self.is_last_pp_rank = get_pp_group().is_last_rank
 
+        # Per-step sink for the PP receive-side sub-phase timings surfaced in
+        # the worker-level step-timing log. Set to a fresh dict by the worker
+        # when VLLM_LOG_WORKER_STEP_TIMINGS is on, then merged back after
+        # execute_model; stays None otherwise. Each entry is the worker's
+        # (wall_start, wall_end, cpu_duration_ms) tuple format.
+        self.pp_recv_timing: dict[str, tuple[float, float, float]] | None = None
+
         # Size the UVA buffer pools to the max number of concurrent in-flight
         # steps. Must run before any pooled buffer is constructed
         set_default_max_concurrency(vllm_config.max_concurrent_batches)
@@ -336,6 +343,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         "post_end",
                         "samp_start",
                         "samp_end",
+                        "upd_start",
+                        "upd_end",
+                        "ppbc_start",
+                        "ppbc_end",
+                        "pprecv_start",
+                        "pprecv_end",
+                        "kvpf_start",
+                        "kvpf_end",
                     )
                 }
                 for _ in range(
@@ -1839,11 +1854,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Prepare the intermediate tensors.
             assert intermediate_tensors is not None
             assert self.intermediate_tensors is not None
+            # The first access to .tensors forces the lazy PP receive to
+            # complete: the cross-stage irecv wait plus the deferred TP
+            # all-gather postprocess. Force and time it here so the recv cost
+            # is isolated instead of folded into the copy_ below.
+            timing = self.pp_recv_timing
+            if timing is not None:
+                _w0, _p0 = time.time(), time.perf_counter()
+                recv_tensors = intermediate_tensors.tensors
+                timing["pp_sync_recv"] = (
+                    _w0,
+                    time.time(),
+                    (time.perf_counter() - _p0) * 1000.0,
+                )
+            else:
+                recv_tensors = intermediate_tensors.tensors
             n = input_batch.num_tokens_after_padding
             new_tensors = {
                 k: v[:n]
                 if dummy_run
-                else v[:n].copy_(intermediate_tensors.tensors[k][:n])
+                else v[:n].copy_(recv_tensors[k][:n])
                 for k, v in self.intermediate_tensors.tensors.items()
             }
             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
@@ -1966,6 +1996,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Non-last PP rank: return IntermediateTensors for sending.
             assert output_intermediate_tensors is not None
             assert self.pp_handler is not None
+            if (
+                _LOG_GPU_STEP_TIMINGS
+                and not dummy_run
+                and self._timing_events is not None
+            ):
+                assert self._cpu_timing_records is not None
+                timing_record = self._cpu_timing_records[self._gpu_timing_count]
+                self._timing_events[self._gpu_timing_count]["post_end"].record()
+                timing_record["post_wall_end"] = time.time()
+                timing_record["post_end"] = time.perf_counter()
+                # Non-last PP ranks have no sample phase; the pp_recv phase
+                # and slot advance are recorded later in sample_tokens.
             return self.pp_handler.relay_aux_hidden_states(
                 model_inputs["intermediate_tensors"], output_intermediate_tensors
             )
@@ -2005,6 +2047,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # IntermediateTensors instead of final hidden states. Receive the
             # sampled tokens broadcast from the last rank and update local state.
             assert self.pp_handler is not None
+            # pp_recv is the non-last-rank counterpart of the last rank's
+            # pp_broadcast/update_states phases.
+            self._phase_timing_begin("pprecv")
             all_decode_next = self.pp_handler.receive(input_batch)
             # Optimistically update num_computed_tokens for entire batch here.
             # Will be adjusted for rejections if necessary in update_requests.
@@ -2013,9 +2058,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # Might contain non-final prefill chunks, which will be scheduled
                 # in the immediate next step (rather than in pp_size steps).
                 self.model_state.postprocess_state(input_batch.idx_mapping, 0)
+            self._phase_timing_end("pprecv")
 
             # Post-step KV connector related operations.
+            self._phase_timing_begin("kvpf")
             kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+            self._phase_timing_end("kvpf")
+            # Advance the timing slot now that this step's phases are recorded.
+            if _LOG_GPU_STEP_TIMINGS and self._timing_events is not None:
+                self._record_phase_timings()
             # The first PP rank holds the encoder cache, so pass its EC output on.
             output = ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
             return ModelRunnerOutput.with_ec_conn_output(output, ec_connector_output)
@@ -2040,16 +2091,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self._timing_events[self._gpu_timing_count]["samp_end"].record()
             timing_record["samp_wall_end"] = time.time()
             timing_record["samp_end"] = time.perf_counter()
-            self._record_phase_timings()
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
+            # This is the last->non-last PP send-back of sampled tokens.
+            self._phase_timing_begin("ppbc")
             self.pp_handler.broadcast(
                 sampler_output.sampled_token_ids,
                 num_sampled,
                 num_rejected,
                 input_batch,
             )
+            self._phase_timing_end("ppbc")
 
         assert self.prompt_logprobs_worker is not None
         prompt_logprobs_dict = self.prompt_logprobs_worker.compute_prompt_logprobs(
@@ -2099,6 +2152,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # ensuring that `copy_event` is recorded before calling postprocess.
         # This sequencing may slightly reduce latency as async D2H copy does not
         # need to wait for the postprocess to finish.
+        self._phase_timing_begin("upd")
         self.postprocess_sampled(
             input_batch.idx_mapping,
             sampler_output.sampled_token_ids,
@@ -2106,6 +2160,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_rejected,
             input_batch.query_start_loc,
         )
+        self._phase_timing_end("upd")
 
         if self.speculator is not None:
             assert self.sampler is not None
@@ -2152,7 +2207,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
 
         # Post-step KV connector related operations.
+        self._phase_timing_begin("kvpf")
         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+        self._phase_timing_end("kvpf")
+        # Advance the timing slot only after the post-sample sub-phases
+        # (pp_broadcast, update_states, kv post_forward) are recorded into it.
+        if _LOG_GPU_STEP_TIMINGS and self._timing_events is not None:
+            self._record_phase_timings()
         model_runner_output.kv_connector_output = kv_connector_output
         model_runner_output.ec_connector_output = ec_connector_output
 
@@ -2213,6 +2274,26 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch.query_start_loc,
         )
 
+    def _phase_timing_begin(self, key: str) -> None:
+        """Record CPU+GPU start markers for a step sub-phase in the current slot."""
+        if not (_LOG_GPU_STEP_TIMINGS and self._timing_events is not None):
+            return
+        assert self._cpu_timing_records is not None
+        record = self._cpu_timing_records[self._gpu_timing_count]
+        record[f"{key}_wall_start"] = time.time()
+        record[f"{key}_start"] = time.perf_counter()
+        self._timing_events[self._gpu_timing_count][f"{key}_start"].record()
+
+    def _phase_timing_end(self, key: str) -> None:
+        """Record CPU+GPU end markers for a step sub-phase in the current slot."""
+        if not (_LOG_GPU_STEP_TIMINGS and self._timing_events is not None):
+            return
+        assert self._cpu_timing_records is not None
+        record = self._cpu_timing_records[self._gpu_timing_count]
+        self._timing_events[self._gpu_timing_count][f"{key}_end"].record()
+        record[f"{key}_wall_end"] = time.time()
+        record[f"{key}_end"] = time.perf_counter()
+
     def _record_phase_timings(self) -> None:
         """Log known-complete timing records without synchronizing the device."""
         assert self._timing_events is not None
@@ -2239,6 +2320,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             "forward": ("fwd", "fwd_start", "fwd_end"),
             "postprocess": ("post", "post_start", "post_end"),
             "sample": ("samp", "samp_start", "samp_end"),
+            "update_states": ("upd", "upd_start", "upd_end"),
+            "pp_broadcast": ("ppbc", "ppbc_start", "ppbc_end"),
+            "pp_recv": ("pprecv", "pprecv_start", "pprecv_end"),
+            "kv_post_forward": ("kvpf", "kvpf_start", "kvpf_end"),
         }
         first_step = self._gpu_timing_step_count - self._gpu_timing_count + 1
         lines: list[str] = []
@@ -2251,22 +2336,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 f"decode={record['decode']}"
             )
             for phase, (wall_key, start_key, end_key) in phase_keys.items():
+                if start_key not in record:
+                    # Phase absent for this step (e.g. non-last PP ranks have
+                    # no sample phase).
+                    continue
                 cpu_start = cast(float, record[start_key])
                 cpu_end = cast(float, record[end_key])
                 wall_start = cast(float, record[f"{wall_key}_wall_start"])
                 wall_end = cast(float, record[f"{wall_key}_wall_end"])
                 gpu_duration = ev[start_key].elapsed_time(ev[end_key])
+                fmt = "%m-%d %H:%M:%S.%f"
+                start_str = datetime.fromtimestamp(
+                    wall_start, timezone.utc
+                ).strftime(fmt)
+                end_str = datetime.fromtimestamp(
+                    wall_end, timezone.utc
+                ).strftime(fmt)
                 lines.append(
                     f"  {phase} "
-                    f"cpu_start={datetime.fromtimestamp(wall_start):%m-%d %H:%M:%S.%f} "
-                    f"cpu_end={datetime.fromtimestamp(wall_end):%m-%d %H:%M:%S.%f} "
+                    f"cpu_start={start_str} "
+                    f"cpu_end={end_str} "
                     f"cpu_duration_ms={(cpu_end - cpu_start) * 1000.0:.3f} "
                     f"gpu_duration_ms={gpu_duration:.3f}"
                 )
 
         logger.info(
             "GPU model runner step timing details "
-            "(steps %d-%d; durations in ms):\n%s",
+            "(steps %d-%d; UTC timestamps, durations in ms):\n%s",
             first_step,
             first_step + n - 1,
             "\n".join(lines),

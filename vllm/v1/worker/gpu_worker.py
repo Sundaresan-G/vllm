@@ -7,7 +7,7 @@ import os
 import time
 from collections.abc import Callable
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from types import NoneType
 from typing import TYPE_CHECKING, Any
 
@@ -101,6 +101,13 @@ from .utils import request_memory
 
 logger = init_logger(__name__)
 
+# Optional CPU timing of the worker's execute_model sub-phases (PP recv/send
+# posting, the blocking wait on the previous step's PP send, and the wrapped
+# model_runner.execute_model call). Gated by the master VLLM_LOG_STEP_TIMINGS
+# switch via the VLLM_LOG_WORKER_STEP_TIMINGS component.
+_LOG_WORKER_STEP_TIMINGS = envs.VLLM_LOG_WORKER_STEP_TIMINGS
+_WORKER_STEP_TIMING_INTERVAL = envs.VLLM_WORKER_STEP_TIMING_INTERVAL
+
 
 def _num_workspace_lanes(vllm_config: VllmConfig, use_v2_model_runner: bool) -> int:
     spec_config = vllm_config.speculative_config
@@ -152,21 +159,56 @@ class AsyncIntermediateTensors(IntermediateTensors):
         tensors: dict[str, torch.Tensor],
         comm_handles: list[Handle] | None = None,
         comm_postprocess: list[Callable[[], None]] | None = None,
+        timing: dict[str, tuple[float, ...]] | None = None,
     ) -> None:
         super().__init__(tensors)
         self._comm_handles = comm_handles
         self._comm_postprocess = comm_postprocess
         self._comm_waited = False
+        # Optional worker timing sink. When set, wait_for_comm records the PP
+        # recv wait and the TP all-gather postprocess as separate phases using
+        # the (wall_start, wall_end, cpu_duration_ms, gpu_duration_ms)
+        # convention.
+        self._timing = timing
 
     def wait_for_comm(self) -> None:
         if self._comm_waited:
             return
+        timing = self._timing
         if self._comm_handles:
+            if timing is not None:
+                _w0, _p0 = time.time(), time.perf_counter()
+                _g0 = torch.Event(enable_timing=True)
+                _g1 = torch.Event(enable_timing=True)
+                _g0.record()
             for handle in self._comm_handles:
                 handle.wait()
+            if timing is not None:
+                _g1.record()
+                # Store the events; elapsed_time is read lazily at log flush
+                # (many steps later), so no device sync is needed here.
+                timing["pp_recv_wait"] = (
+                    _w0,
+                    time.time(),
+                    (time.perf_counter() - _p0) * 1000.0,
+                    (_g0, _g1),
+                )
         if self._comm_postprocess:
+            if timing is not None:
+                _w0, _p0 = time.time(), time.perf_counter()
+                _g0 = torch.Event(enable_timing=True)
+                _g1 = torch.Event(enable_timing=True)
+                _g0.record()
             for fn in self._comm_postprocess:
                 fn()
+            if timing is not None:
+                _g1.record()
+                timing["pp_tp_all_gather"] = (
+                    _w0,
+                    time.time(),
+                    (time.perf_counter() - _p0) * 1000.0,
+                    (_g0, _g1),
+                )
         self._comm_waited = True
 
     def __getattribute__(self, name: str):
@@ -223,6 +265,10 @@ class Worker(WorkerBase):
 
         # Device handles of the previous step's PP intermediate-tensor send.
         self._pp_send_work: list[Handle] = []
+
+        # Buffered per-step CPU timings of execute_model's PP comm phases.
+        self._worker_timing_records: list[dict[str, Any]] = []
+        self._worker_timing_step = 0
 
         # Resolved lazily on first sleep/wake; persists worker-process state.
         self._sleep_mode_backend: SleepModeBackend | None = None
@@ -1122,12 +1168,22 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        timing = {} if _LOG_WORKER_STEP_TIMINGS else None
+
         # Wait for the previous step's sends so this forward pass cannot
         # overwrite buffers they are still reading.
+        if timing is not None:
+            _w0, _p0 = time.time(), time.perf_counter()
         if self._pp_send_work:
             for handle in self._pp_send_work:
                 handle.wait()
             self._pp_send_work = []
+        if timing is not None:
+            timing["prev_send_wait"] = (
+                _w0,
+                time.time(),
+                (time.perf_counter() - _p0) * 1000.0,
+            )
 
         intermediate_tensors = None
         forward_pass = scheduler_output.total_num_scheduled_tokens > 0
@@ -1165,6 +1221,8 @@ class Worker(WorkerBase):
                 )
             }
 
+        if timing is not None:
+            _w0, _p0 = time.time(), time.perf_counter()
         if forward_pass and not get_pp_group().is_first_rank:
             tensor_dict, comm_handles, comm_postprocess = (
                 get_pp_group().irecv_tensor_dict(
@@ -1177,9 +1235,23 @@ class Worker(WorkerBase):
                 tensor_dict,
                 comm_handles=comm_handles,
                 comm_postprocess=comm_postprocess,
+                timing=timing,
+            )
+        if timing is not None:
+            timing["irecv_post"] = (
+                _w0,
+                time.time(),
+                (time.perf_counter() - _p0) * 1000.0,
             )
 
         with self.annotate_profile(scheduler_output):
+            if timing is not None:
+                _w0, _p0 = time.time(), time.perf_counter()
+                # Collect the PP receive-side sub-phase timings recorded by the
+                # model runner during execute: pp_sync_recv (lazy irecv wait +
+                # TP all-gather postprocess) and, on the V1 runner, the SP
+                # residual all-gather (sp_residual_all_gather).
+                self.model_runner.pp_recv_timing = {}
             output = self.model_runner.execute_model(
                 scheduler_output, intermediate_tensors
             )
@@ -1189,9 +1261,20 @@ class Worker(WorkerBase):
                 and output is None
             ):
                 output = self.model_runner.pool()  # type: ignore
+            if timing is not None:
+                timing["execute"] = (
+                    _w0,
+                    time.time(),
+                    (time.perf_counter() - _p0) * 1000.0,
+                )
+                recv_timing = self.model_runner.pp_recv_timing
+                if recv_timing:
+                    timing.update(recv_timing)
+                self.model_runner.pp_recv_timing = None
             if isinstance(
                 output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
             ):
+                self._record_worker_timing(timing, num_scheduled_tokens)
                 return output
 
         assert isinstance(output, IntermediateTensors)
@@ -1204,14 +1287,105 @@ class Worker(WorkerBase):
         # Non-blocking send of the intermediate tensors. The metadata handle
         # is reaped lazily by the GroupCoordinator; the device handles are
         # waited at the top of the next step.
+        if timing is not None:
+            _w0, _p0 = time.time(), time.perf_counter()
         handles = get_pp_group().isend_tensor_dict(
             output.tensors,
             all_gather_group=get_tp_group(),
             all_gather_tensors=all_gather_tensors,
         )
         self._pp_send_work = handles[1:]
+        if timing is not None:
+            timing["isend_post"] = (
+                _w0,
+                time.time(),
+                (time.perf_counter() - _p0) * 1000.0,
+            )
 
+        self._record_worker_timing(timing, num_scheduled_tokens)
         return None
+
+    def _record_worker_timing(
+        self, timing: dict[str, Any] | None, num_tokens: int
+    ) -> None:
+        """Buffer one step's worker-level PP comm timings; flush at interval.
+
+        ``prev_send_wait`` is the blocking wait on the previous step's PP
+        isend (the real send cost surfaced as backpressure). ``irecv_post``
+        and ``isend_post`` are the non-blocking post costs; the actual recv
+        completion is awaited lazily inside ``execute``. ``pp_sync_recv`` is
+        the combined lazy recv forced by the first ``.tensors``/``.items()``
+        access, broken down into ``pp_recv_wait`` (the cross-stage irecv
+        handle wait) and ``pp_tp_all_gather`` (the TP all-gather postprocess
+        reconstructing the full tensor from the 1/TP slice).
+        ``sp_residual_all_gather`` is the V1-only SP residual all-gather
+        (nonzero only when sequence parallelism scatters the residual). Each
+        phase stores ``(wall_start, wall_end, cpu_duration_ms)``; the recv
+        sub-phases (``pp_recv_wait``, ``pp_tp_all_gather``) additionally carry
+        a 4th element ``gpu_duration_ms`` from device events.
+        """
+        if timing is None:
+            return
+        self._worker_timing_step += 1
+        timing["step"] = self._worker_timing_step
+        timing["num_tokens"] = num_tokens
+        self._worker_timing_records.append(timing)
+        if len(self._worker_timing_records) >= _WORKER_STEP_TIMING_INTERVAL:
+            self._log_worker_timings()
+
+    def _log_worker_timings(self) -> None:
+        if not self._worker_timing_records:
+            return
+        phases = (
+            "prev_send_wait",
+            "irecv_post",
+            "execute",
+            "pp_sync_recv",
+            "pp_recv_wait",
+            "pp_tp_all_gather",
+            "sp_residual_all_gather",
+            "isend_post",
+        )
+        lines: list[str] = []
+        fmt = "%m-%d %H:%M:%S.%f"
+        for record in self._worker_timing_records:
+            # One header line per step, then each phase on its own indented
+            # line with cpu_start/cpu_end wall timestamps, matching the GPU
+            # model runner step-timing format.
+            lines.append(
+                "Worker execute_model step timing "
+                f"step={record['step']} num_tokens={record['num_tokens']}"
+            )
+            for phase in phases:
+                if phase not in record:
+                    continue
+                vals = record[phase]
+                wall_start, wall_end, cpu_ms = vals[0], vals[1], vals[2]
+                start_str = datetime.fromtimestamp(
+                    wall_start, timezone.utc
+                ).strftime(fmt)
+                end_str = datetime.fromtimestamp(
+                    wall_end, timezone.utc
+                ).strftime(fmt)
+                field = (
+                    f"  {phase} "
+                    f"cpu_start={start_str} "
+                    f"cpu_end={end_str} "
+                    f"cpu_duration_ms={cpu_ms:.3f}"
+                )
+                if len(vals) > 3:
+                    start_ev, end_ev = vals[3]
+                    field += f" gpu_duration_ms={start_ev.elapsed_time(end_ev):.3f}"
+                lines.append(field)
+        logger.info(
+            "Worker execute_model step timing rank=%d "
+            "(steps %d-%d; UTC timestamps, durations in ms):\n%s",
+            self.rank,
+            self._worker_timing_records[0]["step"],
+            self._worker_timing_records[-1]["step"],
+            "\n".join(lines),
+        )
+        self._worker_timing_records.clear()
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         return self.model_runner.take_draft_token_ids()

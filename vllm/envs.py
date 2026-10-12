@@ -53,6 +53,8 @@ if TYPE_CHECKING:
     VLLM_ENGINE_CORE_STEP_TIMING_INTERVAL: int = 50
     VLLM_LOG_GPU_MODEL_RUNNER_STEP_TIMINGS: bool = False
     VLLM_GPU_MODEL_RUNNER_STEP_TIMING_INTERVAL: int = 50
+    VLLM_LOG_WORKER_STEP_TIMINGS: bool = False
+    VLLM_WORKER_STEP_TIMING_INTERVAL: int = 50
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
@@ -906,6 +908,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_GPU_MODEL_RUNNER_STEP_TIMING_INTERVAL": lambda: _step_timing_interval(
         "VLLM_GPU_MODEL_RUNNER_STEP_TIMING_INTERVAL"
+    ),
+    "VLLM_LOG_WORKER_STEP_TIMINGS": lambda: _step_timing_enabled(
+        "VLLM_LOG_WORKER_STEP_TIMINGS"
+    ),
+    "VLLM_WORKER_STEP_TIMING_INTERVAL": lambda: _step_timing_interval(
+        "VLLM_WORKER_STEP_TIMING_INTERVAL"
     ),
     # Trace function calls
     # If set to 1, vllm will trace function calls
