@@ -185,6 +185,7 @@ class TorchProfilerWrapper(WorkerProfiler):
         super().__init__(profiler_config)
 
         self.local_rank = local_rank
+        self.worker_name = worker_name
         self.profiler_config = profiler_config
         torch_profiler_trace_dir = profiler_config.torch_profiler_dir
         if local_rank in (None, 0):
@@ -266,13 +267,18 @@ class TorchProfilerWrapper(WorkerProfiler):
             row_limit=row_limit,
         )
 
-    def _write_profiler_table(self, rank: int, table: str) -> None:
+    def _write_profiler_table(self, table: str) -> None:
         profiler_dir = self.profiler_config.torch_profiler_dir
 
         # Skip file write for URI paths (gs://, s3://, etc.)
         # as standard file I/O doesn't work with URI schemes
         if not _is_uri_path(profiler_dir):
-            profiler_out_file = f"{profiler_dir}/profiler_out_{rank}.txt"
+            # Key the dump on worker_name (globally unique: it embeds the
+            # global rank and all parallel dims dp/pp/tp/dcp/ep), not
+            # local_rank. local_rank restarts at 0 on every node, so with a
+            # shared output dir multi-node workers would overwrite each other's
+            # profiler_out_<local_rank>.txt.
+            profiler_out_file = f"{profiler_dir}/profiler_out_{self.worker_name}.txt"
             with open(profiler_out_file, "w") as f:
                 print(table, file=f)
 
@@ -315,7 +321,7 @@ class TorchProfilerWrapper(WorkerProfiler):
         rank = self.local_rank
         if profiler_config.torch_profiler_dump_cuda_time_total:
             table = self._build_profiler_table(sort_key="self_cuda_time_total")
-            self._write_profiler_table(rank, table)
+            self._write_profiler_table(table)
 
             # only print profiler results on rank 0
             if rank == 0:
@@ -325,7 +331,7 @@ class TorchProfilerWrapper(WorkerProfiler):
             table = self._build_profiler_table(
                 sort_key="self_cpu_time_total", row_limit=50
             )
-            self._write_profiler_table(rank, table)
+            self._write_profiler_table(table)
 
             # only print profiler results on rank 0
             if rank == 0:
