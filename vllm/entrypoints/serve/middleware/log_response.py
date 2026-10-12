@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pydantic
 from fastapi import Request
@@ -14,6 +14,11 @@ from vllm.logger import init_logger
 from .authenticate import GUARDED_PREFIX
 
 logger = init_logger(__name__)
+
+
+def _fmt_ts(ts: float) -> str:
+    """Format an epoch timestamp as a UTC wall-clock string."""
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%m-%d %H:%M:%S.%f")
 
 
 class APIServerRequestTimingMiddleware:
@@ -45,11 +50,11 @@ class APIServerRequestTimingMiddleware:
 
         logger.info(
             "API server request timing received method=%s path=%s "
-            "request_id=%s start=%s",
+            "request_id=%s start=%s (UTC)",
             method,
             path,
             client_request_id,
-            f"{datetime.fromtimestamp(start_time):%m-%d %H:%M:%S.%f}",
+            _fmt_ts(start_time),
         )
 
         async def send_with_timing(message: Message) -> None:
@@ -92,7 +97,7 @@ class APIServerRequestTimingMiddleware:
             )
             logger.info(
                 "API server request timing details method=%s path=%s "
-                "request_id=%s status=%s start=%s end=%s: "
+                "request_id=%s status=%s start=%s end=%s (UTC): "
                 "routing_validation=%.3f prompt_render=%.3f tokenize=%.3f "
                 "input_processing=%.3f serving_setup=%.3f "
                 "response_setup=%.3f headers_to_first_body=%.3f "
@@ -101,8 +106,8 @@ class APIServerRequestTimingMiddleware:
                 path,
                 request_id,
                 status_code,
-                f"{datetime.fromtimestamp(start_time):%m-%d %H:%M:%S.%f}",
-                f"{datetime.fromtimestamp(end_time):%m-%d %H:%M:%S.%f}",
+                _fmt_ts(start_time),
+                _fmt_ts(end_time),
                 (endpoint_start - start) * 1000.0,
                 prompt_render_ms,
                 tokenize_ms,
