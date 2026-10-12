@@ -76,7 +76,9 @@ class NewLineFormatter(logging.Formatter):
         return msg
 
     def formatTime(self, record, datefmt=None):
-        ct = datetime.datetime.fromtimestamp(record.created)
+        ct = datetime.datetime.fromtimestamp(
+            record.created, datetime.timezone.utc
+        )
         if datefmt:
             s = ct.strftime(datefmt)
         else:
