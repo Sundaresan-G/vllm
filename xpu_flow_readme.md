@@ -8,6 +8,10 @@ reference case:
 - Hardware: Intel Battlemage B70, **TP = 4**
 - Build: vLLM `0.27.2rc0+kimi.xpu`
 
+Sections 0–10 cover the single-node **TP=4** path. **Section 11** extends this to
+a two-node **PP=2 × TP=8** deployment (pipeline parallelism, cross-node hidden
+state transfer, and multi-node `MessageQueue` setup).
+
 All file/line references point at the installed source under `vllm/`.
 
 ---
@@ -1852,7 +1856,339 @@ sequenceDiagram
 
 ---
 
-## 11. End-to-End Summary
+## 11. Pipeline Parallelism (PP) — Two-Node Deployment
+
+Sections 0–10 describe a **single-node TP=4** run. Pipeline parallelism adds a
+second axis: the decoder layers are **split into contiguous stages**, each stage
+owns a different slice of the layers, and the stages run on **different nodes**.
+The reference case for this section is the larger two-node bring-up:
+
+- Model: `moonshotai/Kimi-K3` (47 decoder layers in this config)
+- Topology: **PP = 2** (one stage per node) × **TP = 8** (GPUs per node) →
+  `world_size = 16`
+- Build: vLLM `0.28.1rc0+kimi.xpu`
+- Backend: **mp multi-node** (`data_parallel_backend` defaults to `"mp"`; pure
+  TP+PP with `--nnodes 2` needs no `--data-parallel-*` flags)
+
+```mermaid
+flowchart LR
+    subgraph N0["Node 0 — PP stage 0 (layers 0..23)"]
+        H[API server + EngineCore]
+        W0["ranks 0..7 (TP=8)"]
+    end
+    subgraph N1["Node 1 — PP stage 1 (layers 24..46)"]
+        W1["ranks 8..15 (TP=8), headless"]
+    end
+    W0 == "isend/irecv hidden states\n(torch.distributed, xccl)" ==> W1
+    W1 -. "last stage: logits -> sampling" .-> H
+```
+
+### 11a. Launch — one node full, one node headless
+
+Only node 0 runs the API server + EngineCore; node 1 runs a **worker-only**
+process. The serve CLI selects this per node from `--node-rank`:
+
+| Flag | Node 0 | Node 1 |
+|------|--------|--------|
+| `--node-rank` / `-r` | `0` | `1` |
+| `--headless` | no | **yes** |
+| HTTP API server | yes (port 9000) | **no** |
+| Global ranks spawned | `0..TP-1` | `TP..2*TP-1` |
+
+- Node 0 takes the normal path from sections 1–7: full `AsyncLLM` + EngineCore +
+  a `MultiprocExecutor` that spawns its local TP ranks.
+- Node 1 runs `run_headless()`, which detects `node_rank_within_dp > 0` and
+  launches a worker-only `MultiprocExecutor` that **joins node 0's xccl process
+  group** rather than standing up a scheduler or API server. Its workers block in
+  `worker_busy_loop` executing broadcast RPCs for the lifetime of the job.
+- Common CLI: `-pp/--pipeline-parallel-size`, `-tp`, `--nnodes/-n`,
+  `--node-rank/-r`, `--master-addr`, `--master-port`, `--headless`.
+- oneCCL cross-node transport uses `CCL_ATL_TRANSPORT=ofi` + `FI_PROVIDER=tcp`
+  (TCP sockets); dist backend is `xccl`.
+
+### 11b. Layer split — `get_pp_indices`
+
+Which layers land on which stage is computed by `get_pp_indices`
+([distributed/utils.py:127](vllm/distributed/utils.py#L127)). It divides the
+layers evenly, then adds any remainder to all-but-the-last partition:
+
+- 47 layers, PP=2 → **`[24, 23]`** (stage 0 = layers 0–23, stage 1 = layers
+  24–46). The log notes "Hidden layers were unevenly partitioned".
+- Override explicitly with `VLLM_PP_LAYER_PARTITION=24,23`.
+
+Each model builds only its own slice: `make_layers` returns real layers for
+`layers[start_layer:end_layer]` and `PPMissingLayer` placeholders elsewhere. The
+**embedding** lives on the first PP rank; the **lm_head / sampling** lives on the
+last PP rank. Every TP worker on a node holds the same layer slice (TP shards it
+width-wise; PP splits it depth-wise).
+
+### 11c. Where PP data is transmitted — `Worker.execute_model`
+
+The hand-off between stages happens in
+[gpu_worker.py:1133](vllm/v1/worker/gpu_worker.py#L1133). A **middle** PP rank
+(neither first nor last) does three comm actions per step, in this order:
+
+```python
+# 1. Wait for the PREVIOUS step's send to drain (backpressure), L1137-1145
+if self._pp_send_work:
+    for handle in self._pp_send_work:
+        handle.wait()
+    self._pp_send_work = []
+
+# 2. Post an async recv of hidden states from the previous stage, L1188
+tensor_dict, comm_handles, comm_postprocess = get_pp_group().irecv_tensor_dict(
+    all_gather_group=get_tp_group(), all_gather_tensors=all_gather_tensors)
+intermediate_tensors = AsyncIntermediateTensors(tensor_dict, comm_handles, ...)
+
+# 3. Run the local layer stack (recv completes lazily inside here)
+output = self.model_runner.execute_model(scheduler_output, intermediate_tensors)
+
+# 4. Post an async send of this stage's output to the next stage, L1235
+handles = get_pp_group().isend_tensor_dict(
+    output.tensors, all_gather_group=get_tp_group(), ...)
+self._pp_send_work = handles[1:]   # waited at the TOP of the NEXT step
+```
+
+Boundary ranks differ:
+
+- **First rank** (stage 0): no `irecv`; it embeds tokens itself. It only `isend`s
+  its output.
+- **Last rank** (stage N-1): `irecv`s, runs its layers, then returns a normal
+  `ModelRunnerOutput` (it owns `compute_logits` + sampling), so no `isend`.
+
+### 11d. `isend`/`irecv` are *post*, not *transfer* — the lazy wait
+
+`isend`/`irecv` (the `i` = immediate) **do not move data**; they post a request
+to xccl and return a work handle immediately. The bytes move asynchronously on
+the comm stream. Completion is observed by `handle.wait()`. Three details make
+this safe and overlapped:
+
+1. **The recv completes lazily.** `irecv_tensor_dict` returns the destination
+   buffers wrapped in `AsyncIntermediateTensors`
+   ([gpu_worker.py:154](vllm/v1/worker/gpu_worker.py#L154)). Its
+   `__getattribute__` ([gpu_worker.py:179](vllm/v1/worker/gpu_worker.py#L179))
+   intercepts the first read of `.tensors` and calls `wait_for_comm()`
+   ([gpu_worker.py:168](vllm/v1/worker/gpu_worker.py#L168)), which `wait()`s the
+   recv handles and runs the all-gather postprocess. So the **recv transfer cost
+   is folded into the model forward**, the moment the model body first touches
+   the received tensors.
+2. **The send completes next step.** The returned send handles are stashed in
+   `self._pp_send_work` and awaited at the **top of the following step**
+   (action 1 above), so the send overlaps everything in between. This is the real
+   send cost, surfaced as backpressure.
+3. **Buffers stay alive.** `isend_tensor_dict` self-retains the handles + source
+   tensors in `_pending_isends` and calls `record_stream`, so a fire-and-forget
+   caller can't free or overwrite an in-flight send buffer.
+
+```mermaid
+sequenceDiagram
+    participant Snd as stage K worker
+    participant Rcv as stage K+1 worker
+    Note over Snd: step N
+    Snd->>Snd: wait(prev isend)   # drains step N-1 send
+    Rcv->>Rcv: post irecv (buffers, handle) — returns immediately
+    Rcv->>Rcv: execute_model { first .tensors read -> wait_for_comm() }
+    Snd-->>Rcv: hidden states move on xccl comm stream
+    Rcv->>Rcv: forward over local layers
+    Snd->>Snd: post isend(output) — returns immediately
+    Note over Snd: step N+1 top: wait(this isend)
+```
+
+### 11e. The transport underneath — `isend_tensor_dict` / `irecv_tensor_dict`
+
+Both live on the `GroupCoordinator`
+([parallel_state.py:1149](vllm/distributed/parallel_state.py#L1149) and
+[:1271](vllm/distributed/parallel_state.py#L1271)). A tensor dict is split into
+**metadata** (shapes/dtypes/keys) and the **tensors**:
+
+- **Metadata** goes over the **CPU/gloo group** (`isend_object`/`recv_object`) —
+  a small, blocking exchange so the receiver knows what buffers to allocate.
+- **Tensors** go over the **device group** (`torch.distributed.isend/irecv` on
+  the xccl group). `dst` defaults to `(rank_in_group + 1) % world_size` for send
+  and `src` to `(rank_in_group - 1) % world_size` for recv — i.e. the next/prev
+  PP stage.
+- **All-gather optimization.** When an `all_gather_group` (the TP group) is
+  passed, each sender transmits only a `1/TP` **slice** of the tensor and the
+  receiver reconstructs the full tensor with a TP all-gather (the deferred
+  `postprocess` closures). `all_gather_tensors` disables this per-tensor for
+  tensors that are not fully replicated across the TP group (e.g. the `residual`
+  when sequence parallelism is on).
+
+On the model-runner side, the first PP rank builds intermediate tensors locally
+while non-first ranks pull them in via `sync_and_gather_intermediate_tensors`
+([gpu_model_runner.py:3507](vllm/v1/worker/gpu_model_runner.py#L3507)), invoked
+from `_preprocess` ([gpu_model_runner.py:3769](vllm/v1/worker/gpu_model_runner.py#L3769))
+when `not get_pp_group().is_first_rank`.
+
+#### Which rank actually sends/receives — *all* TP ranks, in parallel
+
+`self` in `isend_tensor_dict`/`irecv_tensor_dict` is the **PP group
+coordinator** (`get_pp_group()`), and there is **one PP group per TP position**.
+For PP=2 × TP=8 the 16 global ranks form 8 independent 2-rank PP channels, each
+pairing a stage-0 worker with the stage-1 worker at the **same TP position**:
+
+```
+PP group for TP pos 0: (global 0, global 8)
+PP group for TP pos 1: (global 1, global 9)
+...
+PP group for TP pos 7: (global 7, global 15)
+```
+
+So the hand-off is **not** one rank shipping the whole tensor while the other 7
+sit idle. Every TP worker runs `execute_model` as its own process and posts its
+own `isend`/`irecv` **simultaneously**, giving 8 concurrent cross-node transfers:
+
+```python
+dst = (self.rank_in_group + 1) % self.world_size        # next PP stage (0->1)
+handle = torch.distributed.isend(tensor, dst=self.ranks[dst], group=...)
+```
+
+`self.rank_in_group` is the position *within the 2-rank PP group* (0 or 1);
+`self.ranks[dst]` maps it back to the **global** rank (e.g. 1 → 9).
+
+#### Why the `1/TP` slice is free — the tensor is already replicated
+
+After the layer stack's final all-reduce, the hidden state is **replicated**:
+every TP rank of the stage holds the identical full tensor (when sequence
+parallelism is off). That replication is exactly what makes the all-gather
+optimization free — each sender already owns the whole tensor, so it can carve
+out *its own* `1/TP` slice with no extra communication. The slice size/position
+come from the TP group ([parallel_state.py:1182](vllm/distributed/parallel_state.py#L1182)):
+`all_gather_size = TP` and `all_gather_rank =` this rank's TP position.
+
+**Send side** — slice out your own `1/TP` piece in `isend_tensor_dict`
+([parallel_state.py:1199](vllm/distributed/parallel_state.py#L1199)):
+
+```python
+for key, tensor in zip(tensor_keys, tensor_list):          # L1199
+    if tensor.numel() == 0:
+        continue
+    if self._should_use_all_gather(                         # L1204 gate
+        key, tensor.numel(), all_gather_group, all_gather_tensors
+    ):
+        tensor = tensor.reshape(all_gather_size, -1)[all_gather_rank]  # L1207 the 1/TP slice
+    comm_group = metadata_group if tensor.is_cpu else group
+    handle = torch.distributed.isend(                       # L1209 sends only slice r
+        tensor, dst=self.ranks[dst], group=comm_group
+    )
+```
+
+**Recv side** — receive your slice into a view of the full buffer, then rebuild
+via a deferred TP all-gather in `irecv_tensor_dict`
+([parallel_state.py:1318](vllm/distributed/parallel_state.py#L1318)):
+
+```python
+if self._should_use_all_gather(                             # L1318 gate
+    key, full_tensor.numel(), all_gather_group, all_gather_tensors
+):
+    orig_shape = full_tensor.shape
+    slice_tensor = full_tensor.reshape(all_gather_size, -1)[ # L1322 view into full buffer
+        all_gather_rank
+    ]
+    handle = torch.distributed.irecv(                       # L1327 receives only slice r
+        slice_tensor, src=self.ranks[src], group=comm_group
+    )
+    handles.append(handle)
+
+    def _postprocess(...):                                  # L1331 deferred reconstruction
+        tensor_dict[key] = all_gather_group.all_gather(     # L1337 TP all-gather -> full
+            slice_tensor, dim=0
+        ).reshape(orig_shape)
+    postprocess.append(_postprocess)
+```
+
+The receiver allocates the **full** buffer, takes the same
+`reshape(TP, -1)[all_gather_rank]` **view** into it, and `irecv`s directly into
+that slice. The `_postprocess` closure (run later, during the lazy
+`wait_for_comm` in the forward) performs the intra-node TP `all_gather` that
+fills in the other `TP-1` slices from the sibling ranks, reconstructing the full
+tensor in place.
+
+The gate `_should_use_all_gather` returns False (send/recv the whole tensor over
+one channel) when there is no TP group, when the tensor size is not divisible by
+`TP`, or when the key is explicitly disabled via `all_gather_tensors` (the
+sequence-parallel `residual` case).
+
+| | bytes per link | parallel links | cross-node wall-clock |
+|---|---|---|---|
+| one rank sends full tensor | `S` | 1 | `S / BW` |
+| all-gather opt (TP ranks, `1/TP` each) | `S/TP` | `TP` | `S / (TP·BW)` |
+
+Net effect: the cross-node PP hop is ~TP× faster, paid for by a cheap
+**intra-node** TP all-gather (fast Xe-link) on the receiver. This is only
+possible *because* the tensor is replicated across the TP group. Sequence-
+parallel tensors (e.g. `residual`) are **not** replicated — each rank holds a
+distinct shard — so they are sent whole over a single channel.
+
+### 11f. Multi-node `MessageQueue` — the same-node detection fix
+
+Section 9a explained that `MessageQueue` is a hybrid SHM / TCP-PUBSUB transport
+whose split is decided from `n_local_reader` (same-node readers). For the
+**response direction** on a multi-node job, the per-worker response queues are
+built via `create_from_process_group_single_reader`
+([shm_broadcast.py:925](vllm/distributed/device_communicators/shm_broadcast.py#L925)),
+which must decide **which workers are on the same node as the reader**.
+
+The original code derived this from a `device_count()` heuristic
+(`rank // device_count() == reader_rank // device_count()`). That breaks on XPU
+when `VLLM_XPU_PER_WORKER_ZE_AFFINITY=1`: each worker sees exactly **one** device
+(`device_count() == 1`), so only rank 0 was ever flagged same-node. On node 0,
+head workers 1..TP-1 then got empty `local_reader_ranks` and a **`None`
+worker_response_mq**, tripping `assert local_message_queue is not None` in
+`MultiprocExecutor`.
+
+The fix replaces the heuristic with the shared-memory node probe
+`in_the_same_node_as` ([parallel_state.py:2335](vllm/distributed/parallel_state.py#L2335)):
+
+```python
+# shm_broadcast.py:954-965
+from vllm.distributed.parallel_state import in_the_same_node_as
+global_ranks = dist.get_process_group_ranks(pg)
+reader_group_rank = global_ranks.index(reader_rank)
+status = in_the_same_node_as(pg, source_rank=reader_group_rank)
+same_node = status[dist.get_rank(pg)]
+buffer_io = MessageQueue(
+    n_reader=1, n_local_reader=1 if same_node else 0, ...)
+```
+
+This is the **same** detector the writer-side `create_from_process_group`
+([shm_broadcast.py:982](vllm/distributed/device_communicators/shm_broadcast.py#L982),
+using `in_the_same_node_as(pg, source_rank=writer_rank)`) already used, so both
+directions now agree and NUMA binding is preserved. It is device-count agnostic,
+so CUDA/Ray are unaffected.
+
+### 11g. Observing PP comm cost — `VLLM_LOG_WORKER_STEP_TIMINGS`
+
+Because the PP hand-off is almost entirely **CPU-side orchestration** plus
+async comm-stream transfers, the worker exposes per-step CPU timings of
+`execute_model`'s sub-phases, gated by the master `VLLM_LOG_STEP_TIMINGS` switch
+via the `VLLM_LOG_WORKER_STEP_TIMINGS` component (interval
+`VLLM_WORKER_STEP_TIMING_INTERVAL`, default 50). Recorded in
+`_record_worker_timing` / `_log_worker_timings`
+([gpu_worker.py:1247](vllm/v1/worker/gpu_worker.py#L1247)):
+
+| Phase | Meaning |
+|-------|---------|
+| `prev_send_wait_ms` | blocking wait on the **previous** step's `isend` → the real **send** cost, surfaced as backpressure |
+| `irecv_post_ms` | posting the recv (+ the small blocking gloo metadata recv); **not** the transfer |
+| `execute_ms` | `model_runner.execute_model`; the **recv** transfer completes lazily *inside* here |
+| `isend_post_ms` | posting the send; data leaves on the comm stream afterward |
+
+GPU-event timing is intentionally **not** used for the `isend`/`irecv` calls:
+wrapping the *post* in device events would measure only the enqueue. The real
+transfer cost already surfaces as `prev_send_wait_ms` (send) and inside
+`execute_ms` (recv); the model runner's own `VLLM_LOG_GPU_MODEL_RUNNER_STEP_TIMINGS`
+brackets the forward compute with device events separately.
+
+> Multi-worker output files (profiler tables, timing logs) are keyed by the
+> globally unique worker name (`dp{}_pp{}_tp{}_dcp{}_ep{}_rank{global_rank}` from
+> `get_worker_rank_suffix` at
+> [distributed/utils.py:696](vllm/distributed/utils.py#L696)), so node 0 and
+> node 1 never collide on shared NFS even though local ranks both restart at 0.
+
+---
+
+## 12. End-to-End Summary
 
 ```mermaid
 flowchart TB
