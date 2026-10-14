@@ -221,6 +221,18 @@ if [[ "$PINNED_MAX_ROUND_MB" != "max" ]]; then
     export PYTORCH_ALLOC_CONF="pinned_max_round_threshold_mb:${PINNED_MAX_ROUND_MB}"
 fi
 
+# Per-command env for the `vllm serve` invocation. Each var is overridable from
+# outside (VAR=... sbatch ...); the per-GPU affinity vars set by GPU_SCHEME are
+# spliced in. The result is prefixed to the serve command inside the setsid
+# block below.
+COMMON_SERVE_ENV="VLLM_XPU_MOE_GATHER_OFFLOAD=${VLLM_XPU_MOE_GATHER_OFFLOAD:-1} \
+ZE_ENABLE_PCI_ID_DEVICE_ORDER=${ZE_ENABLE_PCI_ID_DEVICE_ORDER:-1} \
+VLLM_LOG_STEP_TIMINGS=${VLLM_LOG_STEP_TIMINGS:-0} \
+VLLM_XPU_ENABLE_XPU_GRAPH=${VLLM_XPU_ENABLE_XPU_GRAPH:-1} \
+TRITON_DEFAULT_BACKEND=${TRITON_DEFAULT_BACKEND:-intel} \
+${ZE_AFFINITY_ENV} \
+${PER_WORKER_ZE_ENV}"
+
 # Logging helper — prints [file:line func()] message to stderr
 log() {
     local file="${BASH_SOURCE[1]##*/}"
@@ -375,13 +387,7 @@ main() {
         sycl-ls --verbose
 
         # NEOReadDebugKeys=1 EnableImplicitConvertionToCounterBasedEvents=0 \\
-        VLLM_XPU_MOE_GATHER_OFFLOAD=1 \\
-        ZE_ENABLE_PCI_ID_DEVICE_ORDER=1 \\
-        VLLM_LOG_STEP_TIMINGS=0 \\
-        VLLM_XPU_ENABLE_XPU_GRAPH=1 \\
-        TRITON_DEFAULT_BACKEND=intel \\
-        ${ZE_AFFINITY_ENV} \\
-        ${PER_WORKER_ZE_ENV} \\
+        ${COMMON_SERVE_ENV} \\
         ${UNITRACE_PREFIX} \\
         ${NUMACTL_PREFIX} \\
         \$(which vllm) serve ${MODEL} --trust-remote-code \\
