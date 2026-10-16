@@ -59,13 +59,12 @@ from vllm.v1.metrics.loggers import (
 )
 from vllm.v1.metrics.prometheus import shutdown_prometheus
 from vllm.v1.metrics.stats import IterationStats
+from vllm.v1.utils import log_step_timing
 
 logger = init_logger(__name__)
 
 _LOG_API_SERVER_STEP_TIMINGS = envs.VLLM_LOG_API_SERVER_STEP_TIMINGS
-_API_SERVER_STEP_TIMING_LOG_INTERVAL = (
-    envs.VLLM_API_SERVER_STEP_TIMING_INTERVAL
-)
+_API_SERVER_STEP_TIMING_LOG_INTERVAL = envs.VLLM_API_SERVER_STEP_TIMING_INTERVAL
 
 
 def _fmt_ts(ts: float) -> str:
@@ -818,12 +817,13 @@ class AsyncLLM(EngineClient):
                         f"cpu_end={_fmt_ts(we)} "
                         f"cpu_duration_ms={dur:.3f}"
                     )
-            logger.info(
-                "API server step timing details "
-                "(steps %d-%d, UTC timestamps, ms):\n%s",
+            log_step_timing(
+                logger,
+                "API server step timing details (steps %d-%d, UTC timestamps, ms):\n%s",
                 step_timing_records[0][0],
                 step_timing_records[-1][0],
                 "\n".join(lines),
+                label="APIServer",
             )
             step_timing_records.clear()
 

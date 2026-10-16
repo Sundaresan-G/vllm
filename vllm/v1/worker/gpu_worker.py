@@ -85,7 +85,11 @@ from vllm.v1.outputs import (
     DraftTokenIds,
     ModelRunnerOutput,
 )
-from vllm.v1.utils import compute_iteration_details, report_usage_stats
+from vllm.v1.utils import (
+    compute_iteration_details,
+    log_step_timing,
+    report_usage_stats,
+)
 from vllm.v1.worker.sentinel.gpu_worker_sentinel import WorkerSentinel
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
@@ -1365,12 +1369,10 @@ class Worker(WorkerBase):
                     continue
                 vals = record[phase]
                 wall_start, wall_end, cpu_ms = vals[0], vals[1], vals[2]
-                start_str = datetime.fromtimestamp(
-                    wall_start, timezone.utc
-                ).strftime(fmt)
-                end_str = datetime.fromtimestamp(
-                    wall_end, timezone.utc
-                ).strftime(fmt)
+                start_str = datetime.fromtimestamp(wall_start, timezone.utc).strftime(
+                    fmt
+                )
+                end_str = datetime.fromtimestamp(wall_end, timezone.utc).strftime(fmt)
                 field = (
                     f"  {phase} "
                     f"cpu_start={start_str} "
@@ -1383,7 +1385,8 @@ class Worker(WorkerBase):
                 phase_lines.append((wall_start, field))
             phase_lines.sort(key=lambda item: item[0])
             lines.extend(line for _, line in phase_lines)
-        logger.info(
+        log_step_timing(
+            logger,
             "Worker execute_model step timing rank=%d "
             "(steps %d-%d; UTC timestamps, durations in ms):\n%s",
             self.rank,

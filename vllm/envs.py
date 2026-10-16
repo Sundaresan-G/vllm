@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     VLLM_GPU_MODEL_RUNNER_STEP_TIMING_INTERVAL: int = 50
     VLLM_LOG_WORKER_STEP_TIMINGS: bool = False
     VLLM_WORKER_STEP_TIMING_INTERVAL: int = 50
+    VLLM_STEP_TIMING_LOG_DIR: str | None = None
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
@@ -589,6 +590,32 @@ def _step_timing_interval(component_env_name: str) -> int:
     return max(1, int(os.getenv(component_env_name, default)))
 
 
+def _step_timing_log_dir() -> str | None:
+    """Resolve the directory for per-rank step-timing dump files.
+
+    Priority:
+      1. An explicit ``VLLM_STEP_TIMING_LOG_DIR`` always wins.
+      2. Otherwise, when step timing is enabled (``VLLM_LOG_STEP_TIMINGS=1``),
+         default to a new ``vllm_step_timings_<timestamp>`` folder under the
+         current working directory so dumps don't interleave on stdout by
+         default. The resolved path is pinned back into the environment so
+         every rank/subprocess shares one folder instead of each computing a
+         different timestamp.
+      3. Else ``None`` (stdout logging, unchanged behavior).
+    """
+    explicit = os.getenv("VLLM_STEP_TIMING_LOG_DIR")
+    if explicit:
+        return explicit
+    if os.getenv("VLLM_LOG_STEP_TIMINGS", "0") == "1":
+        from datetime import datetime
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default = os.path.join(os.getcwd(), f"vllm_step_timings_{timestamp}")
+        os.environ["VLLM_STEP_TIMING_LOG_DIR"] = default
+        return default
+    return None
+
+
 # The start-* and end* here are used by the documentation generator
 # to extract the used env vars.
 
@@ -883,9 +910,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Per-step timing is disabled by default. The master switch enables timing
     # globally; component switches can then selectively disable individual logs.
-    "VLLM_LOG_STEP_TIMINGS": lambda: (
-        os.getenv("VLLM_LOG_STEP_TIMINGS", "0") == "1"
-    ),
+    "VLLM_LOG_STEP_TIMINGS": lambda: (os.getenv("VLLM_LOG_STEP_TIMINGS", "0") == "1"),
     # Number of steps buffered per timing log. Component-specific intervals
     # override this master value when explicitly set.
     "VLLM_STEP_TIMING_INTERVAL": lambda: max(
@@ -915,6 +940,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_WORKER_STEP_TIMING_INTERVAL": lambda: _step_timing_interval(
         "VLLM_WORKER_STEP_TIMING_INTERVAL"
     ),
+    # When set, per-step timing dumps are written to one file per rank under
+    # this directory (named step_timing_<rank-label>.log) instead of the shared
+    # stdout stream. This avoids cross-rank line interleaving that corrupts the
+    # dumps when many ranks flush concurrently. If unset but step timing is
+    # enabled (VLLM_LOG_STEP_TIMINGS=1), defaults to ./step_timings; otherwise
+    # unset keeps stdout logging.
+    "VLLM_STEP_TIMING_LOG_DIR": lambda: _step_timing_log_dir(),
     # Trace function calls
     # If set to 1, vllm will trace function calls
     # Useful for debugging

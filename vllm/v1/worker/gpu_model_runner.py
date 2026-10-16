@@ -214,7 +214,11 @@ from vllm.v1.spec_decode.step3p5 import Step3p5MTPProposer
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
 from vllm.v1.spec_decode.utils import update_num_computed_tokens_for_batch_change
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
-from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
+from vllm.v1.utils import (
+    CpuGpuBuffer,
+    log_step_timing,
+    record_function_or_nullcontext,
+)
 from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.block_table import SlotMappingMode
 from vllm.v1.worker.cp_utils import (
@@ -1015,9 +1019,7 @@ class GPUModelRunner(
         # EngineCore must collect batch N before it can dispatch batch N plus
         # max_concurrent_batches. Its output copy waits for the default stream,
         # so all timing events for N are complete by then.
-        self._gpu_timing_completion_lag = max(
-            1, vllm_config.max_concurrent_batches
-        )
+        self._gpu_timing_completion_lag = max(1, vllm_config.max_concurrent_batches)
         self._step_is_decode = False
         self._timing_events: list[dict[str, torch.Event]] | None = None
         self._cpu_timing_records: list[dict[str, float | int | bool]] | None = None
@@ -4699,12 +4701,8 @@ class GPUModelRunner(
                     self.kv_connector_output = kv_connector_output
                     if _LOG_GPU_STEP_TIMINGS and self._timing_events is not None:
                         assert self._cpu_timing_records is not None
-                        timing_record = self._cpu_timing_records[
-                            self._gpu_timing_count
-                        ]
-                        self._timing_events[self._gpu_timing_count][
-                            "post_end"
-                        ].record()
+                        timing_record = self._cpu_timing_records[self._gpu_timing_count]
+                        self._timing_events[self._gpu_timing_count]["post_end"].record()
                         timing_record["post_wall_end"] = time.time()
                         timing_record["post_end"] = time.perf_counter()
                         # Non-last PP ranks have no sample phase; record the
@@ -4855,12 +4853,10 @@ class GPUModelRunner(
                 wall_end = cast(float, record[f"{wall_key}_wall_end"])
                 gpu_duration = ev[start_key].elapsed_time(ev[end_key])
                 fmt = "%m-%d %H:%M:%S.%f"
-                start_str = datetime.fromtimestamp(
-                    wall_start, timezone.utc
-                ).strftime(fmt)
-                end_str = datetime.fromtimestamp(
-                    wall_end, timezone.utc
-                ).strftime(fmt)
+                start_str = datetime.fromtimestamp(wall_start, timezone.utc).strftime(
+                    fmt
+                )
+                end_str = datetime.fromtimestamp(wall_end, timezone.utc).strftime(fmt)
                 phase_lines.append(
                     (
                         wall_start,
@@ -4874,7 +4870,8 @@ class GPUModelRunner(
             phase_lines.sort(key=lambda item: item[0])
             lines.extend(line for _, line in phase_lines)
 
-        logger.info(
+        log_step_timing(
+            logger,
             "GPU model runner step timing details "
             "(steps %d-%d; UTC timestamps, durations in ms):\n%s",
             first_step,

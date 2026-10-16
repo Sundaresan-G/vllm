@@ -79,6 +79,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     RoutedExpertsTensors,
 )
+from vllm.v1.utils import log_step_timing
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.cp_utils import check_attention_cp_compatibility
 from vllm.v1.worker.gpu import pcp_manager as pcp
@@ -1871,9 +1872,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 recv_tensors = intermediate_tensors.tensors
             n = input_batch.num_tokens_after_padding
             new_tensors = {
-                k: v[:n]
-                if dummy_run
-                else v[:n].copy_(recv_tensors[k][:n])
+                k: v[:n] if dummy_run else v[:n].copy_(recv_tensors[k][:n])
                 for k, v in self.intermediate_tensors.tensors.items()
             }
             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
@@ -2350,12 +2349,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 wall_end = cast(float, record[f"{wall_key}_wall_end"])
                 gpu_duration = ev[start_key].elapsed_time(ev[end_key])
                 fmt = "%m-%d %H:%M:%S.%f"
-                start_str = datetime.fromtimestamp(
-                    wall_start, timezone.utc
-                ).strftime(fmt)
-                end_str = datetime.fromtimestamp(
-                    wall_end, timezone.utc
-                ).strftime(fmt)
+                start_str = datetime.fromtimestamp(wall_start, timezone.utc).strftime(
+                    fmt
+                )
+                end_str = datetime.fromtimestamp(wall_end, timezone.utc).strftime(fmt)
                 phase_lines.append(
                     (
                         wall_start,
@@ -2369,7 +2366,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             phase_lines.sort(key=lambda item: item[0])
             lines.extend(line for _, line in phase_lines)
 
-        logger.info(
+        log_step_timing(
+            logger,
             "GPU model runner step timing details "
             "(steps %d-%d; UTC timestamps, durations in ms):\n%s",
             first_step,

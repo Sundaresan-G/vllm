@@ -943,9 +943,7 @@ class WorkerProc:
             assert worker.worker_response_mq is not None
             if kwargs["vllm_config"].parallel_config.numa_bind:
                 device = getattr(worker.worker, "device", None)
-                numa_utils.log_current_affinity_state(
-                    f"Worker_{worker.rank}", device
-                )
+                numa_utils.log_current_affinity_state(f"Worker_{worker.rank}", device)
 
             worker.monitor_death_pipe(death_pipe, shutdown_requested)
 
@@ -1127,6 +1125,9 @@ class WorkerProc:
             process_name += f"_EP{ep_rank}"
         set_process_title(name=process_name)
         decorate_logs(process_name)
+        from vllm.v1.utils import set_process_label
+
+        set_process_label(process_name)
 
 
 def set_multiprocessing_worker_envs(local_world_size: int = 1):

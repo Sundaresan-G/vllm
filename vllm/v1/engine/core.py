@@ -92,7 +92,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 from vllm.v1.structured_output import StructuredOutputManager
-from vllm.v1.utils import compute_iteration_details
+from vllm.v1.utils import compute_iteration_details, log_step_timing
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
@@ -262,6 +262,12 @@ class EngineCore:
         self._step_timing_records: list[dict[str, Any]] = []
         self._step_timing_batch_count = 0
         self._step_timing_invocation_count = 0
+        dp_rank = vllm_config.parallel_config.data_parallel_rank
+        self._step_timing_label = (
+            f"EngineCore_DP{dp_rank}"
+            if vllm_config.parallel_config.data_parallel_size > 1
+            else "EngineCore"
+        )
 
         self.aborts_queue = queue.Queue[list[str]]()
 
@@ -644,12 +650,8 @@ class EngineCore:
             return {}, False
 
         if not _LOG_STEP_TIMINGS:
-            scheduler_output = self.scheduler.schedule(
-                self._should_throttle_prefills()
-            )
-            future = self.model_executor.execute_model(
-                scheduler_output, non_block=True
-            )
+            scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+            future = self.model_executor.execute_model(scheduler_output, non_block=True)
             grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
             with (
                 self.capture_iteration_details(scheduler_output) as iteration_details,
@@ -665,15 +667,11 @@ class EngineCore:
             batch_id = self._step_timing_batch_count
             step_start_time = time.time()
             t0 = time.perf_counter()
-            scheduler_output = self.scheduler.schedule(
-                self._should_throttle_prefills()
-            )
+            scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
             t1 = time.perf_counter()
             # For UniProc (TP=1) the forward pass runs inline here; for
             # MultiProc (TP>1) this only dispatches and returns a Future.
-            future = self.model_executor.execute_model(
-                scheduler_output, non_block=True
-            )
+            future = self.model_executor.execute_model(scheduler_output, non_block=True)
             t2 = time.perf_counter()
             grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
             t3 = time.perf_counter()
@@ -784,12 +782,8 @@ class EngineCore:
                 f"call={record['invocation_id']} mode={record['mode']}"
             )
             if dispatch_record := record["dispatch"]:
-                timings_ms = cast(
-                    dict[str, float], dispatch_record["timings_ms"]
-                )
-                post_collect_dispatch = dispatch_record.get(
-                    "post_collect_dispatch"
-                )
+                timings_ms = cast(dict[str, float], dispatch_record["timings_ms"])
+                post_collect_dispatch = dispatch_record.get("post_collect_dispatch")
                 start_time = cast(float, dispatch_record["start_time"])
                 end_time = cast(float, dispatch_record["end_time"])
                 phase_lines: list[str] = []
@@ -820,9 +814,7 @@ class EngineCore:
                 timings_ms = cast(dict[str, float], collect_record["timings_ms"])
                 start_time = cast(float, collect_record["start_time"])
                 end_time = cast(float, collect_record["end_time"])
-                dispatch_start = cast(
-                    float, collect_record["dispatch_start_time"]
-                )
+                dispatch_start = cast(float, collect_record["dispatch_start_time"])
                 dispatch_end = cast(float, collect_record["dispatch_end_time"])
                 phase_lines = []
                 cursor = start_time
@@ -850,13 +842,9 @@ class EngineCore:
                 )
                 lines.extend(phase_lines)
             if dispatch_record and (
-                post_collect_dispatch := dispatch_record.get(
-                    "post_collect_dispatch"
-                )
+                post_collect_dispatch := dispatch_record.get("post_collect_dispatch")
             ):
-                timings_ms = cast(
-                    dict[str, float], dispatch_record["timings_ms"]
-                )
+                timings_ms = cast(dict[str, float], dispatch_record["timings_ms"])
                 sample_dispatch_ms = timings_ms["sample_dispatch_ms"]
                 start_time = cast(float, post_collect_dispatch["start_time"])
                 end_time = cast(float, post_collect_dispatch["end_time"])
@@ -874,12 +862,13 @@ class EngineCore:
                     f"cpu_end={_fmt_ts(end_time)} "
                     f"cpu_duration_ms={sample_dispatch_ms:.3f}"
                 )
-        logger.info(
-            "engine invocation timing details "
-            "(calls %d-%d, UTC timestamps, ms):\n%s",
+        log_step_timing(
+            logger,
+            "engine invocation timing details (calls %d-%d, UTC timestamps, ms):\n%s",
             self._step_timing_records[0]["invocation_id"],
             self._step_timing_records[-1]["invocation_id"],
             "\n".join(lines),
+            label=self._step_timing_label,
         )
         self._step_timing_records.clear()
 
@@ -948,9 +937,7 @@ class EngineCore:
             if _LOG_STEP_TIMINGS:
                 t2 = time.perf_counter()
                 execute_dispatch_end_time = time.time()
-                scheduled_step_timings_ms["execute_dispatch_ms"] = (
-                    t2 - t1
-                ) * 1000.0
+                scheduled_step_timings_ms["execute_dispatch_ms"] = (t2 - t1) * 1000.0
             if self.is_ec_consumer:
                 model_executed = scheduler_output.total_num_scheduled_tokens > 0
 

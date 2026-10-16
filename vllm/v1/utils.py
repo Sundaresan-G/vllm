@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import json
 import multiprocessing
+import os
 import threading
 import time
 import weakref
@@ -17,6 +18,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Generic,
+    TextIO,
     TypeVar,
     Union,
     overload,
@@ -856,3 +858,87 @@ def compute_iteration_details(scheduler_output: SchedulerOutput) -> IterationDet
         num_encoder_inputs,
         num_encoder_output_tokens,
     )
+
+
+# ---------------------------------------------------------------------------
+# Per-rank file sink for step-timing dumps.
+#
+# The step-timing instrumentation emits large multi-line dumps from several
+# subsystems (worker, GPU model runner, engine core, API server). When many
+# ranks flush these dumps to the shared stdout stream concurrently, physical
+# lines from different ranks splice together, corrupting the dumps and breaking
+# downstream parsing.
+#
+# When ``VLLM_STEP_TIMING_LOG_DIR`` is set, :func:`log_step_timing` writes each
+# dump to a dedicated per-rank file (one writer per process, so no
+# interleaving) instead of the shared logger. Every physical line is prefixed
+# with ``(<label>) [step_timing] `` so parsers that key on the rank prefix keep
+# working on the per-rank files unchanged. When the env var is unset, the dump
+# falls back to ``logger.info`` and stdout behavior is identical to before.
+# ---------------------------------------------------------------------------
+
+# Rank label for the current process (e.g. "Worker_PP0_TP3"), registered once
+# by the process bootstrap. Falls back to the multiprocessing process name.
+_step_timing_process_label: str | None = None
+_step_timing_handles: dict[str, TextIO] = {}
+_step_timing_lock = threading.Lock()
+
+
+def set_process_label(label: str) -> None:
+    """Record the full rank label used to name this process's dump file."""
+    global _step_timing_process_label
+    _step_timing_process_label = label
+
+
+def _resolve_step_timing_label(explicit: str | None) -> str:
+    if explicit:
+        return explicit
+    if _step_timing_process_label:
+        return _step_timing_process_label
+    return multiprocessing.current_process().name
+
+
+def _get_step_timing_handle(log_dir: str, label: str) -> TextIO | None:
+    handle = _step_timing_handles.get(label)
+    if handle is not None:
+        return handle
+    with _step_timing_lock:
+        handle = _step_timing_handles.get(label)
+        if handle is None:
+            try:
+                os.makedirs(log_dir, exist_ok=True)
+                path = os.path.join(log_dir, f"step_timing_{label}.log")
+                handle = open(path, "a", buffering=1)  # noqa: SIM115
+            except OSError:
+                return None
+            _step_timing_handles[label] = handle
+    return handle
+
+
+def log_step_timing(
+    logger,
+    msg: str,
+    *args,
+    label: str | None = None,
+) -> None:
+    """Emit a step-timing dump to a per-rank file or the shared logger.
+
+    Args:
+        logger: Fallback logger used when file logging is disabled.
+        msg: Printf-style format string (same as passed to ``logger.info``).
+        *args: Format arguments for ``msg``.
+        label: Explicit rank label; defaults to the registered process label.
+    """
+    log_dir = envs.VLLM_STEP_TIMING_LOG_DIR
+    if not log_dir:
+        logger.info(msg, *args)
+        return
+
+    handle = _get_step_timing_handle(log_dir, _resolve_step_timing_label(label))
+    if handle is None:
+        logger.info(msg, *args)
+        return
+
+    rendered = msg % args if args else msg
+    prefix = f"({_resolve_step_timing_label(label)}) [step_timing] "
+    handle.write("".join(f"{prefix}{line}\n" for line in rendered.split("\n")))
