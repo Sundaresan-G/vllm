@@ -727,7 +727,7 @@ def _dur_ms(a, b):
     return (b - a).total_seconds() * 1000.0
 
 
-def pp_overhead(worker, gpu, ec_collect, t_from=None, t_to=None):
+def pp_overhead(worker, gpu, ec_dispatch, ec_collect, t_from=None, t_to=None):
     """Decompose the per-step PP=2 overhead into three measured diffs.
 
     Formulas (all on the same node clock):
@@ -783,29 +783,43 @@ def pp_overhead(worker, gpu, ec_collect, t_from=None, t_to=None):
     ]
     w1.sort(key=lambda r: r["phases"]["irecv_post"]["end"])
     w1_t = [r["phases"]["irecv_post"]["end"] for r in w1]
+
+    # Structural ECstep<->gstep pairing. The EngineCore batch counter and the
+    # PP1 GPU step counter are different clocks: EngineCore also counts ntok=0
+    # pipeline-fill bubbles, and the GPU side runs warm-up/capture forwards
+    # before serving begins. So a timestamp bisect mispairs the first real
+    # step. Instead, align the two 1:1 in order after removing those artifacts:
+    #   * real EngineCore batches = dispatch num_tokens>0 (skip ntok=0 bubbles),
+    #   * real GPU steps = PP1 forwards at/after the first real dispatch (skip
+    #     warm-up), carrying each batch's collect-end for pp1_ec.
+    real_ec = [
+        (
+            ec_dispatch[b]["start"],
+            b,
+            ec_dispatch[b]["num_tokens"],
+            ec_collect[b]["end"],
+        )
+        for b in sorted(ec_dispatch)
+        if ec_dispatch[b]["num_tokens"] > 0
+        and b in ec_collect
+        and ec_collect[b].get("end")
+    ]
+    first_ec_start = real_ec[0][0] if real_ec else None
     g1 = [
         r
         for (rk, _s), r in gpu.items()
         if rk == "PP1"
-        and r.get("num_tokens") == 1
         and r.get("pre_start") is not None
         and "pp_broadcast" in r.get("phases", {})
+        and (first_ec_start is None or r["pre_start"] >= first_ec_start)
     ]
     g1.sort(key=lambda r: r["pre_start"])
-    # Only real decode collects: the ntok=0 bubble collects have a near-zero
-    # future wait and would otherwise mismatch as the "next" collect. Keep
-    # the batch id alongside the end time for per-step attribution.
-    coll_pairs = sorted(
-        (r["end"], r["batch"])
-        for r in ec_collect.values()
-        if r.get("end")
-        and r["phases"].get("model_output_future_wait", {}).get("cpu_ms", 0) > 1.0
-    )
-    coll = [t for t, _b in coll_pairs]
+    paired = list(zip(real_ec, g1))
 
-    print("# pp_overhead: per decode step (ntok=1)")
-    print("#   ECstep            = EngineCore step id (pass to")
+    print("# pp_overhead: real serving steps (ECstep<->gstep matched 1:1)")
+    print("#   ECstep            = EngineCore batch id (pass to")
     print("#                       --batch-start / --batch-end)")
+    print("#   ntok              = gstep scheduled tokens (prefill>1, decode=1)")
     print("#   transfer_loss     = W.PP1.irecv.end - W.PP0.isend.end")
     print("#                       (valid: irecv blocks the host)")
     print("#   bcast_cost        = (G.PP1.ppbc.end - G.PP1.exec.cpu_start)")
@@ -825,11 +839,13 @@ def pp_overhead(worker, gpu, ec_collect, t_from=None, t_to=None):
     )
     tr_s = bc_s = bb_s = kv_s = pr_s = pi_s = po_s = 0.0
     tr_n = bc_n = bb_n = kv_n = pr_n = pi_n = po_n = 0
-    for g in g1:
+    for (ec_start, batch, _ec_ntok, coll_end), g in paired:
         exec_start = g["pre_start"]
-        if lo and hms(exec_start) < lo:
+        # Window on the paired EngineCore batch dispatch time, not the gstep
+        # exec time, so --batch-start/--batch-end filter on ECstep directly.
+        if lo and hms(ec_start) < lo:
             continue
-        if hi and hms(exec_start) > hi:
+        if hi and hms(ec_start) > hi:
             continue
         phs = g["phases"]
         ppbc_end = phs["pp_broadcast"]["end"]
@@ -853,12 +869,9 @@ def pp_overhead(worker, gpu, ec_collect, t_from=None, t_to=None):
                     p0["phases"]["isend_post"]["end"],
                 )
 
-        pp1_ec = None
-        batch = None
-        j = bisect_left(coll, ppbc_end)
-        if j < len(coll):
-            pp1_ec = _dur_ms(ppbc_end, coll[j])
-            batch = coll_pairs[j][1]
+        # batch (ECstep) comes from the structural pairing; pp1_ec uses that
+        # batch's own collect-end rather than a timestamp bisect.
+        pp1_ec = _dur_ms(ppbc_end, coll_end)
 
         kvpf = phs.get("kv_post_forward", {}).get("cpu_ms")
 
@@ -877,12 +890,16 @@ def pp_overhead(worker, gpu, ec_collect, t_from=None, t_to=None):
             return f"{x:.3f}" if x is not None else "-"
 
         print(
-            f"{(batch if batch is not None else '-'):>7} {g['step']:>5} "
+            f"{batch:>7} {g['step']:>5} "
             f"{g.get('num_tokens', '-'):>5} "
             f"{f(transfer):>9} {f(bcast):>8} {f(pp1_ec):>8} "
             f"{f(kvpf):>7} {f(pp0_recv):>8} "
             f"{f(pp1_idle):>9} {f(pp0_idle):>9}"
         )
+        # Only decode steps (ntok=1) feed the averages; the prefill row is
+        # shown for alignment but has a very different overhead profile.
+        if g.get("num_tokens") != 1:
+            continue
         if transfer is not None:
             tr_s += transfer
             tr_n += 1
@@ -1024,8 +1041,9 @@ def main():
     # Resolve the time window from batch ids (if given) else --from/--to.
     t_from, t_to = args.t_from, args.t_to
     if args.batch_start is not None or args.batch_end is not None:
-        b_start = args.batch_start if args.batch_start is not None else args.batch_end
-        b_end = args.batch_end if args.batch_end is not None else args.batch_start
+        all_batches = sorted(set(ec_d) | set(ec_c))
+        b_start = args.batch_start if args.batch_start is not None else all_batches[0]
+        b_end = args.batch_end if args.batch_end is not None else all_batches[-1]
         t_from, t_to = batch_window_bounds(ec_d, ec_c, b_start, b_end)
         if args.gantt:
             label = "gantt"
@@ -1040,7 +1058,7 @@ def main():
     if args.gantt:
         gantt(events, t_from, t_to, width=args.gantt_width, splits=args.splits)
     elif args.pp_overhead:
-        pp_overhead(worker, gpu, ec_c, t_from, t_to)
+        pp_overhead(worker, gpu, ec_d, ec_c, t_from, t_to)
     elif args.batch_start is not None or args.batch_end is not None or args.timeline:
         timeline(events, t_from, t_to)
     else:
