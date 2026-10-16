@@ -163,7 +163,7 @@ class AsyncIntermediateTensors(IntermediateTensors):
         tensors: dict[str, torch.Tensor],
         comm_handles: list[Handle] | None = None,
         comm_postprocess: list[Callable[[], None]] | None = None,
-        timing: dict[str, tuple[float, ...]] | None = None,
+        timing: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(tensors)
         self._comm_handles = comm_handles
@@ -1172,7 +1172,7 @@ class Worker(WorkerBase):
     def execute_model(
         self, scheduler_output: "SchedulerOutput"
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        timing = {} if _LOG_WORKER_STEP_TIMINGS else None
+        timing: dict[str, Any] | None = {} if _LOG_WORKER_STEP_TIMINGS else None
 
         # Wait for the previous step's sends so this forward pass cannot
         # overwrite buffers they are still reading.
